@@ -1,0 +1,1220 @@
+//! Lean rusqlite storage backend for whatsapp-rust.
+//!
+//! Implements all four `Backend` traits (SignalStore, AppSyncStore, ProtocolStore, DeviceStore)
+//! using raw rusqlite — no Diesel, no ORM, no migration framework.
+//!
+//! Design advantages over upstream (Diesel, 2370 lines) and ZeroClaw (rusqlite, 1347 lines):
+//!   - Single-device only (no device_id column) — halves query complexity
+//!   - One Mutex<Connection> + spawn_blocking — no semaphore needed
+//!   - WAL mode + NORMAL sync — fast writes, no corruption risk
+//!   - CREATE TABLE IF NOT EXISTS — no migration framework
+//!   - serde_json only for opaque types (HashState) — everything else is columns
+
+use std::path::Path;
+use std::str::FromStr;
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use async_trait::async_trait;
+use prost::Message as ProstMessage;
+use rusqlite::{params, Connection, OptionalExtension};
+use wacore::appstate::hash::HashState;
+use wacore::appstate::processor::AppStateMutationMAC;
+use wacore::libsignal::protocol::{KeyPair, PrivateKey, PublicKey};
+use wacore::store::device::DEVICE_PROPS;
+use wacore::store::error::{db_err, Result, StoreError};
+use wacore::store::traits::*;
+use wacore::store::Device;
+use wacore_binary::jid::Jid;
+use waproto::whatsapp as wa;
+
+// ---------------------------------------------------------------------------
+// Schema — 15 tables, no device_id column (single-device design)
+// ---------------------------------------------------------------------------
+
+const SCHEMA: &str = "
+-- Device identity & crypto keys
+CREATE TABLE IF NOT EXISTS device (
+    id INTEGER PRIMARY KEY,
+    pn TEXT NOT NULL DEFAULT '',
+    lid TEXT NOT NULL DEFAULT '',
+    registration_id INTEGER NOT NULL DEFAULT 0,
+    noise_key BLOB NOT NULL DEFAULT x'',
+    identity_key BLOB NOT NULL DEFAULT x'',
+    signed_pre_key BLOB NOT NULL DEFAULT x'',
+    signed_pre_key_id INTEGER NOT NULL DEFAULT 0,
+    signed_pre_key_signature BLOB NOT NULL DEFAULT x'',
+    adv_secret_key BLOB NOT NULL DEFAULT x'',
+    account BLOB,
+    push_name TEXT NOT NULL DEFAULT '',
+    app_version_primary INTEGER NOT NULL DEFAULT 0,
+    app_version_secondary INTEGER NOT NULL DEFAULT 0,
+    app_version_tertiary INTEGER NOT NULL DEFAULT 0,
+    app_version_last_fetched_ms INTEGER NOT NULL DEFAULT 0,
+    edge_routing_info BLOB,
+    props_hash TEXT
+);
+
+-- Signal Protocol: identity keys
+CREATE TABLE IF NOT EXISTS identities (
+    address TEXT PRIMARY KEY,
+    key BLOB NOT NULL
+);
+
+-- Signal Protocol: sessions
+CREATE TABLE IF NOT EXISTS sessions (
+    address TEXT PRIMARY KEY,
+    record BLOB NOT NULL
+);
+
+-- Signal Protocol: pre-keys
+CREATE TABLE IF NOT EXISTS prekeys (
+    id INTEGER PRIMARY KEY,
+    key BLOB NOT NULL,
+    uploaded INTEGER NOT NULL DEFAULT 0
+);
+
+-- Signal Protocol: signed pre-keys
+CREATE TABLE IF NOT EXISTS signed_prekeys (
+    id INTEGER PRIMARY KEY,
+    record BLOB NOT NULL
+);
+
+-- Signal Protocol: sender keys (group messaging)
+CREATE TABLE IF NOT EXISTS sender_keys (
+    address TEXT PRIMARY KEY,
+    record BLOB NOT NULL
+);
+
+-- App state sync keys
+CREATE TABLE IF NOT EXISTS app_state_keys (
+    key_id BLOB PRIMARY KEY,
+    key_data BLOB NOT NULL,
+    fingerprint BLOB NOT NULL DEFAULT x'',
+    timestamp INTEGER NOT NULL DEFAULT 0
+);
+
+-- App state versions (HashState serialized as JSON)
+CREATE TABLE IF NOT EXISTS app_state_versions (
+    name TEXT PRIMARY KEY,
+    state_data BLOB NOT NULL
+);
+
+-- App state mutation MACs
+CREATE TABLE IF NOT EXISTS app_state_mutation_macs (
+    name TEXT NOT NULL,
+    index_mac BLOB NOT NULL,
+    version INTEGER NOT NULL,
+    value_mac BLOB NOT NULL,
+    PRIMARY KEY (name, index_mac)
+);
+
+-- SKDM (Sender Key Distribution Message) recipients per group
+CREATE TABLE IF NOT EXISTS skdm_recipients (
+    group_jid TEXT NOT NULL,
+    device_jid TEXT NOT NULL,
+    PRIMARY KEY (group_jid, device_jid)
+);
+
+-- LID (Linked Identity) to phone number mapping
+CREATE TABLE IF NOT EXISTS lid_pn_mapping (
+    lid TEXT PRIMARY KEY,
+    phone_number TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    learning_source TEXT NOT NULL
+);
+
+-- Base keys for replay/collision detection
+CREATE TABLE IF NOT EXISTS base_keys (
+    address TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    base_key BLOB NOT NULL,
+    PRIMARY KEY (address, message_id)
+);
+
+-- Device registry (multi-device awareness per contact)
+CREATE TABLE IF NOT EXISTS device_registry (
+    user_id TEXT PRIMARY KEY,
+    devices_json TEXT NOT NULL,
+    timestamp INTEGER NOT NULL,
+    phash TEXT
+);
+
+-- Sender key status (lazy deletion marks)
+CREATE TABLE IF NOT EXISTS sender_key_status (
+    group_jid TEXT NOT NULL,
+    participant TEXT NOT NULL,
+    marked_at INTEGER NOT NULL,
+    PRIMARY KEY (group_jid, participant)
+);
+
+-- Trusted contact privacy tokens
+CREATE TABLE IF NOT EXISTS tc_tokens (
+    jid TEXT PRIMARY KEY,
+    token BLOB NOT NULL,
+    token_timestamp INTEGER NOT NULL,
+    sender_timestamp INTEGER
+);
+
+-- Indexes for non-PK lookups
+CREATE INDEX IF NOT EXISTS idx_lid_pn_phone ON lid_pn_mapping(phone_number);
+CREATE INDEX IF NOT EXISTS idx_tc_tokens_ts ON tc_tokens(token_timestamp);
+";
+
+const CURRENT_SCHEMA_VERSION: i64 = 1;
+
+// ---------------------------------------------------------------------------
+// Store
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+pub struct Store {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl Store {
+    /// Open (or create) the database at `path` and initialize the schema.
+    pub fn new(path: &Path) -> Result<Self> {
+        let conn = Connection::open(path).map_err(db_err)?;
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA busy_timeout = 5000;
+             PRAGMA cache_size = -2000;
+             PRAGMA foreign_keys = ON;
+             PRAGMA temp_store = MEMORY;",
+        )
+        .map_err(db_err)?;
+        conn.execute_batch(SCHEMA).map_err(db_err)?;
+        let schema_version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(db_err)?;
+        run_schema_migrations(&conn, schema_version)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    /// Run a blocking database operation on a dedicated thread.
+    async fn run<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = conn.lock();
+            f(&guard)
+        })
+        .await
+        .map_err(db_err)?
+    }
+
+    /// Get a reference to the connection for synchronous checks (e.g. PRAGMA integrity_check).
+    pub fn conn_for_check(&self) -> parking_lot::MutexGuard<'_, Connection> {
+        self.conn.lock()
+    }
+
+    /// Create a hot backup of the database using SQLite's backup API.
+    #[allow(dead_code)] // Available for scheduled backups
+    pub fn snapshot_db(&self, dest_path: &Path) -> Result<()> {
+        let guard = self.conn.lock();
+        let mut dest = Connection::open(dest_path).map_err(db_err)?;
+        let backup = rusqlite::backup::Backup::new(&guard, &mut dest).map_err(db_err)?;
+        backup
+            .run_to_completion(100, std::time::Duration::from_millis(10), None)
+            .map_err(db_err)?;
+        Ok(())
+    }
+}
+
+fn run_schema_migrations(conn: &Connection, from_version: i64) -> Result<()> {
+    if from_version > CURRENT_SCHEMA_VERSION {
+        return Err(StoreError::Database(format!(
+            "database schema version {from_version} is newer than supported {CURRENT_SCHEMA_VERSION}"
+        )));
+    }
+
+    if from_version < CURRENT_SCHEMA_VERSION {
+        // v1 bootstrap: schema is already applied via SCHEMA execute_batch; stamp version.
+        conn.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)
+            .map_err(db_err)?;
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn serialize_keypair(kp: &KeyPair) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64);
+    buf.extend_from_slice(kp.private_key.serialize());
+    buf.extend_from_slice(kp.public_key.public_key_bytes());
+    buf
+}
+
+fn deserialize_keypair(bytes: &[u8]) -> Result<KeyPair> {
+    if bytes.len() != 64 {
+        return Err(StoreError::Serialization(format!(
+            "keypair: expected 64 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    let private = PrivateKey::deserialize(&bytes[..32])
+        .map_err(|e| StoreError::Serialization(e.to_string()))?;
+    let public = PublicKey::from_djb_public_key_bytes(&bytes[32..])
+        .map_err(|e| StoreError::Serialization(e.to_string()))?;
+    Ok(KeyPair::new(public, private))
+}
+
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+/// Save a Device to the database (shared by DeviceStore::save and ::create).
+fn save_device_to_db(conn: &Connection, device: &Device) -> Result<()> {
+    let pn = device
+        .pn
+        .as_ref()
+        .map(|j| j.to_string())
+        .unwrap_or_default();
+    let lid = device
+        .lid
+        .as_ref()
+        .map(|j| j.to_string())
+        .unwrap_or_default();
+    let noise = serialize_keypair(&device.noise_key);
+    let identity = serialize_keypair(&device.identity_key);
+    let spk = serialize_keypair(&device.signed_pre_key);
+    let account = device.account.as_ref().map(|a| a.encode_to_vec());
+
+    conn.execute(
+        "INSERT INTO device (id, pn, lid, registration_id, noise_key, identity_key,
+         signed_pre_key, signed_pre_key_id, signed_pre_key_signature, adv_secret_key,
+         account, push_name, app_version_primary, app_version_secondary,
+         app_version_tertiary, app_version_last_fetched_ms, edge_routing_info, props_hash)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+         ON CONFLICT(id) DO UPDATE SET
+            pn=excluded.pn, lid=excluded.lid, registration_id=excluded.registration_id,
+            noise_key=excluded.noise_key, identity_key=excluded.identity_key,
+            signed_pre_key=excluded.signed_pre_key, signed_pre_key_id=excluded.signed_pre_key_id,
+            signed_pre_key_signature=excluded.signed_pre_key_signature,
+            adv_secret_key=excluded.adv_secret_key, account=excluded.account,
+            push_name=excluded.push_name,
+            app_version_primary=excluded.app_version_primary,
+            app_version_secondary=excluded.app_version_secondary,
+            app_version_tertiary=excluded.app_version_tertiary,
+            app_version_last_fetched_ms=excluded.app_version_last_fetched_ms,
+            edge_routing_info=excluded.edge_routing_info,
+            props_hash=excluded.props_hash",
+        params![
+            pn,
+            lid,
+            device.registration_id as i64,
+            noise,
+            identity,
+            spk,
+            device.signed_pre_key_id as i64,
+            device.signed_pre_key_signature,
+            device.adv_secret_key,
+            account,
+            device.push_name,
+            device.app_version_primary as i64,
+            device.app_version_secondary as i64,
+            device.app_version_tertiary as i64,
+            device.app_version_last_fetched_ms,
+            device.edge_routing_info,
+            device.props_hash,
+        ],
+    )
+    .map_err(db_err)?;
+    Ok(())
+}
+
+/// Load a Device from the database.
+fn load_device_from_db(conn: &Connection) -> Result<Option<Device>> {
+    let row = conn
+        .query_row(
+            "SELECT pn, lid, registration_id, noise_key, identity_key, signed_pre_key,
+             signed_pre_key_id, signed_pre_key_signature, adv_secret_key, account,
+             push_name, app_version_primary, app_version_secondary, app_version_tertiary,
+             app_version_last_fetched_ms, edge_routing_info, props_hash
+             FROM device WHERE id = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, Vec<u8>>(7)?,
+                    row.get::<_, Vec<u8>>(8)?,
+                    row.get::<_, Option<Vec<u8>>>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, i64>(11)?,
+                    row.get::<_, i64>(12)?,
+                    row.get::<_, i64>(13)?,
+                    row.get::<_, i64>(14)?,
+                    row.get::<_, Option<Vec<u8>>>(15)?,
+                    row.get::<_, Option<String>>(16)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(db_err)?;
+
+    let Some((
+        pn_s,
+        lid_s,
+        reg_id,
+        noise_b,
+        ident_b,
+        spk_b,
+        spk_id,
+        spk_sig,
+        adv,
+        account_b,
+        push_name,
+        v1,
+        v2,
+        v3,
+        v_ts,
+        eri,
+        ph,
+    )) = row
+    else {
+        return Ok(None);
+    };
+
+    let to_u32 = |v: i64, field: &str| -> Result<u32> {
+        u32::try_from(v)
+            .map_err(|_| StoreError::Serialization(format!("{field}: value {v} out of u32 range")))
+    };
+    let to_fixed = |v: Vec<u8>, field: &str, expected: usize| -> Result<Vec<u8>> {
+        if v.len() == expected {
+            Ok(v)
+        } else {
+            Err(StoreError::Serialization(format!(
+                "{field}: expected {expected} bytes, got {}",
+                v.len()
+            )))
+        }
+    };
+
+    Ok(Some(Device {
+        pn: if pn_s.is_empty() {
+            None
+        } else {
+            Jid::from_str(&pn_s).ok()
+        },
+        lid: if lid_s.is_empty() {
+            None
+        } else {
+            Jid::from_str(&lid_s).ok()
+        },
+        registration_id: to_u32(reg_id, "registration_id")?,
+        noise_key: deserialize_keypair(&noise_b)?,
+        identity_key: deserialize_keypair(&ident_b)?,
+        signed_pre_key: deserialize_keypair(&spk_b)?,
+        signed_pre_key_id: to_u32(spk_id, "signed_pre_key_id")?,
+        signed_pre_key_signature: {
+            let bytes = to_fixed(spk_sig, "signed_pre_key_signature", 64)?;
+            let mut fixed = [0u8; 64];
+            fixed.copy_from_slice(&bytes);
+            fixed
+        },
+        adv_secret_key: {
+            let bytes = to_fixed(adv, "adv_secret_key", 32)?;
+            let mut fixed = [0u8; 32];
+            fixed.copy_from_slice(&bytes);
+            fixed
+        },
+        account: account_b
+            .map(|b| wa::AdvSignedDeviceIdentity::decode(b.as_slice()))
+            .transpose()
+            .map_err(|e| StoreError::Serialization(e.to_string()))?,
+        push_name,
+        app_version_primary: to_u32(v1, "app_version_primary")?,
+        app_version_secondary: to_u32(v2, "app_version_secondary")?,
+        app_version_tertiary: to_u32(v3, "app_version_tertiary")?,
+        app_version_last_fetched_ms: v_ts,
+        device_props: DEVICE_PROPS.clone(),
+        edge_routing_info: eri,
+        props_hash: ph,
+    }))
+}
+
+// ===========================================================================
+// SignalStore — identity keys, sessions, pre-keys, sender keys
+// ===========================================================================
+
+#[async_trait]
+impl SignalStore for Store {
+    async fn put_identity(&self, address: &str, key: [u8; 32]) -> Result<()> {
+        let addr = address.to_owned();
+        self.run(move |c| {
+            c.execute(
+                "INSERT INTO identities (address, key) VALUES (?1, ?2)
+                 ON CONFLICT(address) DO UPDATE SET key = excluded.key",
+                params![addr, key.as_slice()],
+            )
+            .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn load_identity(&self, address: &str) -> Result<Option<Vec<u8>>> {
+        let addr = address.to_owned();
+        self.run(move |c| {
+            c.query_row(
+                "SELECT key FROM identities WHERE address = ?1",
+                params![addr],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_err)
+        })
+        .await
+    }
+
+    async fn delete_identity(&self, address: &str) -> Result<()> {
+        let addr = address.to_owned();
+        self.run(move |c| {
+            c.execute("DELETE FROM identities WHERE address = ?1", params![addr])
+                .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn get_session(&self, address: &str) -> Result<Option<Vec<u8>>> {
+        let addr = address.to_owned();
+        self.run(move |c| {
+            c.query_row(
+                "SELECT record FROM sessions WHERE address = ?1",
+                params![addr],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_err)
+        })
+        .await
+    }
+
+    async fn put_session(&self, address: &str, session: &[u8]) -> Result<()> {
+        let addr = address.to_owned();
+        let data = session.to_vec();
+        self.run(move |c| {
+            c.execute(
+                "INSERT INTO sessions (address, record) VALUES (?1, ?2)
+                 ON CONFLICT(address) DO UPDATE SET record = excluded.record",
+                params![addr, data],
+            )
+            .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn delete_session(&self, address: &str) -> Result<()> {
+        let addr = address.to_owned();
+        self.run(move |c| {
+            c.execute("DELETE FROM sessions WHERE address = ?1", params![addr])
+                .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn store_prekey(&self, id: u32, record: &[u8], uploaded: bool) -> Result<()> {
+        let data = record.to_vec();
+        self.run(move |c| {
+            c.execute(
+                "INSERT INTO prekeys (id, key, uploaded) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(id) DO UPDATE SET key = excluded.key, uploaded = excluded.uploaded",
+                params![id, data, uploaded],
+            )
+            .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn load_prekey(&self, id: u32) -> Result<Option<Vec<u8>>> {
+        self.run(move |c| {
+            c.query_row(
+                "SELECT key FROM prekeys WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_err)
+        })
+        .await
+    }
+
+    async fn remove_prekey(&self, id: u32) -> Result<()> {
+        self.run(move |c| {
+            c.execute("DELETE FROM prekeys WHERE id = ?1", params![id])
+                .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn store_signed_prekey(&self, id: u32, record: &[u8]) -> Result<()> {
+        let data = record.to_vec();
+        self.run(move |c| {
+            c.execute(
+                "INSERT INTO signed_prekeys (id, record) VALUES (?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET record = excluded.record",
+                params![id, data],
+            )
+            .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn load_signed_prekey(&self, id: u32) -> Result<Option<Vec<u8>>> {
+        self.run(move |c| {
+            c.query_row(
+                "SELECT record FROM signed_prekeys WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_err)
+        })
+        .await
+    }
+
+    async fn load_all_signed_prekeys(&self) -> Result<Vec<(u32, Vec<u8>)>> {
+        self.run(|c| {
+            let mut stmt = c
+                .prepare("SELECT id, record FROM signed_prekeys")
+                .map_err(db_err)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, u32>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .map_err(db_err)?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.map_err(db_err)?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn remove_signed_prekey(&self, id: u32) -> Result<()> {
+        self.run(move |c| {
+            c.execute("DELETE FROM signed_prekeys WHERE id = ?1", params![id])
+                .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn put_sender_key(&self, address: &str, record: &[u8]) -> Result<()> {
+        let addr = address.to_owned();
+        let data = record.to_vec();
+        self.run(move |c| {
+            c.execute(
+                "INSERT INTO sender_keys (address, record) VALUES (?1, ?2)
+                 ON CONFLICT(address) DO UPDATE SET record = excluded.record",
+                params![addr, data],
+            )
+            .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn get_sender_key(&self, address: &str) -> Result<Option<Vec<u8>>> {
+        let addr = address.to_owned();
+        self.run(move |c| {
+            c.query_row(
+                "SELECT record FROM sender_keys WHERE address = ?1",
+                params![addr],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_err)
+        })
+        .await
+    }
+
+    async fn delete_sender_key(&self, address: &str) -> Result<()> {
+        let addr = address.to_owned();
+        self.run(move |c| {
+            c.execute("DELETE FROM sender_keys WHERE address = ?1", params![addr])
+                .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+    }
+}
+
+// ===========================================================================
+// AppSyncStore — app state keys, versions, mutation MACs
+// ===========================================================================
+
+#[async_trait]
+impl AppSyncStore for Store {
+    async fn get_sync_key(&self, key_id: &[u8]) -> Result<Option<AppStateSyncKey>> {
+        let kid = key_id.to_vec();
+        self.run(move |c| {
+            c.query_row(
+                "SELECT key_data, fingerprint, timestamp FROM app_state_keys WHERE key_id = ?1",
+                params![kid],
+                |row| {
+                    Ok(AppStateSyncKey {
+                        key_data: row.get(0)?,
+                        fingerprint: row.get(1)?,
+                        timestamp: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db_err)
+        })
+        .await
+    }
+
+    async fn set_sync_key(&self, key_id: &[u8], key: AppStateSyncKey) -> Result<()> {
+        let kid = key_id.to_vec();
+        self.run(move |c| {
+            c.execute(
+                "INSERT INTO app_state_keys (key_id, key_data, fingerprint, timestamp)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(key_id) DO UPDATE SET
+                    key_data=excluded.key_data, fingerprint=excluded.fingerprint,
+                    timestamp=excluded.timestamp",
+                params![kid, key.key_data, key.fingerprint, key.timestamp],
+            )
+            .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn get_version(&self, name: &str) -> Result<HashState> {
+        let n = name.to_owned();
+        self.run(move |c| {
+            let opt: Option<Vec<u8>> = c
+                .query_row(
+                    "SELECT state_data FROM app_state_versions WHERE name = ?1",
+                    params![n],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(db_err)?;
+            match opt {
+                Some(data) => serde_json::from_slice(&data)
+                    .map_err(|e| StoreError::Serialization(e.to_string())),
+                None => Ok(HashState::default()),
+            }
+        })
+        .await
+    }
+
+    async fn set_version(&self, name: &str, state: HashState) -> Result<()> {
+        let n = name.to_owned();
+        let data =
+            serde_json::to_vec(&state).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        self.run(move |c| {
+            c.execute(
+                "INSERT INTO app_state_versions (name, state_data) VALUES (?1, ?2)
+                 ON CONFLICT(name) DO UPDATE SET state_data = excluded.state_data",
+                params![n, data],
+            )
+            .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn put_mutation_macs(
+        &self,
+        name: &str,
+        version: u64,
+        mutations: &[AppStateMutationMAC],
+    ) -> Result<()> {
+        let n = name.to_owned();
+        let macs: Vec<(Vec<u8>, Vec<u8>)> = mutations
+            .iter()
+            .map(|m| (m.index_mac.clone(), m.value_mac.clone()))
+            .collect();
+        self.run(move |c| {
+            let tx = c.unchecked_transaction().map_err(db_err)?;
+            for (index_mac, value_mac) in &macs {
+                tx.execute(
+                    "INSERT INTO app_state_mutation_macs (name, index_mac, version, value_mac)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(name, index_mac) DO UPDATE SET
+                        version=excluded.version, value_mac=excluded.value_mac",
+                    params![n, index_mac, version as i64, value_mac],
+                )
+                .map_err(db_err)?;
+            }
+            tx.commit().map_err(db_err)
+        })
+        .await
+    }
+
+    async fn get_mutation_mac(&self, name: &str, index_mac: &[u8]) -> Result<Option<Vec<u8>>> {
+        let n = name.to_owned();
+        let im = index_mac.to_vec();
+        self.run(move |c| {
+            c.query_row(
+                "SELECT value_mac FROM app_state_mutation_macs
+                 WHERE name = ?1 AND index_mac = ?2",
+                params![n, im],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_err)
+        })
+        .await
+    }
+
+    async fn delete_mutation_macs(&self, name: &str, index_macs: &[Vec<u8>]) -> Result<()> {
+        let n = name.to_owned();
+        let macs = index_macs.to_vec();
+        self.run(move |c| {
+            let tx = c.unchecked_transaction().map_err(db_err)?;
+            for mac in &macs {
+                tx.execute(
+                    "DELETE FROM app_state_mutation_macs WHERE name = ?1 AND index_mac = ?2",
+                    params![n, mac],
+                )
+                .map_err(db_err)?;
+            }
+            tx.commit().map_err(db_err)
+        })
+        .await
+    }
+}
+
+// ===========================================================================
+// ProtocolStore — SKDM, LID mapping, base keys, device registry, tc tokens
+// ===========================================================================
+
+#[async_trait]
+impl ProtocolStore for Store {
+    async fn get_skdm_recipients(&self, group_jid: &str) -> Result<Vec<Jid>> {
+        let gj = group_jid.to_owned();
+        self.run(move |c| {
+            let mut stmt = c
+                .prepare("SELECT device_jid FROM skdm_recipients WHERE group_jid = ?1")
+                .map_err(db_err)?;
+            let rows = stmt
+                .query_map(params![gj], |row| row.get::<_, String>(0))
+                .map_err(db_err)?;
+            let mut out = Vec::new();
+            for r in rows {
+                let s = r.map_err(db_err)?;
+                if let Ok(jid) = Jid::from_str(&s) {
+                    out.push(jid);
+                }
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn add_skdm_recipients(&self, group_jid: &str, device_jids: &[Jid]) -> Result<()> {
+        let gj = group_jid.to_owned();
+        let jids: Vec<String> = device_jids.iter().map(|j| j.to_string()).collect();
+        self.run(move |c| {
+            let tx = c.unchecked_transaction().map_err(db_err)?;
+            for jid in &jids {
+                tx.execute(
+                    "INSERT OR IGNORE INTO skdm_recipients (group_jid, device_jid) VALUES (?1, ?2)",
+                    params![gj, jid],
+                )
+                .map_err(db_err)?;
+            }
+            tx.commit().map_err(db_err)
+        })
+        .await
+    }
+
+    async fn clear_skdm_recipients(&self, group_jid: &str) -> Result<()> {
+        let gj = group_jid.to_owned();
+        self.run(move |c| {
+            c.execute(
+                "DELETE FROM skdm_recipients WHERE group_jid = ?1",
+                params![gj],
+            )
+            .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn get_lid_mapping(&self, lid: &str) -> Result<Option<LidPnMappingEntry>> {
+        let l = lid.to_owned();
+        self.run(move |c| {
+            c.query_row(
+                "SELECT lid, phone_number, created_at, updated_at, learning_source
+                 FROM lid_pn_mapping WHERE lid = ?1",
+                params![l],
+                |row| {
+                    Ok(LidPnMappingEntry {
+                        lid: row.get(0)?,
+                        phone_number: row.get(1)?,
+                        created_at: row.get(2)?,
+                        updated_at: row.get(3)?,
+                        learning_source: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db_err)
+        })
+        .await
+    }
+
+    async fn get_pn_mapping(&self, phone: &str) -> Result<Option<LidPnMappingEntry>> {
+        let p = phone.to_owned();
+        self.run(move |c| {
+            c.query_row(
+                "SELECT lid, phone_number, created_at, updated_at, learning_source
+                 FROM lid_pn_mapping WHERE phone_number = ?1
+                 ORDER BY updated_at DESC LIMIT 1",
+                params![p],
+                |row| {
+                    Ok(LidPnMappingEntry {
+                        lid: row.get(0)?,
+                        phone_number: row.get(1)?,
+                        created_at: row.get(2)?,
+                        updated_at: row.get(3)?,
+                        learning_source: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db_err)
+        })
+        .await
+    }
+
+    async fn put_lid_mapping(&self, entry: &LidPnMappingEntry) -> Result<()> {
+        let e = entry.clone();
+        self.run(move |c| {
+            c.execute(
+                "INSERT INTO lid_pn_mapping (lid, phone_number, created_at, updated_at, learning_source)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(lid) DO UPDATE SET
+                    phone_number=excluded.phone_number, updated_at=excluded.updated_at,
+                    learning_source=excluded.learning_source",
+                params![e.lid, e.phone_number, e.created_at, e.updated_at, e.learning_source],
+            )
+            .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn get_all_lid_mappings(&self) -> Result<Vec<LidPnMappingEntry>> {
+        self.run(|c| {
+            let mut stmt = c
+                .prepare(
+                    "SELECT lid, phone_number, created_at, updated_at, learning_source
+                     FROM lid_pn_mapping",
+                )
+                .map_err(db_err)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(LidPnMappingEntry {
+                        lid: row.get(0)?,
+                        phone_number: row.get(1)?,
+                        created_at: row.get(2)?,
+                        updated_at: row.get(3)?,
+                        learning_source: row.get(4)?,
+                    })
+                })
+                .map_err(db_err)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(db_err)
+        })
+        .await
+    }
+
+    async fn save_base_key(&self, address: &str, message_id: &str, base_key: &[u8]) -> Result<()> {
+        let addr = address.to_owned();
+        let mid = message_id.to_owned();
+        let bk = base_key.to_vec();
+        self.run(move |c| {
+            c.execute(
+                "INSERT INTO base_keys (address, message_id, base_key) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(address, message_id) DO UPDATE SET base_key = excluded.base_key",
+                params![addr, mid, bk],
+            )
+            .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn has_same_base_key(
+        &self,
+        address: &str,
+        message_id: &str,
+        current_base_key: &[u8],
+    ) -> Result<bool> {
+        let addr = address.to_owned();
+        let mid = message_id.to_owned();
+        let cbk = current_base_key.to_vec();
+        self.run(move |c| {
+            let stored: Option<Vec<u8>> = c
+                .query_row(
+                    "SELECT base_key FROM base_keys WHERE address = ?1 AND message_id = ?2",
+                    params![addr, mid],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(db_err)?;
+            Ok(stored.map_or(false, |s| s == cbk))
+        })
+        .await
+    }
+
+    async fn delete_base_key(&self, address: &str, message_id: &str) -> Result<()> {
+        let addr = address.to_owned();
+        let mid = message_id.to_owned();
+        self.run(move |c| {
+            c.execute(
+                "DELETE FROM base_keys WHERE address = ?1 AND message_id = ?2",
+                params![addr, mid],
+            )
+            .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn update_device_list(&self, record: DeviceListRecord) -> Result<()> {
+        let devices_json = serde_json::to_string(&record.devices)
+            .map_err(|e| StoreError::Serialization(e.to_string()))?;
+        self.run(move |c| {
+            c.execute(
+                "INSERT INTO device_registry (user_id, devices_json, timestamp, phash)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(user_id) DO UPDATE SET
+                    devices_json=excluded.devices_json, timestamp=excluded.timestamp,
+                    phash=excluded.phash",
+                params![record.user, devices_json, record.timestamp, record.phash],
+            )
+            .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn get_devices(&self, user: &str) -> Result<Option<DeviceListRecord>> {
+        let u = user.to_owned();
+        self.run(move |c| {
+            c.query_row(
+                "SELECT user_id, devices_json, timestamp, phash FROM device_registry
+                 WHERE user_id = ?1",
+                params![u],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(db_err)?
+            .map(|(user, dj, ts, ph)| {
+                let devices = serde_json::from_str(&dj)
+                    .map_err(|e| StoreError::Serialization(e.to_string()))?;
+                Ok(DeviceListRecord {
+                    user,
+                    devices,
+                    timestamp: ts,
+                    phash: ph,
+                })
+            })
+            .transpose()
+        })
+        .await
+    }
+
+    async fn mark_forget_sender_key(&self, group_jid: &str, participant: &str) -> Result<()> {
+        let gj = group_jid.to_owned();
+        let p = participant.to_owned();
+        let ts = now_secs();
+        self.run(move |c| {
+            c.execute(
+                "INSERT INTO sender_key_status (group_jid, participant, marked_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(group_jid, participant) DO UPDATE SET marked_at = excluded.marked_at",
+                params![gj, p, ts],
+            )
+            .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn consume_forget_marks(&self, group_jid: &str) -> Result<Vec<String>> {
+        let gj = group_jid.to_owned();
+        self.run(move |c| {
+            let tx = c.unchecked_transaction().map_err(db_err)?;
+            let mut stmt = tx
+                .prepare("SELECT participant FROM sender_key_status WHERE group_jid = ?1")
+                .map_err(db_err)?;
+            let participants: Vec<String> = stmt
+                .query_map(params![gj], |row| row.get(0))
+                .map_err(db_err)?
+                .collect::<std::result::Result<_, _>>()
+                .map_err(db_err)?;
+            drop(stmt);
+            tx.execute(
+                "DELETE FROM sender_key_status WHERE group_jid = ?1",
+                params![gj],
+            )
+            .map_err(db_err)?;
+            tx.commit().map_err(db_err)?;
+            Ok(participants)
+        })
+        .await
+    }
+
+    async fn get_tc_token(&self, jid: &str) -> Result<Option<TcTokenEntry>> {
+        let j = jid.to_owned();
+        self.run(move |c| {
+            c.query_row(
+                "SELECT token, token_timestamp, sender_timestamp FROM tc_tokens WHERE jid = ?1",
+                params![j],
+                |row| {
+                    Ok(TcTokenEntry {
+                        token: row.get(0)?,
+                        token_timestamp: row.get(1)?,
+                        sender_timestamp: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db_err)
+        })
+        .await
+    }
+
+    async fn put_tc_token(&self, jid: &str, entry: &TcTokenEntry) -> Result<()> {
+        let j = jid.to_owned();
+        let e = entry.clone();
+        self.run(move |c| {
+            c.execute(
+                "INSERT INTO tc_tokens (jid, token, token_timestamp, sender_timestamp)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(jid) DO UPDATE SET
+                    token=excluded.token, token_timestamp=excluded.token_timestamp,
+                    sender_timestamp=excluded.sender_timestamp",
+                params![j, e.token, e.token_timestamp, e.sender_timestamp],
+            )
+            .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn delete_tc_token(&self, jid: &str) -> Result<()> {
+        let j = jid.to_owned();
+        self.run(move |c| {
+            c.execute("DELETE FROM tc_tokens WHERE jid = ?1", params![j])
+                .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn get_all_tc_token_jids(&self) -> Result<Vec<String>> {
+        self.run(|c| {
+            let mut stmt = c.prepare("SELECT jid FROM tc_tokens").map_err(db_err)?;
+            let rows = stmt.query_map([], |row| row.get(0)).map_err(db_err)?;
+            rows.collect::<std::result::Result<_, _>>().map_err(db_err)
+        })
+        .await
+    }
+
+    async fn delete_expired_tc_tokens(&self, cutoff_timestamp: i64) -> Result<u32> {
+        self.run(move |c| {
+            let count = c
+                .execute(
+                    "DELETE FROM tc_tokens WHERE token_timestamp < ?1",
+                    params![cutoff_timestamp],
+                )
+                .map_err(db_err)?;
+            u32::try_from(count)
+                .map_err(|_| StoreError::Database(format!("delete count {count} out of u32 range")))
+        })
+        .await
+    }
+}
+
+// ===========================================================================
+// DeviceStore — device persistence
+// ===========================================================================
+
+#[async_trait]
+impl DeviceStore for Store {
+    async fn save(&self, device: &Device) -> Result<()> {
+        let d = device.clone();
+        self.run(move |c| save_device_to_db(c, &d)).await
+    }
+
+    async fn load(&self) -> Result<Option<Device>> {
+        self.run(load_device_from_db).await
+    }
+
+    async fn exists(&self) -> Result<bool> {
+        self.run(|c| {
+            let count: i64 = c
+                .query_row("SELECT COUNT(*) FROM device WHERE id = 1", [], |row| {
+                    row.get(0)
+                })
+                .map_err(db_err)?;
+            Ok(count > 0)
+        })
+        .await
+    }
+
+    async fn create(&self) -> Result<i32> {
+        self.run(|c| {
+            // Guard: never overwrite an existing device (would rotate identity keys)
+            let count: i64 = c
+                .query_row("SELECT COUNT(*) FROM device WHERE id = 1", [], |row| {
+                    row.get(0)
+                })
+                .map_err(db_err)?;
+            if count > 0 {
+                return Ok(1); // Already exists — no-op
+            }
+            let device = Device::new();
+            save_device_to_db(c, &device)?;
+            Ok(1)
+        })
+        .await
+    }
+}

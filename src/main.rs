@@ -1,0 +1,458 @@
+//! picoclaw-wa-rust — Pure Rust WhatsApp bridge for picoclaw.
+//!
+//! Lean replacement for the Baileys (Node.js) sidecar.
+//! Uses whatsapp-rust (wa-rs) for the WhatsApp Web protocol
+//! and our own rusqlite backend for Signal Protocol storage.
+
+mod bridge;
+mod storage;
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Result;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info, warn};
+
+use bridge::{BridgeConfig, WhatsAppBridge};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "picoclaw_wa_rust=info,whatsapp_rust=info".parse().unwrap()),
+        )
+        .init();
+
+    info!("picoclaw-wa-rust v{}", env!("CARGO_PKG_VERSION"));
+
+    let (inbound_tx, mut inbound_rx) = mpsc::channel(256);
+    let cancel = CancellationToken::new();
+
+    // Allowed numbers: only bridge messages from these senders (empty = all)
+    let allowed: Vec<String> = std::env::var("WHATSAPP_ALLOWED")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.chars().filter(|c| c.is_ascii_digit()).collect::<String>())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if !allowed.is_empty() {
+        info!(allowed = ?allowed, "sender allowlist active");
+    }
+
+    let config = BridgeConfig {
+        db_path: PathBuf::from("whatsapp.db"),
+        pair_phone: std::env::var("WHATSAPP_PAIR_PHONE").ok(),
+        allowed_numbers: allowed,
+        ..Default::default()
+    };
+
+    let bridge = Arc::new(WhatsAppBridge::start(config, inbound_tx, cancel.clone()));
+
+    info!("bridge started, state: {:?}", bridge.state());
+    info!("waiting for WhatsApp connection (scan QR code or enter pair code)...");
+
+    // Print inbound messages
+    let bridge_for_rx = bridge.clone();
+    tokio::spawn(async move {
+        while let Some(msg) = inbound_rx.recv().await {
+            let reply_tag = msg
+                .reply_to
+                .as_deref()
+                .map(|id| format!(" (reply to {id})"))
+                .unwrap_or_default();
+            println!(
+                "\n<< [{}] {} ({}){}: {}",
+                msg.jid,
+                msg.sender,
+                msg.content.kind(),
+                reply_tag,
+                msg.content.display_text()
+            );
+            if bridge_for_rx.is_connected() {
+                print!("> ");
+            }
+        }
+    });
+
+    // Interactive REPL for testing (stdin)
+    let bridge_for_repl = bridge.clone();
+    let cancel_for_repl = cancel.clone();
+    tokio::spawn(async move {
+        let stdin = BufReader::new(tokio::io::stdin());
+        let mut lines = stdin.lines();
+
+        println!("Commands:");
+        println!("  send <jid> <message>           — send text (prints msg ID)");
+        println!("  reply <jid> <id> <sender> <msg>— reply quoting a message");
+        println!("  edit <jid> <id> <new text>     — edit a sent message");
+        println!("  react <jid> <id> <emoji>       — react to a message");
+        println!("  image <jid> <path>             — send an image file");
+        println!("  audio <jid> <path>             — send audio as voice note");
+        println!("  video <jid> <path>             — send a video file");
+        println!("  doc <jid> <path>               — send a document/file");
+        println!("  sticker <jid> <path>           — send a WebP sticker");
+        println!("  location <jid> <lat> <lon>     — send a location pin");
+        println!("  contact <jid> <name> <phone>   — send a contact card");
+        println!("  typing <jid>                   — show typing indicator");
+        println!("  stop-typing <jid>              — cancel typing indicator");
+        println!("  status                         — show bridge state");
+        println!("  quit                           — shut down");
+        println!();
+
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    let line = line.trim().to_string();
+                    if line.is_empty() {
+                        continue;
+                    }
+
+                    let parts: Vec<&str> = line.splitn(3, ' ').collect();
+                    match parts[0] {
+                        "send" | "s" => {
+                            if parts.len() < 3 {
+                                println!("usage: send <jid> <message>");
+                                continue;
+                            }
+                            match bridge_for_repl
+                                .send_message_with_id(parts[1], parts[2])
+                                .await
+                            {
+                                Ok(id) => println!(">> sent to {} (id: {})", parts[1], id),
+                                Err(e) => println!("!! send failed: {e}"),
+                            }
+                        }
+                        "edit" | "e" => {
+                            let edit_parts: Vec<&str> = line.splitn(4, ' ').collect();
+                            if edit_parts.len() < 4 {
+                                println!("usage: edit <jid> <msg_id> <new text>");
+                                continue;
+                            }
+                            match bridge_for_repl
+                                .edit_message(edit_parts[1], edit_parts[2], edit_parts[3])
+                                .await
+                            {
+                                Ok(()) => println!(">> edited {}", edit_parts[2]),
+                                Err(e) => println!("!! edit failed: {e}"),
+                            }
+                        }
+                        "image" | "img" => {
+                            if parts.len() < 3 {
+                                println!("usage: image <jid> <path>");
+                                continue;
+                            }
+                            let path = std::path::Path::new(parts[2]);
+                            match std::fs::read(path) {
+                                Ok(data) => {
+                                    let mime = match path.extension().and_then(|e| e.to_str()) {
+                                        Some("png") => "image/png",
+                                        Some("gif") => "image/gif",
+                                        Some("webp") => "image/webp",
+                                        _ => "image/jpeg",
+                                    };
+                                    match bridge_for_repl
+                                        .send_image(parts[1], data, mime, None)
+                                        .await
+                                    {
+                                        Ok(()) => println!(">> image sent to {}", parts[1]),
+                                        Err(e) => println!("!! image send failed: {e}"),
+                                    }
+                                }
+                                Err(e) => println!("!! cannot read file: {e}"),
+                            }
+                        }
+                        "audio" | "voice" => {
+                            if parts.len() < 3 {
+                                println!("usage: audio <jid> <path>");
+                                continue;
+                            }
+                            let path = std::path::Path::new(parts[2]);
+                            match std::fs::read(path) {
+                                Ok(data) => {
+                                    let mime = match path.extension().and_then(|e| e.to_str()) {
+                                        Some("ogg") | Some("opus") => "audio/ogg; codecs=opus",
+                                        Some("mp3") => "audio/mpeg",
+                                        Some("m4a") | Some("aac") => "audio/mp4",
+                                        _ => "audio/ogg; codecs=opus",
+                                    };
+                                    match bridge_for_repl
+                                        .send_audio(parts[1], data, mime, None)
+                                        .await
+                                    {
+                                        Ok(()) => println!(">> audio sent to {}", parts[1]),
+                                        Err(e) => println!("!! audio send failed: {e}"),
+                                    }
+                                }
+                                Err(e) => println!("!! cannot read file: {e}"),
+                            }
+                        }
+                        "video" | "vid" => {
+                            if parts.len() < 3 {
+                                println!("usage: video <jid> <path>");
+                                continue;
+                            }
+                            let path = std::path::Path::new(parts[2]);
+                            match std::fs::read(path) {
+                                Ok(data) => {
+                                    let mime = match path.extension().and_then(|e| e.to_str()) {
+                                        Some("webm") => "video/webm",
+                                        Some("mov") => "video/quicktime",
+                                        Some("3gp") => "video/3gpp",
+                                        _ => "video/mp4",
+                                    };
+                                    match bridge_for_repl
+                                        .send_video(parts[1], data, mime, None)
+                                        .await
+                                    {
+                                        Ok(()) => println!(">> video sent to {}", parts[1]),
+                                        Err(e) => println!("!! video send failed: {e}"),
+                                    }
+                                }
+                                Err(e) => println!("!! cannot read file: {e}"),
+                            }
+                        }
+                        "doc" | "document" => {
+                            if parts.len() < 3 {
+                                println!("usage: doc <jid> <path>");
+                                continue;
+                            }
+                            let path = std::path::Path::new(parts[2]);
+                            let filename = path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("file");
+                            match std::fs::read(path) {
+                                Ok(data) => {
+                                    let mime = match path.extension().and_then(|e| e.to_str()) {
+                                        Some("pdf") => "application/pdf",
+                                        Some("zip") => "application/zip",
+                                        Some("txt") => "text/plain",
+                                        _ => "application/octet-stream",
+                                    };
+                                    match bridge_for_repl
+                                        .send_document(parts[1], data, mime, filename)
+                                        .await
+                                    {
+                                        Ok(()) => println!(">> doc sent to {}", parts[1]),
+                                        Err(e) => println!("!! doc send failed: {e}"),
+                                    }
+                                }
+                                Err(e) => println!("!! cannot read file: {e}"),
+                            }
+                        }
+                        "reply" | "r" => {
+                            let reply_parts: Vec<&str> = line.splitn(5, ' ').collect();
+                            if reply_parts.len() < 5 {
+                                println!("usage: reply <jid> <msg_id> <sender_jid> <message>");
+                                continue;
+                            }
+                            match bridge_for_repl
+                                .send_reply(
+                                    reply_parts[1],
+                                    reply_parts[2],
+                                    reply_parts[3],
+                                    reply_parts[4],
+                                )
+                                .await
+                            {
+                                Ok(id) => println!(">> replied (id: {})", id),
+                                Err(e) => println!("!! reply failed: {e}"),
+                            }
+                        }
+                        "react" => {
+                            // react <jid> <msg_id> <emoji> [from_me]
+                            // from_me defaults to true (reacting to own sent msgs)
+                            let react_parts: Vec<&str> = line.splitn(5, ' ').collect();
+                            if react_parts.len() < 4 {
+                                println!("usage: react <jid> <msg_id> <emoji> [from_me=true]");
+                                continue;
+                            }
+                            let from_me = react_parts
+                                .get(4)
+                                .map(|v| *v != "false" && *v != "0")
+                                .unwrap_or(true);
+                            match bridge_for_repl
+                                .send_reaction(
+                                    react_parts[1],
+                                    react_parts[2],
+                                    react_parts[3],
+                                    from_me,
+                                )
+                                .await
+                            {
+                                Ok(()) => println!(">> reacted {} (from_me={})", react_parts[3], from_me),
+                                Err(e) => println!("!! react failed: {e}"),
+                            }
+                        }
+                        "sticker" | "stk" => {
+                            if parts.len() < 3 {
+                                println!("usage: sticker <jid> <path>");
+                                continue;
+                            }
+                            let path = std::path::Path::new(parts[2]);
+                            match std::fs::read(path) {
+                                Ok(data) => {
+                                    match bridge_for_repl
+                                        .send_sticker(parts[1], data, "image/webp", false)
+                                        .await
+                                    {
+                                        Ok(()) => println!(">> sticker sent to {}", parts[1]),
+                                        Err(e) => println!("!! sticker send failed: {e}"),
+                                    }
+                                }
+                                Err(e) => println!("!! cannot read file: {e}"),
+                            }
+                        }
+                        "location" | "loc" => {
+                            let loc_parts: Vec<&str> = line.splitn(4, ' ').collect();
+                            if loc_parts.len() < 4 {
+                                println!("usage: location <jid> <lat> <lon>");
+                                continue;
+                            }
+                            let lat: f64 = match loc_parts[2].parse() {
+                                Ok(v) => v,
+                                Err(_) => {
+                                    println!("!! invalid latitude");
+                                    continue;
+                                }
+                            };
+                            let lon: f64 = match loc_parts[3].parse() {
+                                Ok(v) => v,
+                                Err(_) => {
+                                    println!("!! invalid longitude");
+                                    continue;
+                                }
+                            };
+                            match bridge_for_repl
+                                .send_location(loc_parts[1], lat, lon, None, None)
+                                .await
+                            {
+                                Ok(()) => println!(">> location sent to {}", loc_parts[1]),
+                                Err(e) => println!("!! location send failed: {e}"),
+                            }
+                        }
+                        "contact" => {
+                            let contact_parts: Vec<&str> = line.splitn(4, ' ').collect();
+                            if contact_parts.len() < 4 {
+                                println!("usage: contact <jid> <name> <phone>");
+                                continue;
+                            }
+                            let name = contact_parts[2];
+                            let phone = contact_parts[3];
+                            let vcard = format!(
+                                "BEGIN:VCARD\nVERSION:3.0\nFN:{name}\nTEL;type=CELL:+{phone}\nEND:VCARD"
+                            );
+                            match bridge_for_repl
+                                .send_contact(contact_parts[1], name, &vcard)
+                                .await
+                            {
+                                Ok(()) => println!(">> contact sent to {}", contact_parts[1]),
+                                Err(e) => println!("!! contact send failed: {e}"),
+                            }
+                        }
+                        "typing" | "t" => {
+                            if parts.len() < 2 {
+                                println!("usage: typing <jid>");
+                                continue;
+                            }
+                            if let Err(e) = bridge_for_repl.start_typing(parts[1]).await {
+                                println!("!! typing failed: {e}");
+                            }
+                        }
+                        "stop-typing" | "st" => {
+                            if parts.len() < 2 {
+                                println!("usage: stop-typing <jid>");
+                                continue;
+                            }
+                            if let Err(e) = bridge_for_repl.stop_typing(parts[1]).await {
+                                println!("!! stop-typing failed: {e}");
+                            }
+                        }
+                        "edit-test" | "et" => {
+                            if parts.len() < 2 {
+                                println!("usage: edit-test <jid>");
+                                continue;
+                            }
+                            let jid = parts[1].to_string();
+                            println!(">> sending original message...");
+                            match bridge_for_repl
+                                .send_message_with_id(&jid, "EDIT-TEST: This will change in 3 seconds...")
+                                .await
+                            {
+                                Ok(id) => {
+                                    println!(">> sent (id: {}), waiting 3s then editing...", id);
+                                    tokio::time::sleep(Duration::from_secs(3)).await;
+                                    match bridge_for_repl
+                                        .edit_message(&jid, &id, "EDITED: picoclaw-wa-rust edited this!")
+                                        .await
+                                    {
+                                        Ok(()) => println!(">> edit sent for {}", id),
+                                        Err(e) => println!("!! edit failed: {e}"),
+                                    }
+                                }
+                                Err(e) => println!("!! send failed: {e}"),
+                            }
+                        }
+                        "revoke-test" | "rt" => {
+                            if parts.len() < 2 {
+                                println!("usage: revoke-test <jid>");
+                                continue;
+                            }
+                            let jid = parts[1].to_string();
+                            println!(">> sending message to delete in 5s...");
+                            match bridge_for_repl
+                                .send_message_with_id(&jid, "DELETE-TEST: This will be deleted in 5 seconds...")
+                                .await
+                            {
+                                Ok(id) => {
+                                    println!(">> sent (id: {}), waiting 5s then revoking...", id);
+                                    tokio::time::sleep(Duration::from_secs(5)).await;
+                                    match bridge_for_repl.revoke_message(&jid, &id).await {
+                                        Ok(()) => println!(">> revoke sent for {}", id),
+                                        Err(e) => println!("!! revoke failed: {e}"),
+                                    }
+                                }
+                                Err(e) => println!("!! send failed: {e}"),
+                            }
+                        }
+                        "status" => {
+                            println!(
+                                "state: {:?}, connected: {}",
+                                bridge_for_repl.state(),
+                                bridge_for_repl.is_connected()
+                            );
+                        }
+                        "quit" | "q" | "exit" => {
+                            cancel_for_repl.cancel();
+                            break;
+                        }
+                        _ => {
+                            println!("unknown command: {}", parts[0]);
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    error!(error = %e, "stdin read error");
+                    break;
+                }
+            }
+        }
+    });
+
+    // Wait for Ctrl-C or quit command
+    cancel.cancelled().await;
+    info!("shutting down...");
+    bridge.stop();
+    if !bridge.wait_stopped(Duration::from_secs(5)).await {
+        warn!("bridge did not fully stop within 5 seconds");
+    }
+
+    Ok(())
+}

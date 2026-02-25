@@ -1,0 +1,38 @@
+[package]
+name = "picoclaw-wa-rust"
+version = "0.2.0"
+edition = "2021"
+description = "Pure Rust WhatsApp bridge for picoclaw — lean, fast, no Baileys"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+chrono = "0.4"
+parking_lot = "0.12"
+prost = "0.14"
+qrcode = "0.14"
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "io-util", "io-std"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# whatsapp-rust — git-pinned to main (crates.io v0.2.0 requires nightly)
+# We skip the default sqlite-storage feature to avoid Diesel/libsqlite3-sys conflicts.
+# Our own rusqlite backend (src/storage.rs) replaces it.
+whatsapp-rust = { git = "https://github.com/jlucaso1/whatsapp-rust", default-features = false }
+wacore = { git = "https://github.com/jlucaso1/whatsapp-rust" }
+wacore-binary = { git = "https://github.com/jlucaso1/whatsapp-rust" }
+waproto = { git = "https://github.com/jlucaso1/whatsapp-rust" }
+whatsapp-rust-tokio-transport = { git = "https://github.com/jlucaso1/whatsapp-rust" }
+whatsapp-rust-ureq-http-client = { git = "https://github.com/jlucaso1/whatsapp-rust" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
