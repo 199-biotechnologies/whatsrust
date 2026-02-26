@@ -244,6 +244,8 @@ fn format_size(bytes: usize) -> String {
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Fields consumed by bot integrations, not the REPL
 pub struct WhatsAppInbound {
+    /// Which bridge instance received this message (for multi-number routing).
+    pub bridge_id: String,
     /// Chat JID (group or individual)
     pub jid: String,
     /// Message ID (for replying, editing, reacting)
@@ -273,6 +275,8 @@ pub struct WhatsAppOutbound {
 }
 
 pub struct BridgeConfig {
+    /// Unique identifier for this bridge instance (for multi-number routing).
+    pub bridge_id: String,
     pub db_path: PathBuf,
     /// Phone number for pair-code linking (e.g. "15551234567"). If None, uses QR.
     pub pair_phone: Option<String>,
@@ -289,6 +293,7 @@ pub struct BridgeConfig {
 impl Default for BridgeConfig {
     fn default() -> Self {
         Self {
+            bridge_id: "default".to_string(),
             db_path: PathBuf::from("whatsapp.db"),
             pair_phone: None,
             max_reconnect_delay: Duration::from_secs(60),
@@ -875,6 +880,7 @@ async fn run_bot_session(
     let auto_mark_read = config.auto_mark_read;
     let allowed_numbers = config.allowed_numbers.clone();
     let dedup_for_events = dedup.clone();
+    let bridge_id = config.bridge_id.clone();
 
     // Build the Bot
     let mut builder = Bot::builder()
@@ -889,8 +895,9 @@ async fn run_bot_session(
             let sr = sr.clone();
             let allowed = allowed_numbers.clone();
             let dedup = dedup_for_events.clone();
+            let bid = bridge_id.clone();
             async move {
-                handle_event(event, client, &ch, &itx, &stx, &store, &sr, auto_mark_read, &allowed, &dedup)
+                handle_event(event, client, &ch, &itx, &stx, &store, &sr, auto_mark_read, &allowed, &dedup, &bid)
                     .await;
             }
         });
@@ -964,6 +971,7 @@ async fn handle_event(
     auto_mark_read: bool,
     allowed_numbers: &[String],
     dedup: &Arc<ParkingMutex<DedupCache>>,
+    bridge_id: &str,
 ) {
     match event {
         Event::PairingQrCode { code, .. } => {
@@ -1015,6 +1023,7 @@ async fn handle_event(
             };
 
             let inbound = WhatsAppInbound {
+                bridge_id: bridge_id.to_string(),
                 jid: info.source.chat.to_string(),
                 id: info.id.clone(),
                 content,
