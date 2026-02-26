@@ -1206,14 +1206,14 @@ async fn handle_event(
                 print!("{}", qr.terminal());
 
                 // Save PNG fallback to temp dir
-                let png_path = std::env::temp_dir().join("picoclaw_qr.png");
+                let png_path = std::env::temp_dir().join("whatsrust_qr.png");
                 match qr.save_png(&png_path, 8) {
                     Ok(()) => info!(path = %png_path.display(), "QR code PNG saved"),
                     Err(e) => debug!(error = %e, "failed to save QR PNG fallback"),
                 }
 
                 // Save HTML fallback to temp dir
-                let html_path = std::env::temp_dir().join("picoclaw_qr.html");
+                let html_path = std::env::temp_dir().join("whatsrust_qr.html");
                 match qr.save_html(&html_path) {
                     Ok(()) => info!(path = %html_path.display(), "QR code HTML saved"),
                     Err(e) => debug!(error = %e, "failed to save QR HTML fallback"),
@@ -1340,7 +1340,7 @@ async fn handle_event(
             let _ = state_tx.send(BridgeState::Disconnected);
         }
         Event::StreamReplaced(_) => {
-            error!("StreamReplaced: another client connected using this same linked device session — stopping to avoid replacement loop. Check for duplicate bridge processes (ps aux | grep picoclaw) or a competing WhatsApp Web/Desktop session.");
+            error!("StreamReplaced: another client connected using this same linked device session — stopping to avoid replacement loop. Check for duplicate bridge processes (ps aux | grep whatsrust) or a competing WhatsApp Web/Desktop session.");
             set_client_handle(client_handle, None);
             stop_reconnect.store(true, Ordering::Relaxed);
             request_disconnect(client.clone());

@@ -1212,33 +1212,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "picoclaw-wa-rust"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "fs2",
- "parking_lot",
- "png",
- "prost",
- "qrcode",
- "rusqlite",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "wacore",
- "wacore-binary",
- "waproto",
- "whatsapp-rust",
- "whatsapp-rust-tokio-transport",
- "whatsapp-rust-ureq-http-client",
-]
-
-[[package]]
 name = "pin-project-lite"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2477,6 +2450,33 @@ dependencies = [
  "tokio",
  "ureq",
  "wacore",
+]
+
+[[package]]
+name = "whatsrust"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "fs2",
+ "parking_lot",
+ "png",
+ "prost",
+ "qrcode",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "wacore",
+ "wacore-binary",
+ "waproto",
+ "whatsapp-rust",
+ "whatsapp-rust-tokio-transport",
+ "whatsapp-rust-ureq-http-client",
 ]
 
 [[package]]

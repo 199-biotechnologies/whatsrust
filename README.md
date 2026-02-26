@@ -1,4 +1,4 @@
-# picoclaw-wa-rust
+# whatsrust
 
 Pure Rust WhatsApp bridge — a lean, single-binary replacement for Baileys (Node.js) sidecars. Designed to be embedded as a library in agent software, dashboards, or any Rust application that needs WhatsApp messaging.
 
@@ -49,7 +49,7 @@ This is designed as a library. Add it to your Cargo.toml or import the modules d
 ### Basic usage
 
 ```rust
-use picoclaw_wa_rust::bridge::{BridgeConfig, WhatsAppBridge, WhatsAppInbound};
+use whatsrust::bridge::{BridgeConfig, WhatsAppBridge, WhatsAppInbound};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -80,7 +80,7 @@ while let Some(msg) = inbound_rx.recv().await {
 Subscribe to QR events and render in your preferred format:
 
 ```rust
-use picoclaw_wa_rust::qr::QrRender;
+use whatsrust::qr::QrRender;
 
 let mut qr_rx = bridge.subscribe_qr();
 while qr_rx.changed().await.is_ok() {

@@ -1,4 +1,4 @@
-//! picoclaw-wa-rust — Pure Rust WhatsApp bridge for picoclaw.
+//! whatsrust — Pure Rust WhatsApp bridge.
 //!
 //! Lean replacement for the Baileys (Node.js) sidecar.
 //! Uses whatsapp-rust (wa-rs) for the WhatsApp Web protocol
@@ -26,11 +26,11 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "picoclaw_wa_rust=info,whatsapp_rust=info".parse().unwrap()),
+                .unwrap_or_else(|_| "whatsrust=info,whatsapp_rust=info".parse().unwrap()),
         )
         .init();
 
-    info!("picoclaw-wa-rust v{}", env!("CARGO_PKG_VERSION"));
+    info!("whatsrust v{}", env!("CARGO_PKG_VERSION"));
 
     let (inbound_tx, mut inbound_rx) = mpsc::channel(256);
     let cancel = CancellationToken::new();
@@ -418,7 +418,7 @@ async fn main() -> Result<()> {
                                     println!(">> sent (id: {}), waiting 3s then editing...", id);
                                     tokio::time::sleep(Duration::from_secs(3)).await;
                                     match bridge_for_repl
-                                        .edit_message(&jid, &id, "EDITED: picoclaw-wa-rust edited this!")
+                                        .edit_message(&jid, &id, "EDITED: whatsrust edited this!")
                                         .await
                                     {
                                         Ok(()) => println!(">> edit sent for {}", id),
