@@ -5,6 +5,7 @@
 //! and our own rusqlite backend for Signal Protocol storage.
 
 mod bridge;
+pub mod qr;
 mod storage;
 
 use std::path::PathBuf;

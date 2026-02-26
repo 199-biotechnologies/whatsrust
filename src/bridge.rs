@@ -354,6 +354,8 @@ pub struct WhatsAppBridge {
     #[allow(dead_code)] // Used by bot integrations via the outbound channel
     outbound_tx: mpsc::Sender<WhatsAppOutbound>,
     state_rx: watch::Receiver<BridgeState>,
+    #[allow(dead_code)] // Used by agent integrations via subscribe_qr()
+    qr_rx: watch::Receiver<Option<String>>,
     cancel: CancellationToken,
     client_handle: Arc<ParkingMutex<Option<Arc<Client>>>>,
 }
@@ -367,6 +369,7 @@ impl WhatsAppBridge {
         cancel: CancellationToken,
     ) -> Self {
         let (state_tx, state_rx) = watch::channel(BridgeState::Disconnected);
+        let (qr_tx, qr_rx) = watch::channel::<Option<String>>(None);
         let (outbound_tx, outbound_rx) = mpsc::channel::<WhatsAppOutbound>(256);
         let client_handle: Arc<ParkingMutex<Option<Arc<Client>>>> =
             Arc::new(ParkingMutex::new(None));
@@ -375,7 +378,7 @@ impl WhatsAppBridge {
         let ch = client_handle.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                run_bridge(config, inbound_tx, outbound_rx, state_tx, cancel_clone, ch).await
+                run_bridge(config, inbound_tx, outbound_rx, state_tx, qr_tx, cancel_clone, ch).await
             {
                 error!(error = %e, "WhatsApp bridge exited with error");
             }
@@ -384,6 +387,7 @@ impl WhatsAppBridge {
         Self {
             outbound_tx,
             state_rx,
+            qr_rx,
             cancel,
             client_handle,
         }
@@ -443,6 +447,14 @@ impl WhatsAppBridge {
             .send_paused(&target)
             .await
             .map_err(|e| anyhow::anyhow!("chatstate error: {e}"))
+    }
+
+    /// Subscribe to QR code events. Returns `Some(data)` when a QR code is available
+    /// for scanning, `None` when pairing completes or session connects.
+    /// Use `crate::qr::QrRender::new(&data)` to render in any format (terminal, HTML, SVG, PNG).
+    #[allow(dead_code)] // Used by agent integrations, not the REPL
+    pub fn subscribe_qr(&self) -> watch::Receiver<Option<String>> {
+        self.qr_rx.clone()
     }
 
     /// Check if the bridge has an active WhatsApp connection.
@@ -792,6 +804,7 @@ async fn run_bridge(
     inbound_tx: mpsc::Sender<WhatsAppInbound>,
     mut outbound_rx: mpsc::Receiver<WhatsAppOutbound>,
     state_tx: watch::Sender<BridgeState>,
+    qr_tx: watch::Sender<Option<String>>,
     cancel: CancellationToken,
     client_handle: Arc<ParkingMutex<Option<Arc<Client>>>>,
 ) -> Result<()> {
@@ -938,6 +951,7 @@ async fn run_bridge(
             &inbound_tx,
             &mut outbound_rx,
             &state_tx,
+            &qr_tx,
             &cancel,
             &client_handle,
             &dedup,
@@ -1002,6 +1016,7 @@ async fn run_bot_session(
     inbound_tx: &mpsc::Sender<WhatsAppInbound>,
     outbound_rx: &mut mpsc::Receiver<WhatsAppOutbound>,
     state_tx: &watch::Sender<BridgeState>,
+    qr_tx: &watch::Sender<Option<String>>,
     cancel: &CancellationToken,
     client_handle: &Arc<ParkingMutex<Option<Arc<Client>>>>,
     dedup: &Arc<ParkingMutex<DedupCache>>,
@@ -1025,6 +1040,7 @@ async fn run_bot_session(
     let dl_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DOWNLOADS));
     let rr_delay_min = config.read_receipt_delay_min_ms;
     let rr_delay_max = config.read_receipt_delay_max_ms;
+    let qtx = Arc::new(qr_tx.clone());
 
     // Build the Bot
     let mut builder = Bot::builder()
@@ -1035,6 +1051,7 @@ async fn run_bot_session(
             let ch = ch.clone();
             let itx = itx.clone();
             let stx = stx.clone();
+            let qtx = qtx.clone();
             let store = store_for_events.clone();
             let sr = sr.clone();
             let allowed = allowed_numbers.clone();
@@ -1042,7 +1059,7 @@ async fn run_bot_session(
             let bid = bridge_id.clone();
             let dl_sem = dl_semaphore.clone();
             async move {
-                handle_event(event, client, &ch, &itx, &stx, &store, &sr, auto_mark_read, &allowed, &dedup, &bid, &dl_sem, rr_delay_min, rr_delay_max)
+                handle_event(event, client, &ch, &itx, &stx, &qtx, &store, &sr, auto_mark_read, &allowed, &dedup, &bid, &dl_sem, rr_delay_min, rr_delay_max)
                     .await;
             }
         });
@@ -1163,6 +1180,7 @@ async fn handle_event(
     client_handle: &Arc<ParkingMutex<Option<Arc<Client>>>>,
     inbound_tx: &mpsc::Sender<WhatsAppInbound>,
     state_tx: &Arc<watch::Sender<BridgeState>>,
+    qr_tx: &Arc<watch::Sender<Option<String>>>,
     store: &Store,
     stop_reconnect: &Arc<AtomicBool>,
     auto_mark_read: bool,
@@ -1175,15 +1193,38 @@ async fn handle_event(
 ) {
     match event {
         Event::PairingQrCode { code, .. } => {
-            render_qr(&code);
+            // Publish raw QR data for agent integrations
+            let _ = qr_tx.send(Some(code.clone()));
+
+            // Render compact half-block QR in terminal
+            if let Some(qr) = crate::qr::QrRender::new(&code) {
+                print!("{}", qr.terminal());
+
+                // Save PNG fallback to temp dir
+                let png_path = std::env::temp_dir().join("picoclaw_qr.png");
+                match qr.save_png(&png_path, 8) {
+                    Ok(()) => info!(path = %png_path.display(), "QR code PNG saved"),
+                    Err(e) => debug!(error = %e, "failed to save QR PNG fallback"),
+                }
+
+                // Save HTML fallback to temp dir
+                let html_path = std::env::temp_dir().join("picoclaw_qr.html");
+                match qr.save_html(&html_path) {
+                    Ok(()) => info!(path = %html_path.display(), "QR code HTML saved"),
+                    Err(e) => debug!(error = %e, "failed to save QR HTML fallback"),
+                }
+            }
+            info!("scan the QR code above with WhatsApp on your phone");
             let _ = state_tx.send(BridgeState::Pairing);
         }
         Event::PairingCode { code, .. } => {
             info!(code = %code, "enter this pair code on your phone");
+            let _ = qr_tx.send(None); // clear any previous QR
             let _ = state_tx.send(BridgeState::Pairing);
         }
         Event::Connected(_) => {
             info!("WhatsApp connected");
+            let _ = qr_tx.send(None); // clear QR on connection
             set_client_handle(client_handle, Some(client.clone()));
             let _ = state_tx.send(BridgeState::Connected);
         }
@@ -2017,25 +2058,6 @@ fn rand_jitter_ms(base_ms: u64) -> u64 {
     seed ^= seed >> 7;
     seed ^= seed << 17;
     seed % (base_ms / 2).max(1)
-}
-
-/// Render a QR code in the terminal using Unicode block characters.
-fn render_qr(data: &str) {
-    use qrcode::QrCode;
-
-    let Ok(code) = QrCode::new(data.as_bytes()) else {
-        error!("failed to generate QR code");
-        return;
-    };
-
-    let string = code
-        .render::<char>()
-        .quiet_zone(true)
-        .module_dimensions(2, 1)
-        .build();
-
-    println!("\n{string}\n");
-    info!("scan the QR code above with WhatsApp on your phone");
 }
 
 // ---------------------------------------------------------------------------
