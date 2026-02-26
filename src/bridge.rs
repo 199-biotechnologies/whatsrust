@@ -408,6 +408,11 @@ impl WhatsAppBridge {
         *self.state_rx.borrow()
     }
 
+    /// Subscribe to bridge state changes.
+    pub fn subscribe_state(&self) -> watch::Receiver<BridgeState> {
+        self.state_rx.clone()
+    }
+
     pub fn stop(&self) {
         self.cancel.cancel();
     }
