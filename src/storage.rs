@@ -10,7 +10,7 @@
 //!   - CREATE TABLE IF NOT EXISTS — no migration framework
 //!   - serde_json only for opaque types (HashState) — everything else is columns
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -159,12 +159,24 @@ CREATE TABLE IF NOT EXISTS tc_tokens (
     sender_timestamp INTEGER
 );
 
+-- Persistent outbound message queue (crash-safe, replaces in-memory VecDeque)
+CREATE TABLE IF NOT EXISTS outbound_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    jid TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    retries INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
 -- Indexes for non-PK lookups
 CREATE INDEX IF NOT EXISTS idx_lid_pn_phone ON lid_pn_mapping(phone_number);
 CREATE INDEX IF NOT EXISTS idx_tc_tokens_ts ON tc_tokens(token_timestamp);
+CREATE INDEX IF NOT EXISTS idx_outbound_status ON outbound_queue(status, id);
 ";
 
-const CURRENT_SCHEMA_VERSION: i64 = 1;
+const CURRENT_SCHEMA_VERSION: i64 = 2;
 
 // ---------------------------------------------------------------------------
 // Store
@@ -173,6 +185,21 @@ const CURRENT_SCHEMA_VERSION: i64 = 1;
 #[derive(Clone)]
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
+}
+
+/// A row from the outbound message queue.
+#[derive(Debug, Clone)]
+pub struct OutboundRow {
+    pub id: i64,
+    pub jid: String,
+    pub payload: String,
+    pub retries: i32,
+}
+
+/// Statistics from a prune operation.
+#[derive(Debug, Clone)]
+pub struct PruneStats {
+    pub sent_deleted: u32,
 }
 
 impl Store {
@@ -185,7 +212,12 @@ impl Store {
              PRAGMA busy_timeout = 5000;
              PRAGMA cache_size = -2000;
              PRAGMA foreign_keys = ON;
-             PRAGMA temp_store = MEMORY;",
+             PRAGMA temp_store = MEMORY;
+             PRAGMA fullfsync = ON;
+             PRAGMA journal_size_limit = 67108864;
+             PRAGMA mmap_size = 268435456;
+             PRAGMA wal_autocheckpoint = 1000;
+             PRAGMA auto_vacuum = INCREMENTAL;",
         )
         .map_err(db_err)?;
         conn.execute_batch(SCHEMA).map_err(db_err)?;
@@ -219,7 +251,6 @@ impl Store {
     }
 
     /// Create a hot backup of the database using SQLite's backup API.
-    #[allow(dead_code)] // Available for scheduled backups
     pub fn snapshot_db(&self, dest_path: &Path) -> Result<()> {
         let guard = self.conn.lock();
         let mut dest = Connection::open(dest_path).map_err(db_err)?;
@@ -228,6 +259,215 @@ impl Store {
             .run_to_completion(100, std::time::Duration::from_millis(10), None)
             .map_err(db_err)?;
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Outbound queue — persistent message queue (crash-safe)
+    // -----------------------------------------------------------------------
+
+    /// Enqueue a message for outbound delivery. Returns the row ID.
+    pub async fn enqueue_outbound(&self, jid: &str, payload: &str) -> Result<i64> {
+        let j = jid.to_owned();
+        let p = payload.to_owned();
+        let ts = now_secs();
+        self.run(move |c| {
+            c.execute(
+                "INSERT INTO outbound_queue (jid, payload, status, retries, created_at, updated_at)
+                 VALUES (?1, ?2, 'queued', 0, ?3, ?3)",
+                params![j, p, ts],
+            )
+            .map_err(db_err)?;
+            Ok(c.last_insert_rowid())
+        })
+        .await
+    }
+
+    /// Atomically claim the next queued message for processing.
+    /// Sets status to 'inflight' and returns the row, or None if queue is empty.
+    pub async fn claim_next_outbound(&self) -> Result<Option<OutboundRow>> {
+        let ts = now_secs();
+        self.run(move |c| {
+            let tx = c.unchecked_transaction().map_err(db_err)?;
+            let row = tx
+                .query_row(
+                    "SELECT id, jid, payload, retries FROM outbound_queue
+                     WHERE status = 'queued' ORDER BY id LIMIT 1",
+                    [],
+                    |row| {
+                        Ok(OutboundRow {
+                            id: row.get(0)?,
+                            jid: row.get(1)?,
+                            payload: row.get(2)?,
+                            retries: row.get(3)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(db_err)?;
+            if let Some(ref r) = row {
+                tx.execute(
+                    "UPDATE outbound_queue SET status = 'inflight', updated_at = ?1 WHERE id = ?2",
+                    params![ts, r.id],
+                )
+                .map_err(db_err)?;
+            }
+            tx.commit().map_err(db_err)?;
+            Ok(row)
+        })
+        .await
+    }
+
+    /// Mark an outbound message as successfully sent.
+    pub async fn mark_outbound_sent(&self, id: i64) -> Result<()> {
+        let ts = now_secs();
+        self.run(move |c| {
+            c.execute(
+                "UPDATE outbound_queue SET status = 'sent', updated_at = ?1 WHERE id = ?2",
+                params![ts, id],
+            )
+            .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Mark an outbound message as failed (increment retries).
+    /// If retries >= max_retries, status becomes 'failed'; otherwise back to 'queued'.
+    pub async fn mark_outbound_failed(&self, id: i64, max_retries: i32) -> Result<()> {
+        let ts = now_secs();
+        self.run(move |c| {
+            c.execute(
+                "UPDATE outbound_queue SET
+                    retries = retries + 1,
+                    status = CASE WHEN retries + 1 >= ?1 THEN 'failed' ELSE 'queued' END,
+                    updated_at = ?2
+                 WHERE id = ?3",
+                params![max_retries, ts, id],
+            )
+            .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Requeue messages stuck in 'inflight' for longer than the given threshold.
+    /// This handles process crashes where inflight messages were never completed.
+    pub async fn requeue_stale_inflight(&self, older_than_secs: i64) -> Result<u32> {
+        let cutoff = now_secs() - older_than_secs;
+        self.run(move |c| {
+            let count = c
+                .execute(
+                    "UPDATE outbound_queue SET status = 'queued', updated_at = ?1
+                     WHERE status = 'inflight' AND updated_at < ?2",
+                    params![now_secs(), cutoff],
+                )
+                .map_err(db_err)?;
+            u32::try_from(count).map_err(|_| {
+                StoreError::Database(format!("requeue count {count} out of u32 range"))
+            })
+        })
+        .await
+    }
+
+    /// Requeue a specific outbound message without incrementing retries.
+    /// Used when the message can't be sent due to connection issues (not send failures).
+    pub async fn requeue_outbound(&self, id: i64) -> Result<()> {
+        self.run(move |c| {
+            c.execute(
+                "UPDATE outbound_queue SET status = 'queued', updated_at = ?1 WHERE id = ?2",
+                params![now_secs(), id],
+            )
+            .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Get the number of messages in queued or inflight status.
+    pub async fn outbound_queue_depth(&self) -> Result<i64> {
+        self.run(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM outbound_queue WHERE status IN ('queued', 'inflight')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(db_err)
+        })
+        .await
+    }
+
+    // -----------------------------------------------------------------------
+    // Database pruning — prevent unbounded growth
+    // -----------------------------------------------------------------------
+
+    /// Prune old data from the database. Returns counts of deleted rows.
+    pub async fn prune_old_data(&self, sent_retention_secs: i64) -> Result<PruneStats> {
+        let sent_cutoff = now_secs() - sent_retention_secs;
+        self.run(move |c| {
+            let tx = c.unchecked_transaction().map_err(db_err)?;
+
+            // 1. Delete completed outbound messages older than retention period
+            let sent_deleted = tx
+                .execute(
+                    "DELETE FROM outbound_queue WHERE status IN ('sent', 'failed') AND created_at < ?1",
+                    params![sent_cutoff],
+                )
+                .map_err(db_err)? as u32;
+
+            tx.commit().map_err(db_err)?;
+
+            // 2. Reclaim disk space progressively (no-op if auto_vacuum != INCREMENTAL)
+            let _ = c.execute_batch("PRAGMA incremental_vacuum(500);");
+
+            Ok(PruneStats { sent_deleted })
+        })
+        .await
+    }
+
+    // -----------------------------------------------------------------------
+    // Backup — timestamped snapshots with rotation
+    // -----------------------------------------------------------------------
+
+    /// Create a timestamped backup in `backup_dir`, keeping at most `max_backups`.
+    /// Returns the path to the new backup file.
+    pub fn perform_backup(&self, backup_dir: &Path, max_backups: usize) -> Result<PathBuf> {
+        // Ensure backup directory exists
+        std::fs::create_dir_all(backup_dir)
+            .map_err(|e| StoreError::Database(format!("create backup dir: {e}")))?;
+
+        // Generate timestamped filename
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let filename = format!("whatsapp_backup_{ts}.db");
+        let dest_path = backup_dir.join(&filename);
+
+        // Perform the hot backup
+        self.snapshot_db(&dest_path)?;
+
+        // Rotate: list backups, sort by name, delete oldest if over limit
+        if let Ok(entries) = std::fs::read_dir(backup_dir) {
+            let mut backups: Vec<PathBuf> = entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.starts_with("whatsapp_backup_") && n.ends_with(".db"))
+                        .unwrap_or(false)
+                })
+                .collect();
+            backups.sort();
+            while backups.len() > max_backups {
+                if let Some(oldest) = backups.first() {
+                    let _ = std::fs::remove_file(oldest);
+                }
+                backups.remove(0);
+            }
+        }
+
+        Ok(dest_path)
     }
 }
 
@@ -238,8 +478,17 @@ fn run_schema_migrations(conn: &Connection, from_version: i64) -> Result<()> {
         )));
     }
 
+    if from_version < 1 {
+        // v0→v1: initial schema (tables created by SCHEMA execute_batch above).
+    }
+
+    if from_version < 2 {
+        // v1→v2: outbound_queue table (idempotent — CREATE IF NOT EXISTS in SCHEMA).
+        // For existing DBs: the table was already created by the SCHEMA batch above.
+        // Just stamp the version.
+    }
+
     if from_version < CURRENT_SCHEMA_VERSION {
-        // v1 bootstrap: schema is already applied via SCHEMA execute_batch; stamp version.
         conn.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)
             .map_err(db_err)?;
     }
@@ -272,7 +521,7 @@ fn deserialize_keypair(bytes: &[u8]) -> Result<KeyPair> {
     Ok(KeyPair::new(public, private))
 }
 
-fn now_secs() -> i64 {
+pub(crate) fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

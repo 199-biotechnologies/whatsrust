@@ -45,10 +45,22 @@ async fn main() -> Result<()> {
         info!(allowed = ?allowed, "sender allowlist active");
     }
 
+    let health_port: u16 = std::env::var("HEALTH_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    let backup_dir = std::env::var("BACKUP_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| Some(PathBuf::from("whatsapp.db.backups")));
+
     let config = BridgeConfig {
         db_path: PathBuf::from("whatsapp.db"),
         pair_phone: std::env::var("WHATSAPP_PAIR_PHONE").ok(),
         allowed_numbers: allowed,
+        health_port,
+        backup_dir,
         ..Default::default()
     };
 
@@ -446,7 +458,27 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Wait for Ctrl-C or quit command
+    // Wait for Ctrl-C, SIGTERM, or quit command
+    let cancel_for_signals = cancel.clone();
+    tokio::spawn(async move {
+        let ctrl_c = tokio::signal::ctrl_c();
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = signal(SignalKind::terminate()).expect("failed to register SIGTERM");
+            tokio::select! {
+                _ = ctrl_c => info!("SIGINT received"),
+                _ = sigterm.recv() => info!("SIGTERM received"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            ctrl_c.await.expect("failed to listen for ctrl-c");
+            info!("SIGINT received");
+        }
+        cancel_for_signals.cancel();
+    });
+
     cancel.cancelled().await;
     info!("shutting down...");
     bridge.stop();

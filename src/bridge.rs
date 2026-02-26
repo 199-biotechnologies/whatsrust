@@ -16,7 +16,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex as ParkingMutex;
-use tokio::sync::{mpsc, watch};
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
+use tokio::sync::{mpsc, watch, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -35,9 +37,12 @@ use whatsapp_rust_ureq_http_client::UreqHttpClient;
 use crate::storage::Store;
 
 const OUTBOUND_RETRY_DELAY: Duration = Duration::from_millis(500);
-const MAX_OUTBOUND_RETRY_QUEUE: usize = 2048;
 /// Max message IDs to remember for dedup (prevents double-processing on reconnect).
 const DEDUP_CACHE_CAPACITY: usize = 4096;
+/// Maximum media file size we'll download (bytes). Larger files are skipped.
+const MAX_MEDIA_BYTES: u64 = 50 * 1024 * 1024; // 50 MiB
+/// Maximum concurrent media downloads (bounds peak memory usage).
+const MAX_CONCURRENT_DOWNLOADS: usize = 4;
 
 // ---------------------------------------------------------------------------
 // Dedup cache — bounded ring-buffer set to prevent double-processing
@@ -60,10 +65,15 @@ impl DedupCache {
         }
     }
 
-    /// Returns true if the ID was already seen. Otherwise inserts it.
-    fn check_and_insert(&mut self, id: &str) -> bool {
+    /// Returns true if the ID was already seen (check only, does not insert).
+    fn is_seen(&self, id: &str) -> bool {
+        self.seen.contains(id)
+    }
+
+    /// Insert an ID into the dedup set (evicts oldest if full).
+    fn insert(&mut self, id: &str) {
         if self.seen.contains(id) {
-            return true;
+            return;
         }
         if self.order.len() >= self.capacity {
             if let Some(old) = self.order.pop_front() {
@@ -73,7 +83,6 @@ impl DedupCache {
         let owned = id.to_string();
         self.seen.insert(owned.clone());
         self.order.push_back(owned);
-        false
     }
 }
 
@@ -94,6 +103,16 @@ pub enum BridgeState {
 enum SessionAction {
     Retry,
     Stop,
+}
+
+/// Tri-state result from content extraction — drives two-phase dedup.
+enum ExtractResult {
+    /// Successfully extracted content — dedup after enqueue.
+    Content(InboundContent),
+    /// Unknown/unhandled message type — dedup immediately (no point retrying).
+    Unhandled,
+    /// Transient failure (e.g. media download error) — do NOT dedup, allow retry.
+    TransientFailure,
 }
 
 /// Content variants for inbound WhatsApp messages.
@@ -264,14 +283,10 @@ pub struct WhatsAppInbound {
     pub is_from_me: bool,
 }
 
-/// Maximum retries before dropping an outbound message.
-const MAX_OUTBOUND_RETRIES: u32 = 3;
-
 #[derive(Debug, Clone)]
 pub struct WhatsAppOutbound {
     pub jid: String,
     pub text: String,
-    retries: u32,
 }
 
 pub struct BridgeConfig {
@@ -288,6 +303,24 @@ pub struct BridgeConfig {
     pub auto_mark_read: bool,
     /// If non-empty, only process inbound messages from these phone numbers (digits only).
     pub allowed_numbers: Vec<String>,
+    /// Minimum delay before sending a read receipt (anti-ban pacing, millis).
+    pub read_receipt_delay_min_ms: u64,
+    /// Maximum delay before sending a read receipt (anti-ban pacing, millis).
+    pub read_receipt_delay_max_ms: u64,
+    /// Minimum interval between outbound sends (anti-ban pacing, millis).
+    pub min_send_interval_ms: u64,
+    /// TCP port for the health endpoint (0 = disabled).
+    pub health_port: u16,
+    /// Seconds to wait for in-flight operations during graceful shutdown.
+    pub drain_timeout_secs: u64,
+    /// Directory for SQLite backups (None = disabled).
+    pub backup_dir: Option<PathBuf>,
+    /// Interval between automatic backups in seconds (default: 6 hours).
+    pub backup_interval_secs: u64,
+    /// Interval between database prune runs in seconds (default: 1 hour).
+    pub prune_interval_secs: u64,
+    /// Maximum outbound retries before marking as permanently failed.
+    pub max_outbound_retries: i32,
 }
 
 impl Default for BridgeConfig {
@@ -300,6 +333,15 @@ impl Default for BridgeConfig {
             skip_history_sync: true,
             auto_mark_read: true,
             allowed_numbers: Vec::new(),
+            read_receipt_delay_min_ms: 500,
+            read_receipt_delay_max_ms: 3000,
+            min_send_interval_ms: 400,
+            health_port: 0,
+            drain_timeout_secs: 10,
+            backup_dir: None,
+            backup_interval_secs: 6 * 3600,
+            prune_interval_secs: 3600,
+            max_outbound_retries: 3,
         }
     }
 }
@@ -353,7 +395,6 @@ impl WhatsAppBridge {
             .send(WhatsAppOutbound {
                 jid: jid.to_string(),
                 text: text.to_string(),
-                retries: 0,
             })
             .await
             .context("outbound channel closed")
@@ -759,7 +800,7 @@ async fn run_bridge(
     // Open our lean rusqlite storage backend
     let store = Store::new(&config.db_path).context("failed to open WhatsApp storage database")?;
 
-    // DB integrity check on startup (runs on blocking thread to avoid stalling async executor)
+    // DB integrity check on startup
     {
         let store_check = store.clone();
         let check_result = tokio::task::spawn_blocking(move || {
@@ -781,6 +822,24 @@ async fn run_bridge(
         }
     }
 
+    // Recover any messages stuck in 'inflight' from a previous crash
+    match store.requeue_stale_inflight(60).await {
+        Ok(n) if n > 0 => info!(count = n, "requeued stale inflight messages from previous session"),
+        Ok(_) => {}
+        Err(e) => warn!(error = %e, "failed to requeue stale inflight messages"),
+    }
+
+    // Startup backup
+    if let Some(ref backup_dir) = config.backup_dir {
+        let store_bk = store.clone();
+        let dir = backup_dir.clone();
+        match tokio::task::spawn_blocking(move || store_bk.perform_backup(&dir, 3)).await {
+            Ok(Ok(path)) => info!(path = %path.display(), "startup backup complete"),
+            Ok(Err(e)) => warn!(error = %e, "startup backup failed"),
+            Err(e) => warn!(error = %e, "startup backup task panicked"),
+        }
+    }
+
     // Message dedup cache survives reconnections
     let dedup = Arc::new(ParkingMutex::new(DedupCache::new(DEDUP_CACHE_CAPACITY)));
 
@@ -795,11 +854,82 @@ async fn run_bridge(
         }
     }
 
+    // Spawn health endpoint
+    if config.health_port > 0 {
+        let health_state_rx = state_tx.subscribe();
+        let health_store = store.clone();
+        let health_cancel = cancel.clone();
+        tokio::spawn(async move {
+            spawn_health_server(config.health_port, health_state_rx, health_store, health_cancel).await;
+        });
+        info!(port = config.health_port, "health endpoint started");
+    }
+
+    // Spawn periodic backup task
+    if let Some(ref backup_dir) = config.backup_dir {
+        let bk_store = store.clone();
+        let bk_dir = backup_dir.clone();
+        let bk_cancel = cancel.clone();
+        let bk_interval = config.backup_interval_secs;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(bk_interval));
+            interval.tick().await; // skip immediate first tick (startup backup already done)
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let s = bk_store.clone();
+                        let d = bk_dir.clone();
+                        match tokio::task::spawn_blocking(move || s.perform_backup(&d, 3)).await {
+                            Ok(Ok(path)) => info!(path = %path.display(), "periodic backup complete"),
+                            Ok(Err(e)) => warn!(error = %e, "periodic backup failed"),
+                            Err(e) => warn!(error = %e, "periodic backup task panicked"),
+                        }
+                    }
+                    _ = bk_cancel.cancelled() => break,
+                }
+            }
+        });
+    }
+
+    // Spawn periodic prune task
+    {
+        let prune_store = store.clone();
+        let prune_cancel = cancel.clone();
+        let prune_interval = config.prune_interval_secs;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(prune_interval));
+            interval.tick().await; // skip immediate first tick
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        // Prune sent/failed messages older than 24 hours
+                        match prune_store.prune_old_data(86400).await {
+                            Ok(stats) => {
+                                if stats.sent_deleted > 0 {
+                                    info!(sent = stats.sent_deleted, "database pruned");
+                                }
+                            }
+                            Err(e) => warn!(error = %e, "database prune failed"),
+                        }
+                    }
+                    _ = prune_cancel.cancelled() => break,
+                }
+            }
+        });
+    }
+
     let mut backoff = Duration::from_secs(1);
 
     loop {
         if cancel.is_cancelled() {
             break;
+        }
+
+        // Recover inflight messages stranded by previous session's tokio::select! drop
+        match store.requeue_stale_inflight(30).await {
+            Ok(n) if n > 0 => info!(count = n, "requeued stale inflight messages before reconnect"),
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "failed to requeue stale inflight messages"),
         }
 
         let result = run_bot_session(
@@ -846,6 +976,17 @@ async fn run_bridge(
         backoff = (backoff * 2).min(config.max_reconnect_delay);
     }
 
+    // Shutdown backup
+    if let Some(ref backup_dir) = config.backup_dir {
+        let store_bk = store.clone();
+        let dir = backup_dir.clone();
+        match tokio::task::spawn_blocking(move || store_bk.perform_backup(&dir, 3)).await {
+            Ok(Ok(path)) => info!(path = %path.display(), "shutdown backup complete"),
+            Ok(Err(e)) => warn!(error = %e, "shutdown backup failed"),
+            Err(e) => warn!(error = %e, "shutdown backup task panicked"),
+        }
+    }
+
     let _ = state_tx.send(BridgeState::Stopped);
     info!("WhatsApp bridge stopped");
     Ok(())
@@ -881,6 +1022,9 @@ async fn run_bot_session(
     let allowed_numbers = config.allowed_numbers.clone();
     let dedup_for_events = dedup.clone();
     let bridge_id = config.bridge_id.clone();
+    let dl_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DOWNLOADS));
+    let rr_delay_min = config.read_receipt_delay_min_ms;
+    let rr_delay_max = config.read_receipt_delay_max_ms;
 
     // Build the Bot
     let mut builder = Bot::builder()
@@ -896,8 +1040,9 @@ async fn run_bot_session(
             let allowed = allowed_numbers.clone();
             let dedup = dedup_for_events.clone();
             let bid = bridge_id.clone();
+            let dl_sem = dl_semaphore.clone();
             async move {
-                handle_event(event, client, &ch, &itx, &stx, &store, &sr, auto_mark_read, &allowed, &dedup, &bid)
+                handle_event(event, client, &ch, &itx, &stx, &store, &sr, auto_mark_read, &allowed, &dedup, &bid, &dl_sem, rr_delay_min, rr_delay_max)
                     .await;
             }
         });
@@ -939,7 +1084,7 @@ async fn run_bot_session(
                 }
             }
         }
-        _ = handle_outbound(outbound_rx, &client_handle, cancel) => {
+        _ = handle_outbound(outbound_rx, &client_handle, cancel, config.min_send_interval_ms, store, config.max_outbound_retries) => {
             if cancel.is_cancelled() || stop_reconnect.load(Ordering::Relaxed) {
                 Ok(SessionAction::Stop)
             } else {
@@ -947,10 +1092,62 @@ async fn run_bot_session(
             }
         }
         _ = cancel.cancelled() => {
-            info!("bridge shutdown requested");
-            if let Some(client) = get_client_handle(&client_handle) {
-                client.disconnect().await;
+            info!("bridge shutdown requested — draining in-flight operations");
+            let drain_timeout = Duration::from_secs(config.drain_timeout_secs);
+
+            // Drain: persist any remaining channel messages to SQLite, then attempt to send inflight
+            let drain_result = tokio::time::timeout(drain_timeout, async {
+                // Persist remaining channel messages to SQLite queue
+                while let Ok(out) = outbound_rx.try_recv() {
+                    if let Err(e) = store.enqueue_outbound(&out.jid, &out.text).await {
+                        warn!(error = %e, "failed to persist outbound message during shutdown");
+                    }
+                }
+
+                // Try to send any inflight messages if we still have a connection
+                if let Some(client) = get_client_handle(&client_handle) {
+                    let mut sent = 0u32;
+                    while let Ok(Some(row)) = store.claim_next_outbound().await {
+                        let jid = match parse_jid(&row.jid) {
+                            Ok(j) => j,
+                            Err(_) => {
+                                let _ = store.mark_outbound_failed(row.id, config.max_outbound_retries).await;
+                                continue;
+                            }
+                        };
+                        let msg = wa::Message {
+                            conversation: Some(row.payload.clone()),
+                            ..Default::default()
+                        };
+                        match client.send_message(jid, msg).await {
+                            Ok(_) => {
+                                let _ = store.mark_outbound_sent(row.id).await;
+                                sent += 1;
+                            }
+                            Err(_) => {
+                                // Put back for next session
+                                let _ = store.mark_outbound_failed(row.id, config.max_outbound_retries).await;
+                                break;
+                            }
+                        }
+                    }
+                    if sent > 0 {
+                        info!(count = sent, "drained outbound messages during shutdown");
+                    }
+
+                    client.disconnect().await;
+                }
+            })
+            .await;
+
+            if drain_result.is_err() {
+                warn!(timeout_secs = config.drain_timeout_secs, "shutdown drain timed out");
+                if let Some(client) = get_client_handle(&client_handle) {
+                    client.disconnect().await;
+                }
             }
+
+            info!("graceful shutdown complete");
             Ok(SessionAction::Stop)
         }
     }
@@ -972,6 +1169,9 @@ async fn handle_event(
     allowed_numbers: &[String],
     dedup: &Arc<ParkingMutex<DedupCache>>,
     bridge_id: &str,
+    dl_semaphore: &Semaphore,
+    rr_delay_min_ms: u64,
+    rr_delay_max_ms: u64,
 ) {
     match event {
         Event::PairingQrCode { code, .. } => {
@@ -988,8 +1188,8 @@ async fn handle_event(
             let _ = state_tx.send(BridgeState::Connected);
         }
         Event::Message(msg, info) => {
-            // Dedup: skip messages we've already processed (e.g. after reconnect)
-            if dedup.lock().check_and_insert(&info.id) {
+            // Two-phase dedup: check first (don't insert yet)
+            if dedup.lock().is_seen(&info.id) {
                 debug!(id = %info.id, "duplicate message, skipping");
                 return;
             }
@@ -1002,6 +1202,7 @@ async fn handle_event(
                 && !info.source.is_from_me
                 && !allowed_numbers.iter().any(|n| n == &sender)
             {
+                dedup.lock().insert(&info.id);
                 debug!(sender = %sender, "message from non-allowed sender, skipping");
                 return;
             }
@@ -1009,47 +1210,73 @@ async fn handle_event(
             // Extract reply-to context from any message type
             let reply_to = extract_reply_to(&msg);
 
-            // Try to extract content from the message
-            let content = extract_content(&msg, &client).await;
+            // Try to extract content (with media size guard + download semaphore)
+            let result = extract_content(&msg, &client, dl_semaphore).await;
 
-            let Some(content) = content else {
-                debug!(
-                    message_kind = message_kind(&msg),
-                    chat = %info.source.chat,
-                    sender = %sender,
-                    "unhandled inbound message type"
-                );
-                return;
-            };
+            match result {
+                ExtractResult::Content(content) => {
+                    let inbound = WhatsAppInbound {
+                        bridge_id: bridge_id.to_string(),
+                        jid: info.source.chat.to_string(),
+                        id: info.id.clone(),
+                        content,
+                        sender,
+                        sender_raw,
+                        timestamp: info.timestamp.timestamp(),
+                        reply_to,
+                        is_from_me: info.source.is_from_me,
+                    };
 
-            let inbound = WhatsAppInbound {
-                bridge_id: bridge_id.to_string(),
-                jid: info.source.chat.to_string(),
-                id: info.id.clone(),
-                content,
-                sender,
-                sender_raw,
-                timestamp: info.timestamp.timestamp(),
-                reply_to,
-                is_from_me: info.source.is_from_me,
-            };
+                    match inbound_tx.send(inbound).await {
+                        Ok(()) => {
+                            // Commit to dedup only after successful enqueue
+                            dedup.lock().insert(&info.id);
+                        }
+                        Err(e) => {
+                            // Channel closed — do NOT insert into dedup so message isn't lost
+                            warn!(error = %e, "inbound channel closed, message NOT deduped");
+                        }
+                    }
 
-            if let Err(e) = inbound_tx.send(inbound).await {
-                warn!(error = %e, "inbound channel closed");
-            } else if auto_mark_read && !info.source.is_from_me {
-                let group_sender = if info.source.is_group {
-                    Some(&info.source.sender)
-                } else {
-                    None
-                };
-                if let Err(e) = client
-                    .mark_as_read(&info.source.chat, group_sender, vec![info.id.clone()])
-                    .await
-                {
-                    warn!(
-                        error = %e,
+                    // Jittered read receipt (anti-ban pacing)
+                    if auto_mark_read && !info.source.is_from_me {
+                        let range = rr_delay_max_ms.saturating_sub(rr_delay_min_ms).max(1);
+                        let jitter = rand_jitter_ms(range * 2) % range; // full [0, range) distribution
+                        let delay = Duration::from_millis(rr_delay_min_ms + jitter);
+                        tokio::time::sleep(delay).await;
+                        let group_sender = if info.source.is_group {
+                            Some(&info.source.sender)
+                        } else {
+                            None
+                        };
+                        if let Err(e) = client
+                            .mark_as_read(&info.source.chat, group_sender, vec![info.id.clone()])
+                            .await
+                        {
+                            warn!(
+                                error = %e,
+                                chat = %info.source.chat,
+                                "failed to send read receipt"
+                            );
+                        }
+                    }
+                }
+                ExtractResult::Unhandled => {
+                    // Unknown type — dedup immediately (no point retrying)
+                    dedup.lock().insert(&info.id);
+                    debug!(
+                        message_kind = message_kind(&msg),
                         chat = %info.source.chat,
-                        "failed to send read receipt"
+                        sender = %sender,
+                        "unhandled inbound message type"
+                    );
+                }
+                ExtractResult::TransientFailure => {
+                    // Transient failure — do NOT dedup so the message can be retried on redeliver
+                    warn!(
+                        id = %info.id,
+                        chat = %info.source.chat,
+                        "transient extraction failure, will retry on redeliver"
                     );
                 }
             }
@@ -1097,14 +1324,27 @@ async fn handle_event(
             let _ = state_tx.send(BridgeState::Disconnected);
         }
         Event::UndecryptableMessage(info) => {
-            debug!(?info, "undecryptable message (sender key not yet received)");
+            info!(
+                chat = %info.info.source.chat,
+                sender = %info.info.source.sender,
+                "undecryptable message — library will auto-retry via retry receipt + PDO"
+            );
         }
         Event::Receipt(receipt) => {
-            debug!(
+            info!(
                 receipt_type = ?receipt.r#type,
-                message_count = receipt.message_ids.len(),
+                message_ids = ?receipt.message_ids,
                 chat = %receipt.source.chat,
-                "receipt update"
+                sender = %receipt.source.sender,
+                "receipt"
+            );
+        }
+        Event::DeviceListUpdate(update) => {
+            info!(
+                user = %update.user,
+                update_type = ?update.update_type,
+                device_count = update.devices.len(),
+                "contact device list changed — library will re-encrypt for new device set"
             );
         }
         Event::OfflineSyncCompleted(summary) => {
@@ -1112,6 +1352,17 @@ async fn handle_event(
                 count = summary.count,
                 "offline sync completed — real-time messages active"
             );
+        }
+        Event::Disconnected(_) => {
+            warn!("WhatsApp disconnected (transport drop)");
+            set_client_handle(client_handle, None);
+            let _ = state_tx.send(BridgeState::Disconnected);
+        }
+        Event::PairSuccess(_) => {
+            info!("pair code accepted — device paired successfully");
+        }
+        Event::PairError(err) => {
+            error!(?err, "pairing failed");
         }
         _ => {
             debug!(?event, "unhandled event");
@@ -1172,30 +1423,30 @@ fn extract_reply_to(msg: &wa::Message) -> Option<String> {
 const MAX_EXTRACT_DEPTH: u8 = 3;
 
 /// Try to extract structured content from an inbound message.
-/// Returns None for message types we don't bridge yet.
-async fn extract_content(msg: &wa::Message, client: &Arc<Client>) -> Option<InboundContent> {
-    extract_content_inner(msg, client, 0).await
+async fn extract_content(msg: &wa::Message, client: &Arc<Client>, dl_semaphore: &Semaphore) -> ExtractResult {
+    extract_content_inner(msg, client, dl_semaphore, 0).await
 }
 
 /// Inner recursive extractor with depth limit.
 async fn extract_content_inner(
     msg: &wa::Message,
     client: &Arc<Client>,
+    dl_semaphore: &Semaphore,
     depth: u8,
-) -> Option<InboundContent> {
+) -> ExtractResult {
     if depth > MAX_EXTRACT_DEPTH {
         warn!(depth, "extract_content recursion limit reached, skipping");
-        return None;
+        return ExtractResult::Unhandled;
     }
     // --- Text ---
     if let Some(ref text) = msg.conversation {
-        return Some(InboundContent::Text {
+        return ExtractResult::Content(InboundContent::Text {
             body: text.clone(),
         });
     }
     if let Some(ref ext) = msg.extended_text_message {
         if let Some(ref text) = ext.text {
-            return Some(InboundContent::Text {
+            return ExtractResult::Content(InboundContent::Text {
                 body: text.clone(),
             });
         }
@@ -1203,61 +1454,81 @@ async fn extract_content_inner(
 
     // --- Image ---
     if let Some(ref img) = msg.image_message {
+        if let Some(len) = img.file_length {
+            if len > MAX_MEDIA_BYTES { warn!(size = len, "image exceeds size limit, skipping"); return ExtractResult::Unhandled; }
+        }
         let caption = img.caption.clone();
         let mime = img.mimetype.clone().unwrap_or_else(|| "image/jpeg".to_string());
+        let _permit = dl_semaphore.acquire().await.expect("semaphore closed");
         match client.download(img.as_ref() as &dyn Downloadable).await {
             Ok(data) => {
-                return Some(InboundContent::Image { data, mime, caption });
+                if data.len() as u64 > MAX_MEDIA_BYTES { warn!(size = data.len(), "downloaded image exceeds size limit"); return ExtractResult::Unhandled; }
+                return ExtractResult::Content(InboundContent::Image { data, mime, caption });
             }
             Err(e) => {
-                warn!(error = %e, "failed to download image, skipping");
-                return None;
+                warn!(error = %e, "failed to download image");
+                return ExtractResult::TransientFailure;
             }
         }
     }
 
     // --- Video (includes PTV/video notes) ---
     if let Some(ref vid) = msg.video_message {
+        if let Some(len) = vid.file_length {
+            if len > MAX_MEDIA_BYTES { warn!(size = len, "video exceeds size limit, skipping"); return ExtractResult::Unhandled; }
+        }
         let caption = vid.caption.clone();
         let mime = vid.mimetype.clone().unwrap_or_else(|| "video/mp4".to_string());
+        let _permit = dl_semaphore.acquire().await.expect("semaphore closed");
         match client.download(vid.as_ref() as &dyn Downloadable).await {
             Ok(data) => {
-                return Some(InboundContent::Video { data, mime, caption });
+                if data.len() as u64 > MAX_MEDIA_BYTES { warn!(size = data.len(), "downloaded video exceeds size limit"); return ExtractResult::Unhandled; }
+                return ExtractResult::Content(InboundContent::Video { data, mime, caption });
             }
             Err(e) => {
-                warn!(error = %e, "failed to download video, skipping");
-                return None;
+                warn!(error = %e, "failed to download video");
+                return ExtractResult::TransientFailure;
             }
         }
     }
 
     // --- Audio ---
     if let Some(ref aud) = msg.audio_message {
+        if let Some(len) = aud.file_length {
+            if len > MAX_MEDIA_BYTES { warn!(size = len, "audio exceeds size limit, skipping"); return ExtractResult::Unhandled; }
+        }
         let mime = aud.mimetype.clone().unwrap_or_else(|| "audio/ogg".to_string());
         let seconds = aud.seconds;
         let is_voice = aud.ptt.unwrap_or(false);
+        let _permit = dl_semaphore.acquire().await.expect("semaphore closed");
         match client.download(aud.as_ref() as &dyn Downloadable).await {
             Ok(data) => {
-                return Some(InboundContent::Audio { data, mime, seconds, is_voice });
+                if data.len() as u64 > MAX_MEDIA_BYTES { warn!(size = data.len(), "downloaded audio exceeds size limit"); return ExtractResult::Unhandled; }
+                return ExtractResult::Content(InboundContent::Audio { data, mime, seconds, is_voice });
             }
             Err(e) => {
-                warn!(error = %e, "failed to download audio, skipping");
-                return None;
+                warn!(error = %e, "failed to download audio");
+                return ExtractResult::TransientFailure;
             }
         }
     }
 
     // --- Document ---
     if let Some(ref doc) = msg.document_message {
+        if let Some(len) = doc.file_length {
+            if len > MAX_MEDIA_BYTES { warn!(size = len, "document exceeds size limit, skipping"); return ExtractResult::Unhandled; }
+        }
         let mime = doc.mimetype.clone().unwrap_or_else(|| "application/octet-stream".to_string());
         let filename = doc.file_name.clone().unwrap_or_else(|| "file".to_string());
+        let _permit = dl_semaphore.acquire().await.expect("semaphore closed");
         match client.download(doc.as_ref() as &dyn Downloadable).await {
             Ok(data) => {
-                return Some(InboundContent::Document { data, mime, filename });
+                if data.len() as u64 > MAX_MEDIA_BYTES { warn!(size = data.len(), "downloaded document exceeds size limit"); return ExtractResult::Unhandled; }
+                return ExtractResult::Content(InboundContent::Document { data, mime, filename });
             }
             Err(e) => {
-                warn!(error = %e, "failed to download document, skipping");
-                return None;
+                warn!(error = %e, "failed to download document");
+                return ExtractResult::TransientFailure;
             }
         }
     }
@@ -1266,15 +1537,20 @@ async fn extract_content_inner(
     if let Some(ref dwc) = msg.document_with_caption_message {
         if let Some(ref inner) = dwc.message {
             if let Some(ref doc) = inner.document_message {
+                if let Some(len) = doc.file_length {
+                    if len > MAX_MEDIA_BYTES { warn!(size = len, "document exceeds size limit, skipping"); return ExtractResult::Unhandled; }
+                }
                 let mime = doc.mimetype.clone().unwrap_or_else(|| "application/octet-stream".to_string());
                 let filename = doc.file_name.clone().unwrap_or_else(|| "file".to_string());
+                let _permit = dl_semaphore.acquire().await.expect("semaphore closed");
                 match client.download(doc.as_ref() as &dyn Downloadable).await {
                     Ok(data) => {
-                        return Some(InboundContent::Document { data, mime, filename });
+                        if data.len() as u64 > MAX_MEDIA_BYTES { warn!(size = data.len(), "downloaded document exceeds size limit"); return ExtractResult::Unhandled; }
+                        return ExtractResult::Content(InboundContent::Document { data, mime, filename });
                     }
                     Err(e) => {
-                        warn!(error = %e, "failed to download document (with caption), skipping");
-                        return None;
+                        warn!(error = %e, "failed to download document (with caption)");
+                        return ExtractResult::TransientFailure;
                     }
                 }
             }
@@ -1283,15 +1559,20 @@ async fn extract_content_inner(
 
     // --- Sticker ---
     if let Some(ref stk) = msg.sticker_message {
+        if let Some(len) = stk.file_length {
+            if len > MAX_MEDIA_BYTES { warn!(size = len, "sticker exceeds size limit, skipping"); return ExtractResult::Unhandled; }
+        }
         let mime = stk.mimetype.clone().unwrap_or_else(|| "image/webp".to_string());
         let is_animated = stk.is_animated.unwrap_or(false);
+        let _permit = dl_semaphore.acquire().await.expect("semaphore closed");
         match client.download(stk.as_ref() as &dyn Downloadable).await {
             Ok(data) => {
-                return Some(InboundContent::Sticker { data, mime, is_animated });
+                if data.len() as u64 > MAX_MEDIA_BYTES { warn!(size = data.len(), "downloaded sticker exceeds size limit"); return ExtractResult::Unhandled; }
+                return ExtractResult::Content(InboundContent::Sticker { data, mime, is_animated });
             }
             Err(e) => {
-                warn!(error = %e, "failed to download sticker, skipping");
-                return None;
+                warn!(error = %e, "failed to download sticker");
+                return ExtractResult::TransientFailure;
             }
         }
     }
@@ -1299,7 +1580,7 @@ async fn extract_content_inner(
     // --- Location ---
     if let Some(ref loc) = msg.location_message {
         if let (Some(lat), Some(lon)) = (loc.degrees_latitude, loc.degrees_longitude) {
-            return Some(InboundContent::Location {
+            return ExtractResult::Content(InboundContent::Location {
                 lat,
                 lon,
                 name: loc.name.clone(),
@@ -1311,7 +1592,7 @@ async fn extract_content_inner(
     // --- Live location (bridge as static snapshot) ---
     if let Some(ref loc) = msg.live_location_message {
         if let (Some(lat), Some(lon)) = (loc.degrees_latitude, loc.degrees_longitude) {
-            return Some(InboundContent::Location {
+            return ExtractResult::Content(InboundContent::Location {
                 lat,
                 lon,
                 name: loc.caption.clone(),
@@ -1322,7 +1603,7 @@ async fn extract_content_inner(
 
     // --- Contact ---
     if let Some(ref contact) = msg.contact_message {
-        return Some(InboundContent::Contact {
+        return ExtractResult::Content(InboundContent::Contact {
             display_name: contact.display_name.clone().unwrap_or_default(),
             vcard: contact.vcard.clone().unwrap_or_default(),
         });
@@ -1332,7 +1613,7 @@ async fn extract_content_inner(
     if let Some(ref arr) = msg.contacts_array_message {
         // Bridge as first contact (most common case is single)
         if let Some(first) = arr.contacts.first() {
-            return Some(InboundContent::Contact {
+            return ExtractResult::Content(InboundContent::Contact {
                 display_name: first.display_name.clone().unwrap_or_else(|| {
                     arr.display_name.clone().unwrap_or_default()
                 }),
@@ -1344,7 +1625,7 @@ async fn extract_content_inner(
     // --- Reaction ---
     if let Some(ref reaction) = msg.reaction_message {
         if let Some(ref key) = reaction.key {
-            return Some(InboundContent::Reaction {
+            return ExtractResult::Content(InboundContent::Reaction {
                 target_id: key.id.clone().unwrap_or_default(),
                 emoji: reaction.text.clone().unwrap_or_default(),
             });
@@ -1371,7 +1652,7 @@ async fn extract_content_inner(
                         })
                     })
                     .unwrap_or_default();
-                return Some(InboundContent::Edit { target_id, new_text });
+                return ExtractResult::Content(InboundContent::Edit { target_id, new_text });
             }
         }
     }
@@ -1381,7 +1662,7 @@ async fn extract_content_inner(
         // Revoke = type 0 (REVOKE) with a key
         if proto.r#type == Some(0) {
             if let Some(ref key) = proto.key {
-                return Some(InboundContent::Revoke {
+                return ExtractResult::Content(InboundContent::Revoke {
                     target_id: key.id.clone().unwrap_or_default(),
                 });
             }
@@ -1391,23 +1672,23 @@ async fn extract_content_inner(
     // --- Ephemeral wrapper (unwrap and recurse) ---
     if let Some(ref eph) = msg.ephemeral_message {
         if let Some(ref inner) = eph.message {
-            return Box::pin(extract_content_inner(inner, client, depth + 1)).await;
+            return Box::pin(extract_content_inner(inner, client, dl_semaphore, depth + 1)).await;
         }
     }
 
     // --- View-once wrapper (unwrap and recurse) ---
     if let Some(ref vo) = msg.view_once_message {
         if let Some(ref inner) = vo.message {
-            return Box::pin(extract_content_inner(inner, client, depth + 1)).await;
+            return Box::pin(extract_content_inner(inner, client, dl_semaphore, depth + 1)).await;
         }
     }
     if let Some(ref vo2) = msg.view_once_message_v2 {
         if let Some(ref inner) = vo2.message {
-            return Box::pin(extract_content_inner(inner, client, depth + 1)).await;
+            return Box::pin(extract_content_inner(inner, client, dl_semaphore, depth + 1)).await;
         }
     }
 
-    None
+    ExtractResult::Unhandled
 }
 
 // ---------------------------------------------------------------------------
@@ -1441,25 +1722,25 @@ async fn handle_outbound(
     outbound_rx: &mut mpsc::Receiver<WhatsAppOutbound>,
     client_handle: &Arc<ParkingMutex<Option<Arc<Client>>>>,
     cancel: &CancellationToken,
+    min_send_interval_ms: u64,
+    store: &Store,
+    max_retries: i32,
 ) {
-    let mut pending: VecDeque<WhatsAppOutbound> = VecDeque::new();
     let mut outbound_closed = false;
+    let mut last_send = tokio::time::Instant::now() - Duration::from_secs(60);
 
     loop {
         if cancel.is_cancelled() {
             break;
         }
 
+        // Drain channel into SQLite queue (persist immediately for crash safety)
         while !outbound_closed {
             match outbound_rx.try_recv() {
                 Ok(out) => {
-                    if pending.len() >= MAX_OUTBOUND_RETRY_QUEUE {
-                        let dropped = pending.pop_front();
-                        if let Some(d) = dropped {
-                            error!(jid = %d.jid, "dropping oldest outbound after queue reached capacity");
-                        }
+                    if let Err(e) = store.enqueue_outbound(&out.jid, &out.text).await {
+                        error!(error = %e, jid = %out.jid, "failed to enqueue outbound message");
                     }
-                    pending.push_back(out);
                 }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
@@ -1469,23 +1750,43 @@ async fn handle_outbound(
             }
         }
 
-        if pending.is_empty() {
-            if outbound_closed {
-                break;
-            }
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                msg = outbound_rx.recv() => {
-                    match msg {
-                        Some(out) => pending.push_back(out),
-                        None => outbound_closed = true,
+        // Try to claim and send the next queued message
+        let row = match store.claim_next_outbound().await {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                // Queue empty — wait for new messages or cancellation
+                if outbound_closed {
+                    break;
+                }
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    msg = outbound_rx.recv() => {
+                        match msg {
+                            Some(out) => {
+                                if let Err(e) = store.enqueue_outbound(&out.jid, &out.text).await {
+                                    error!(error = %e, "failed to enqueue outbound message");
+                                }
+                            }
+                            None => outbound_closed = true,
+                        }
                     }
                 }
+                continue;
             }
-            continue;
-        }
+            Err(e) => {
+                warn!(error = %e, "failed to claim outbound message from queue");
+                tokio::select! {
+                    _ = tokio::time::sleep(OUTBOUND_RETRY_DELAY) => {}
+                    _ = cancel.cancelled() => break,
+                }
+                continue;
+            }
+        };
 
+        // Wait for a connected client — do NOT burn retries for "no connection"
         let Some(client) = get_client_handle(client_handle) else {
+            // Requeue without incrementing retries (connection issue, not send failure)
+            let _ = store.requeue_outbound(row.id).await;
             tokio::select! {
                 _ = tokio::time::sleep(OUTBOUND_RETRY_DELAY) => {}
                 _ = cancel.cancelled() => break,
@@ -1493,57 +1794,118 @@ async fn handle_outbound(
             continue;
         };
 
-        while let Some(out) = pending.pop_front() {
-            let jid = match parse_jid(&out.jid) {
-                Ok(j) => j,
-                Err(e) => {
-                    error!(error = %e, jid = %out.jid, "invalid outbound JID");
-                    continue;
+        let jid = match parse_jid(&row.jid) {
+            Ok(j) => j,
+            Err(e) => {
+                error!(error = %e, jid = %row.jid, "invalid outbound JID, marking failed");
+                let _ = store.mark_outbound_failed(row.id, 0).await; // immediate fail
+                continue;
+            }
+        };
+
+        // Anti-ban pacing: enforce minimum interval between sends
+        let min_interval = Duration::from_millis(min_send_interval_ms);
+        let elapsed = last_send.elapsed();
+        if elapsed < min_interval {
+            tokio::time::sleep(min_interval - elapsed).await;
+        }
+
+        let msg = wa::Message {
+            conversation: Some(row.payload.clone()),
+            ..Default::default()
+        };
+
+        match client.send_message(jid, msg).await {
+            Ok(_msg_id) => {
+                last_send = tokio::time::Instant::now();
+                let _ = store.mark_outbound_sent(row.id).await;
+            }
+            Err(e) => {
+                if row.retries + 1 >= max_retries {
+                    error!(
+                        error = %e, jid = %row.jid, retries = row.retries + 1,
+                        "dropping outbound message after max retries"
+                    );
+                } else {
+                    warn!(
+                        error = %e, jid = %row.jid, retry = row.retries + 1,
+                        "failed to send outbound message; will retry"
+                    );
                 }
-            };
-
-            let msg = wa::Message {
-                conversation: Some(out.text.clone()),
-                ..Default::default()
-            };
-
-            match client.send_message(jid, msg).await {
-                Ok(_msg_id) => {}
-                Err(e) => {
-                    let mut out = out;
-                    out.retries += 1;
-                    if out.retries >= MAX_OUTBOUND_RETRIES {
-                        error!(
-                            error = %e, jid = %out.jid, retries = out.retries,
-                            "dropping outbound message after max retries"
-                        );
-                    } else {
-                        warn!(
-                            error = %e, jid = %out.jid, retry = out.retries,
-                            "failed to send outbound message; will retry"
-                        );
-                        // Push to back (not front) to avoid head-of-line blocking
-                        pending.push_back(out);
-                    }
-                    tokio::select! {
-                        _ = tokio::time::sleep(OUTBOUND_RETRY_DELAY) => {}
-                        _ = cancel.cancelled() => break,
-                    }
-                    break;
+                let _ = store.mark_outbound_failed(row.id, max_retries).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(OUTBOUND_RETRY_DELAY) => {}
+                    _ = cancel.cancelled() => break,
                 }
             }
         }
 
-        if outbound_closed && pending.is_empty() {
-            break;
+        if outbound_closed {
+            // Check if there are remaining queued messages
+            match store.outbound_queue_depth().await {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(_) => break,
+            }
         }
     }
+}
 
-    if !pending.is_empty() {
-        warn!(
-            pending_count = pending.len(),
-            "outbound handler stopped with unsent messages"
-        );
+// ---------------------------------------------------------------------------
+// Health endpoint — raw TCP, no framework dependencies
+// ---------------------------------------------------------------------------
+
+async fn spawn_health_server(
+    port: u16,
+    state_rx: watch::Receiver<BridgeState>,
+    store: Store,
+    cancel: CancellationToken,
+) {
+    let listener = match TcpListener::bind(("0.0.0.0", port)).await {
+        Ok(l) => l,
+        Err(e) => {
+            error!(error = %e, port = port, "failed to bind health endpoint");
+            return;
+        }
+    };
+
+    loop {
+        tokio::select! {
+            result = listener.accept() => {
+                let Ok((mut stream, _)) = result else { continue };
+
+                // Read the HTTP request before responding (prevents client hangs)
+                let mut buf = [0u8; 1024];
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    tokio::io::AsyncReadExt::read(&mut stream, &mut buf),
+                ).await;
+
+                let state = *state_rx.borrow();
+                let connected = state == BridgeState::Connected;
+                let queue_depth = store.outbound_queue_depth().await.unwrap_or(-1);
+
+                let (status_line, status_str) = if connected {
+                    ("HTTP/1.1 200 OK", "ok")
+                } else {
+                    ("HTTP/1.1 503 Service Unavailable", "disconnected")
+                };
+
+                let body = format!(
+                    r#"{{"status":"{}","state":"{:?}","queue_depth":{}}}"#,
+                    status_str, state, queue_depth
+                );
+                let response = format!(
+                    "{}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                    status_line,
+                    body.len(),
+                    body
+                );
+
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+            _ = cancel.cancelled() => break,
+        }
     }
 }
 
@@ -1635,16 +1997,21 @@ fn normalize_phone(raw: &str) -> String {
     raw.chars().filter(|c| c.is_ascii_digit()).collect()
 }
 
-/// Generate a random jitter in [0, base_ms/2) using a simple xorshift on the system time.
-/// No external RNG crate needed — jitter doesn't need cryptographic quality.
+/// Generate a random jitter in [0, base_ms/2) using xorshift on system time + atomic counter.
+/// The counter prevents identical jitter when called in rapid succession (nanos often repeat).
 fn rand_jitter_ms(base_ms: u64) -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
     if base_ms == 0 {
         return 0;
     }
-    let mut seed = std::time::SystemTime::now()
+    let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as u64;
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut seed = nanos.wrapping_mul(6364136223846793005).wrapping_add(count);
     // xorshift64
     seed ^= seed << 13;
     seed ^= seed >> 7;
@@ -1725,15 +2092,22 @@ mod tests {
     #[test]
     fn test_dedup_cache() {
         let mut cache = DedupCache::new(3);
-        assert!(!cache.check_and_insert("a")); // first time → false
-        assert!(cache.check_and_insert("a"));  // duplicate → true
-        assert!(!cache.check_and_insert("b"));
-        assert!(!cache.check_and_insert("c")); // cache: [a, b, c] (full)
+        assert!(!cache.is_seen("a"));
+        cache.insert("a");
+        assert!(cache.is_seen("a")); // now seen
+        cache.insert("b");
+        cache.insert("c"); // cache: [a, b, c] (full)
         // Inserting "d" evicts "a"
-        assert!(!cache.check_and_insert("d")); // cache: [b, c, d]
-        assert!(!cache.check_and_insert("a")); // "a" was evicted → false; cache: [c, d, a]
-        assert!(cache.check_and_insert("d"));  // "d" still in cache → true
-        assert!(cache.check_and_insert("c"));  // "c" still in cache → true
+        cache.insert("d"); // cache: [b, c, d]
+        assert!(!cache.is_seen("a")); // "a" was evicted
+        cache.insert("a"); // cache: [c, d, a]
+        assert!(cache.is_seen("d")); // "d" still in cache
+        assert!(cache.is_seen("c")); // "c" still in cache
+        // Re-inserting existing key is a no-op (no double eviction)
+        cache.insert("d");
+        assert!(cache.is_seen("c"));
+        assert!(cache.is_seen("d"));
+        assert!(cache.is_seen("a"));
     }
 
     #[test]
