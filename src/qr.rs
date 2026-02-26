@@ -231,4 +231,5 @@ mod tests {
         // PNG magic bytes
         assert_eq!(&png_data[..4], &[0x89, b'P', b'N', b'G']);
     }
+
 }
