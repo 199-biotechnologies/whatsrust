@@ -5,6 +5,7 @@
 //! and our own rusqlite backend for Signal Protocol storage.
 
 mod bridge;
+mod instance_lock;
 pub mod qr;
 mod storage;
 
@@ -63,6 +64,21 @@ async fn main() -> Result<()> {
         health_port,
         backup_dir,
         ..Default::default()
+    };
+
+    // Single-instance guard: prevent two bridges from using the same session
+    let _instance_lock = match instance_lock::InstanceLock::acquire(
+        &config.db_path,
+        Duration::from_secs(2),
+    ) {
+        Ok(lock) => {
+            info!(lock = %lock.path().display(), "session lock acquired");
+            lock
+        }
+        Err(e) => {
+            error!(error = %e, "another bridge instance is already running — refusing to start");
+            std::process::exit(1);
+        }
     };
 
     let bridge = Arc::new(WhatsAppBridge::start(config, inbound_tx, cancel.clone()));

@@ -1335,7 +1335,7 @@ async fn handle_event(
             let _ = state_tx.send(BridgeState::Disconnected);
         }
         Event::StreamReplaced(_) => {
-            warn!("session taken over by another device");
+            error!("StreamReplaced: another client connected using this same linked device session — stopping to avoid replacement loop. Check for duplicate bridge processes (ps aux | grep picoclaw) or a competing WhatsApp Web/Desktop session.");
             set_client_handle(client_handle, None);
             stop_reconnect.store(true, Ordering::Relaxed);
             request_disconnect(client.clone());
