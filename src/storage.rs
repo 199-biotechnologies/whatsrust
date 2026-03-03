@@ -261,6 +261,18 @@ impl Store {
         Ok(())
     }
 
+    /// Read the linked phone number from the stored device registration.
+    /// Returns None if no device is registered or no phone number is stored.
+    pub async fn get_phone_number(&self) -> Result<Option<String>> {
+        self.run(|c| {
+            let pn: Option<String> = c
+                .query_row("SELECT pn FROM device WHERE id = 1", [], |row| row.get(0))
+                .ok();
+            Ok(pn.filter(|s| !s.is_empty()))
+        })
+        .await
+    }
+
     /// Clear stored device credentials (used after LoggedOut to trigger re-pairing on reconnect).
     pub async fn clear_device(&self) -> Result<()> {
         self.run(|c| {
