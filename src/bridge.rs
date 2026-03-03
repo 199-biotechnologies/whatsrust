@@ -1053,6 +1053,8 @@ async fn run_bot_session(
     let rr_delay_max = config.read_receipt_delay_max_ms;
     let activity: ActivityTracker = Arc::new(ParkingMutex::new(HashMap::new()));
     let qtx = Arc::new(qr_tx.clone());
+    // Track previous QR terminal height for in-place overwrite on refresh
+    let prev_qr_lines = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     // Build the Bot
     let mut builder = Bot::builder()
@@ -1071,8 +1073,9 @@ async fn run_bot_session(
             let bid = bridge_id.clone();
             let dl_sem = dl_semaphore.clone();
             let act = activity.clone();
+            let pql = prev_qr_lines.clone();
             async move {
-                handle_event(event, client, &ch, &itx, &stx, &qtx, &store, &sr, auto_mark_read, &allowed, &dedup, &bid, &dl_sem, rr_delay_min, rr_delay_max, &act)
+                handle_event(event, client, &ch, &itx, &stx, &qtx, &store, &sr, auto_mark_read, &allowed, &dedup, &bid, &dl_sem, rr_delay_min, rr_delay_max, &act, &pql)
                     .await;
             }
         });
@@ -1204,6 +1207,7 @@ async fn handle_event(
     rr_delay_min_ms: u64,
     rr_delay_max_ms: u64,
     activity: &ActivityTracker,
+    prev_qr_lines: &Arc<std::sync::atomic::AtomicUsize>,
 ) {
     match event {
         Event::PairingQrCode { code, .. } => {
@@ -1212,7 +1216,15 @@ async fn handle_event(
 
             // Render compact QR in terminal + save PNG/HTML for programmatic access
             if let Some(qr) = crate::qr::QrRender::new(&code) {
+                // If a previous QR was printed, move cursor up to overwrite it in-place.
+                // +2 for the "open QR image" and "scan the QR code" lines below the QR.
+                let prev = prev_qr_lines.load(std::sync::atomic::Ordering::Relaxed);
+                if prev > 0 {
+                    eprint!("\x1b[{}A\x1b[J", prev + 2); // move up + clear to end of screen
+                }
+
                 eprint!("{}", qr.terminal());
+                prev_qr_lines.store(qr.terminal_lines(), std::sync::atomic::Ordering::Relaxed);
 
                 // Save PNG to temp dir and print clickable file:// link
                 let png_path = std::env::temp_dir().join("whatsrust_qr.png");
@@ -1223,7 +1235,7 @@ async fn handle_event(
                     Err(e) => debug!(error = %e, "failed to save QR PNG fallback"),
                 }
 
-                // Save HTML fallback to temp dir
+                // Save auto-refreshing HTML to temp dir
                 let html_path = std::env::temp_dir().join("whatsrust_qr.html");
                 if let Err(e) = qr.save_html(&html_path) {
                     debug!(error = %e, "failed to save QR HTML fallback");
