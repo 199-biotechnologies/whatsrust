@@ -1210,22 +1210,23 @@ async fn handle_event(
             // Publish raw QR data for agent integrations
             let _ = qr_tx.send(Some(code.clone()));
 
-            // Render compact half-block QR in terminal
+            // Render compact QR in terminal + save PNG/HTML for programmatic access
             if let Some(qr) = crate::qr::QrRender::new(&code) {
-                print!("{}", qr.terminal());
+                eprint!("{}", qr.terminal());
 
-                // Save PNG fallback to temp dir
+                // Save PNG to temp dir and print clickable file:// link
                 let png_path = std::env::temp_dir().join("whatsrust_qr.png");
                 match qr.save_png(&png_path, 8) {
-                    Ok(()) => info!(path = %png_path.display(), "QR code PNG saved"),
+                    Ok(()) => {
+                        eprintln!("  open QR image: file://{}", png_path.display());
+                    }
                     Err(e) => debug!(error = %e, "failed to save QR PNG fallback"),
                 }
 
                 // Save HTML fallback to temp dir
                 let html_path = std::env::temp_dir().join("whatsrust_qr.html");
-                match qr.save_html(&html_path) {
-                    Ok(()) => info!(path = %html_path.display(), "QR code HTML saved"),
-                    Err(e) => debug!(error = %e, "failed to save QR HTML fallback"),
+                if let Err(e) = qr.save_html(&html_path) {
+                    debug!(error = %e, "failed to save QR HTML fallback");
                 }
             }
             info!("scan the QR code above with WhatsApp on your phone");

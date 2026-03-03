@@ -52,36 +52,30 @@ impl QrRender {
     }
 
     /// Compact terminal rendering using Unicode half-block characters.
-    /// Packs two QR rows per terminal line — roughly half the height of naive rendering.
-    /// Uses explicit ANSI colors for reliable display on both dark and light terminals.
+    /// Packs two QR rows per terminal line, 1 char per module.
+    /// With monospace ~2:1 height:width ratio and half-block vertical packing,
+    /// each module renders as roughly square.
     pub fn terminal(&self) -> String {
-        let quiet = 4; // quiet zone border (modules)
+        let quiet = 2; // compact quiet zone
         let total = self.size + 2 * quiet;
         let mut out = String::new();
 
-        // ANSI: black foreground, white background
-        let prefix = "\x1b[30;47m";
-        let reset = "\x1b[0m";
-
         // Process rows in pairs
-        let mut y = 0;
-        while y < total {
-            out.push_str(prefix);
-            for x in 0..total {
-                let top = self.is_dark(x as isize - quiet as isize, y as isize - quiet as isize);
-                let bot = self.is_dark(x as isize - quiet as isize, y as isize + 1 - quiet as isize);
-
-                // Each module = 2 chars wide for ~square aspect ratio in monospace
+        let mut y = 0isize;
+        while y < total as isize {
+            out.push_str("\x1b[30;47m"); // black on white
+            for x in 0..total as isize {
+                let top = self.is_dark(x - quiet as isize, y - quiet as isize);
+                let bot = self.is_dark(x - quiet as isize, y + 1 - quiet as isize);
                 let ch = match (top, bot) {
-                    (true, true) => "\u{2588}\u{2588}",   // █ full block (both dark)
-                    (true, false) => "\u{2580}\u{2580}",   // ▀ upper half (top dark)
-                    (false, true) => "\u{2584}\u{2584}",   // ▄ lower half (bottom dark)
-                    (false, false) => "  ",                 // both light
+                    (true, true) => '\u{2588}',   // █ full block
+                    (true, false) => '\u{2580}',  // ▀ upper half
+                    (false, true) => '\u{2584}',  // ▄ lower half
+                    (false, false) => ' ',
                 };
-                out.push_str(ch);
+                out.push(ch);
             }
-            out.push_str(reset);
-            out.push('\n');
+            out.push_str("\x1b[0m\n");
             y += 2;
         }
 
