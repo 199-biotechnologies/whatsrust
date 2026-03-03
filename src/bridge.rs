@@ -327,6 +327,8 @@ pub struct BridgeConfig {
     pub prune_interval_secs: u64,
     /// Maximum outbound retries before marking as permanently failed.
     pub max_outbound_retries: i32,
+    /// Device name shown in WhatsApp's "Linked Devices" list (default: "RustClaw").
+    pub device_name: String,
 }
 
 impl Default for BridgeConfig {
@@ -348,6 +350,7 @@ impl Default for BridgeConfig {
             backup_interval_secs: 6 * 3600,
             prune_interval_secs: 3600,
             max_outbound_retries: 3,
+            device_name: "RustClaw".to_string(),
         }
     }
 }
@@ -1086,6 +1089,13 @@ async fn run_bot_session(
         // builder = builder.skip_history_sync();
     }
 
+    // Set device name shown in WhatsApp's "Linked Devices" list
+    builder = builder.with_device_props(
+        Some(config.device_name.clone()),
+        None,
+        None,
+    );
+
     if let Some(ref phone) = config.pair_phone {
         let normalized = normalize_phone(phone);
         info!(phone = %normalized, "pair-code mode enabled");
@@ -1250,6 +1260,12 @@ async fn handle_event(
             let _ = state_tx.send(BridgeState::Pairing);
         }
         Event::Connected(_) => {
+            // Clear QR from terminal if one was displayed
+            let prev = prev_qr_lines.load(std::sync::atomic::Ordering::Relaxed);
+            if prev > 0 {
+                eprint!("\x1b[{}A\x1b[J", prev + 2); // erase QR + link/scan lines
+                prev_qr_lines.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
             info!("WhatsApp connected");
             let _ = qr_tx.send(None); // clear QR on connection
             set_client_handle(client_handle, Some(client.clone()));
