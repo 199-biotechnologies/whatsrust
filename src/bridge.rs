@@ -1383,11 +1383,15 @@ async fn handle_event(
             }
         }
         Event::LoggedOut(reason) => {
-            warn!(reason = ?reason.reason, on_connect = reason.on_connect, "WhatsApp logged out");
+            warn!(reason = ?reason.reason, on_connect = reason.on_connect, "WhatsApp logged out — clearing auth for re-pairing");
             set_client_handle(client_handle, None);
-            stop_reconnect.store(true, Ordering::Relaxed);
+            // Clear stored credentials so next reconnect triggers QR pairing
+            if let Err(e) = store.clear_device().await {
+                error!(error = %e, "failed to clear device auth after logout");
+            }
             request_disconnect(client.clone());
             let _ = state_tx.send(BridgeState::Disconnected);
+            // Note: stop_reconnect is NOT set — bridge will reconnect and show QR
         }
         Event::StreamError(stream_err) => {
             error!(code = %stream_err.code, "WhatsApp stream error");

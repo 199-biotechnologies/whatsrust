@@ -261,6 +261,16 @@ impl Store {
         Ok(())
     }
 
+    /// Clear stored device credentials (used after LoggedOut to trigger re-pairing on reconnect).
+    pub async fn clear_device(&self) -> Result<()> {
+        self.run(|c| {
+            c.execute("DELETE FROM device WHERE id = 1", [])
+                .map(|_| ())
+                .map_err(db_err)
+        })
+        .await
+    }
+
     // -----------------------------------------------------------------------
     // Outbound queue — persistent message queue (crash-safe)
     // -----------------------------------------------------------------------
