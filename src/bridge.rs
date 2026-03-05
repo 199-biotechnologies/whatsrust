@@ -452,6 +452,17 @@ impl WhatsAppBridge {
             .map_err(|e| anyhow::anyhow!("chatstate error: {e}"))
     }
 
+    /// Send a "recording audio" indicator to a chat.
+    pub async fn start_recording(&self, jid: &str) -> Result<()> {
+        let target = parse_jid(jid)?;
+        let client = get_client_handle(&self.client_handle).context("not connected")?;
+        client
+            .chatstate()
+            .send_recording(&target)
+            .await
+            .map_err(|e| anyhow::anyhow!("chatstate error: {e}"))
+    }
+
     /// Cancel typing indicator for a chat.
     pub async fn stop_typing(&self, jid: &str) -> Result<()> {
         let target = parse_jid(jid)?;
