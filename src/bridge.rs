@@ -284,6 +284,14 @@ pub struct WhatsAppOutbound {
     pub text: String,
 }
 
+/// Presence events surfaced to the consumer (typing, recording indicators).
+#[derive(Debug, Clone)]
+pub enum PresenceEvent {
+    Composing { chat_jid: String, sender: String },
+    Recording { chat_jid: String, sender: String },
+    Paused { chat_jid: String, sender: String },
+}
+
 pub struct BridgeConfig {
     /// Unique identifier for this bridge instance (for multi-number routing).
     pub bridge_id: String,
@@ -312,6 +320,8 @@ pub struct BridgeConfig {
     pub prune_interval_secs: u64,
     /// Maximum outbound retries before marking as permanently failed.
     pub max_outbound_retries: i32,
+    /// Optional channel to receive presence events (typing, recording indicators).
+    pub presence_tx: Option<mpsc::Sender<PresenceEvent>>,
 }
 
 impl Default for BridgeConfig {
@@ -331,6 +341,7 @@ impl Default for BridgeConfig {
             backup_interval_secs: 6 * 3600,
             prune_interval_secs: 3600,
             max_outbound_retries: 3,
+            presence_tx: None,
         }
     }
 }
@@ -453,6 +464,22 @@ impl WhatsAppBridge {
             .send_paused(&target)
             .await
             .map_err(|e| anyhow::anyhow!("chatstate error: {e}"))
+    }
+
+    /// Send a "recording audio" indicator to a chat.
+    pub async fn start_recording(&self, jid: &str) -> Result<()> {
+        let target = parse_jid(jid)?;
+        let client = get_client_handle(&self.client_handle).context("not connected")?;
+        client
+            .chatstate()
+            .send_recording(&target)
+            .await
+            .map_err(|e| anyhow::anyhow!("chatstate error: {e}"))
+    }
+
+    /// Cancel recording indicator for a chat.
+    pub async fn stop_recording(&self, jid: &str) -> Result<()> {
+        self.stop_typing(jid).await
     }
 
     /// Subscribe to QR code events. Returns `Some(data)` when a QR code is available
@@ -1073,6 +1100,7 @@ async fn run_bot_session(
     let dl_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DOWNLOADS));
     let qtx = Arc::new(qr_tx.clone());
     let rr_for_events = rr_tx.clone();
+    let ptx_for_events = config.presence_tx.clone();
 
     // Build the Bot
     let mut builder = Bot::builder()
@@ -1091,8 +1119,9 @@ async fn run_bot_session(
             let bid = bridge_id.clone();
             let dl_sem = dl_semaphore.clone();
             let rr = rr_for_events.clone();
+            let ptx = ptx_for_events.clone();
             async move {
-                handle_event(event, client, &ch, &itx, &stx, &qtx, &store, &sr, auto_mark_read, &allowed, &dedup, &bid, &dl_sem, &rr)
+                handle_event(event, client, &ch, &itx, &stx, &qtx, &store, &sr, auto_mark_read, &allowed, &dedup, &bid, &dl_sem, &rr, &ptx)
                     .await;
             }
         });
@@ -1222,6 +1251,7 @@ async fn handle_event(
     bridge_id: &str,
     dl_semaphore: &Semaphore,
     rr_tx: &mpsc::Sender<ReadReceiptCmd>,
+    presence_tx: &Option<mpsc::Sender<PresenceEvent>>,
 ) {
     match event {
         Event::PairingQrCode { code, .. } => {
@@ -1432,6 +1462,26 @@ async fn handle_event(
         }
         Event::PairError(err) => {
             error!(?err, "pairing failed");
+        }
+        Event::ChatPresence(update) => {
+            if let Some(ref ptx) = presence_tx {
+                let chat_jid = update.source.chat.to_string();
+                let sender = update.source.sender.to_string();
+                let evt = match update.state {
+                    wacore::types::presence::ChatPresence::Composing => {
+                        match update.media {
+                            wacore::types::presence::ChatPresenceMedia::Audio => {
+                                PresenceEvent::Recording { chat_jid, sender }
+                            }
+                            _ => PresenceEvent::Composing { chat_jid, sender },
+                        }
+                    }
+                    wacore::types::presence::ChatPresence::Paused => {
+                        PresenceEvent::Paused { chat_jid, sender }
+                    }
+                };
+                let _ = ptx.try_send(evt);
+            }
         }
         _ => {
             debug!(?event, "unhandled event");
@@ -2233,5 +2283,24 @@ mod tests {
         };
         assert_eq!(content.kind(), "reaction-removed");
         assert!(content.display_text().contains("unreact"));
+    }
+
+    #[test]
+    fn test_presence_event_variants() {
+        let composing = PresenceEvent::Composing {
+            chat_jid: "chat@s.whatsapp.net".into(),
+            sender: "user@s.whatsapp.net".into(),
+        };
+        let recording = PresenceEvent::Recording {
+            chat_jid: "chat@s.whatsapp.net".into(),
+            sender: "user@s.whatsapp.net".into(),
+        };
+        let paused = PresenceEvent::Paused {
+            chat_jid: "chat@s.whatsapp.net".into(),
+            sender: "user@s.whatsapp.net".into(),
+        };
+        assert!(format!("{:?}", composing).contains("Composing"));
+        assert!(format!("{:?}", recording).contains("Recording"));
+        assert!(format!("{:?}", paused).contains("Paused"));
     }
 }
