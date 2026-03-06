@@ -322,6 +322,8 @@ pub struct BridgeConfig {
     pub max_outbound_retries: i32,
     /// Optional channel to receive presence events (typing, recording indicators).
     pub presence_tx: Option<mpsc::Sender<PresenceEvent>>,
+    /// Device name shown in WhatsApp's "Linked Devices" list (default: "RustClaw").
+    pub device_name: String,
 }
 
 impl Default for BridgeConfig {
@@ -342,6 +344,7 @@ impl Default for BridgeConfig {
             prune_interval_secs: 3600,
             max_outbound_retries: 3,
             presence_tx: None,
+            device_name: "RustClaw".to_string(),
         }
     }
 }
@@ -455,17 +458,6 @@ impl WhatsAppBridge {
             .map_err(|e| anyhow::anyhow!("chatstate error: {e}"))
     }
 
-    /// Cancel typing indicator for a chat.
-    pub async fn stop_typing(&self, jid: &str) -> Result<()> {
-        let target = parse_jid(jid)?;
-        let client = get_client_handle(&self.client_handle).context("not connected")?;
-        client
-            .chatstate()
-            .send_paused(&target)
-            .await
-            .map_err(|e| anyhow::anyhow!("chatstate error: {e}"))
-    }
-
     /// Send a "recording audio" indicator to a chat.
     pub async fn start_recording(&self, jid: &str) -> Result<()> {
         let target = parse_jid(jid)?;
@@ -473,6 +465,17 @@ impl WhatsAppBridge {
         client
             .chatstate()
             .send_recording(&target)
+            .await
+            .map_err(|e| anyhow::anyhow!("chatstate error: {e}"))
+    }
+
+    /// Cancel typing indicator for a chat.
+    pub async fn stop_typing(&self, jid: &str) -> Result<()> {
+        let target = parse_jid(jid)?;
+        let client = get_client_handle(&self.client_handle).context("not connected")?;
+        client
+            .chatstate()
+            .send_paused(&target)
             .await
             .map_err(|e| anyhow::anyhow!("chatstate error: {e}"))
     }
@@ -1108,6 +1111,8 @@ async fn run_bot_session(
     let qtx = Arc::new(qr_tx.clone());
     let rr_for_events = rr_tx.clone();
     let ptx_for_events = config.presence_tx.clone();
+    // Track previous QR terminal height for in-place overwrite on refresh
+    let prev_qr_lines = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     // Build the Bot
     let mut builder = Bot::builder()
@@ -1127,8 +1132,9 @@ async fn run_bot_session(
             let dl_sem = dl_semaphore.clone();
             let rr = rr_for_events.clone();
             let ptx = ptx_for_events.clone();
+            let pql = prev_qr_lines.clone();
             async move {
-                handle_event(event, client, &ch, &itx, &stx, &qtx, &store, &sr, auto_mark_read, &allowed, &dedup, &bid, &dl_sem, &rr, &ptx)
+                handle_event(event, client, &ch, &itx, &stx, &qtx, &store, &sr, auto_mark_read, &allowed, &dedup, &bid, &dl_sem, &rr, &ptx, &pql)
                     .await;
             }
         });
@@ -1138,6 +1144,13 @@ async fn run_bot_session(
         // NOTE: Uncomment when skip_history_sync() is available in pinned commit (PR #277)
         // builder = builder.skip_history_sync();
     }
+
+    // Set device name shown in WhatsApp's "Linked Devices" list
+    builder = builder.with_device_props(
+        Some(config.device_name.clone()),
+        None,
+        None,
+    );
 
     if let Some(ref phone) = config.pair_phone {
         let normalized = normalize_phone(phone);
@@ -1260,28 +1273,38 @@ async fn handle_event(
     dl_semaphore: &Semaphore,
     rr_tx: &mpsc::Sender<ReadReceiptCmd>,
     presence_tx: &Option<mpsc::Sender<PresenceEvent>>,
+    prev_qr_lines: &Arc<std::sync::atomic::AtomicUsize>,
 ) {
     match event {
         Event::PairingQrCode { code, .. } => {
             // Publish raw QR data for agent integrations
             let _ = qr_tx.send(Some(code.clone()));
 
-            // Render compact half-block QR in terminal
+            // Render compact QR in terminal + save PNG/HTML for programmatic access
             if let Some(qr) = crate::qr::QrRender::new(&code) {
-                print!("{}", qr.terminal());
+                // If a previous QR was printed, move cursor up to overwrite it in-place.
+                // +2 for the "open QR image" and "scan the QR code" lines below the QR.
+                let prev = prev_qr_lines.load(std::sync::atomic::Ordering::Relaxed);
+                if prev > 0 {
+                    eprint!("\x1b[{}A\x1b[J", prev + 2); // move up + clear to end of screen
+                }
 
-                // Save PNG fallback to temp dir
+                eprint!("{}", qr.terminal());
+                prev_qr_lines.store(qr.terminal_lines(), std::sync::atomic::Ordering::Relaxed);
+
+                // Save PNG to temp dir and print clickable file:// link
                 let png_path = std::env::temp_dir().join("whatsrust_qr.png");
                 match qr.save_png(&png_path, 8) {
-                    Ok(()) => info!(path = %png_path.display(), "QR code PNG saved"),
+                    Ok(()) => {
+                        eprintln!("  open QR image: file://{}", png_path.display());
+                    }
                     Err(e) => debug!(error = %e, "failed to save QR PNG fallback"),
                 }
 
-                // Save HTML fallback to temp dir
+                // Save auto-refreshing HTML to temp dir
                 let html_path = std::env::temp_dir().join("whatsrust_qr.html");
-                match qr.save_html(&html_path) {
-                    Ok(()) => info!(path = %html_path.display(), "QR code HTML saved"),
-                    Err(e) => debug!(error = %e, "failed to save QR HTML fallback"),
+                if let Err(e) = qr.save_html(&html_path) {
+                    debug!(error = %e, "failed to save QR HTML fallback");
                 }
             }
             info!("scan the QR code above with WhatsApp on your phone");
@@ -1293,6 +1316,12 @@ async fn handle_event(
             let _ = state_tx.send(BridgeState::Pairing);
         }
         Event::Connected(_) => {
+            // Clear QR from terminal if one was displayed
+            let prev = prev_qr_lines.load(std::sync::atomic::Ordering::Relaxed);
+            if prev > 0 {
+                eprint!("\x1b[{}A\x1b[J", prev + 2); // erase QR + link/scan lines
+                prev_qr_lines.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
             info!("WhatsApp connected");
             let _ = qr_tx.send(None); // clear QR on connection
             set_client_handle(client_handle, Some(client.clone()));
@@ -1389,12 +1418,17 @@ async fn handle_event(
             }
         }
         Event::LoggedOut(reason) => {
-            warn!(reason = ?reason.reason, on_connect = reason.on_connect, "WhatsApp logged out");
+            warn!(reason = ?reason.reason, on_connect = reason.on_connect, "WhatsApp logged out — clearing auth for re-pairing");
             set_client_handle(client_handle, None);
             let _ = rr_tx.send(ReadReceiptCmd::SetClient(None)).await;
+            // Clear stored credentials so next reconnect triggers QR pairing
+            if let Err(e) = store.clear_device().await {
+                error!(error = %e, "failed to clear device auth after logout");
+            }
             stop_reconnect.store(true, Ordering::Relaxed);
             request_disconnect(client.clone());
             let _ = state_tx.send(BridgeState::Disconnected);
+            // Note: stop_reconnect is NOT set — bridge will reconnect and show QR
         }
         Event::StreamError(stream_err) => {
             error!(code = %stream_err.code, "WhatsApp stream error");

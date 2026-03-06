@@ -52,54 +52,57 @@ impl QrRender {
     }
 
     /// Compact terminal rendering using Unicode half-block characters.
-    /// Packs two QR rows per terminal line — roughly half the height of naive rendering.
-    /// Uses explicit ANSI colors for reliable display on both dark and light terminals.
+    /// Packs two QR rows per terminal line, 1 char per module.
+    /// With monospace ~2:1 height:width ratio and half-block vertical packing,
+    /// each module renders as roughly square.
     pub fn terminal(&self) -> String {
-        let quiet = 4; // quiet zone border (modules)
+        let quiet = 2; // compact quiet zone
         let total = self.size + 2 * quiet;
         let mut out = String::new();
 
-        // ANSI: black foreground, white background
-        let prefix = "\x1b[30;47m";
-        let reset = "\x1b[0m";
-
         // Process rows in pairs
-        let mut y = 0;
-        while y < total {
-            out.push_str(prefix);
-            for x in 0..total {
-                let top = self.is_dark(x as isize - quiet as isize, y as isize - quiet as isize);
-                let bot = self.is_dark(x as isize - quiet as isize, y as isize + 1 - quiet as isize);
-
-                // Each module = 2 chars wide for ~square aspect ratio in monospace
+        let mut y = 0isize;
+        while y < total as isize {
+            out.push_str("\x1b[30;47m"); // black on white
+            for x in 0..total as isize {
+                let top = self.is_dark(x - quiet as isize, y - quiet as isize);
+                let bot = self.is_dark(x - quiet as isize, y + 1 - quiet as isize);
                 let ch = match (top, bot) {
-                    (true, true) => "\u{2588}\u{2588}",   // █ full block (both dark)
-                    (true, false) => "\u{2580}\u{2580}",   // ▀ upper half (top dark)
-                    (false, true) => "\u{2584}\u{2584}",   // ▄ lower half (bottom dark)
-                    (false, false) => "  ",                 // both light
+                    (true, true) => '\u{2588}',   // █ full block
+                    (true, false) => '\u{2580}',  // ▀ upper half
+                    (false, true) => '\u{2584}',  // ▄ lower half
+                    (false, false) => ' ',
                 };
-                out.push_str(ch);
+                out.push(ch);
             }
-            out.push_str(reset);
-            out.push('\n');
+            out.push_str("\x1b[0m\n");
             y += 2;
         }
 
         out
     }
 
-    /// Self-contained HTML page with the QR code rendered as an inline SVG.
-    /// Suitable for writing to a file and opening in a browser, or embedding in a dashboard.
+    /// Number of terminal lines the `terminal()` output occupies.
+    /// Useful for ANSI cursor-up to overwrite a previous QR on refresh.
+    pub fn terminal_lines(&self) -> usize {
+        let quiet = 2;
+        let total = self.size + 2 * quiet;
+        (total + 1) / 2 // ceil(total / 2) since we pack 2 rows per line
+    }
+
+    /// Auto-refreshing HTML page with the QR code rendered as an inline SVG.
+    /// The page reloads every 5 seconds to pick up QR refreshes from WhatsApp.
+    /// Suitable for writing to a file and opening in a browser, or sharing with LLMs.
     pub fn html(&self) -> String {
         let svg = self.svg();
         format!(
             r#"<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>WhatsApp QR Code</title>
+<html><head><meta charset="utf-8"><meta http-equiv="refresh" content="5"><title>WhatsApp QR Code</title>
 <style>body{{display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;background:#f0f0f0;font-family:system-ui}}
 .container{{text-align:center;background:white;padding:32px;border-radius:16px;box-shadow:0 4px 24px rgba(0,0,0,.1)}}
 h2{{color:#25D366;margin:0 0 16px}}svg{{max-width:320px;max-height:320px}}
-p{{color:#666;margin:16px 0 0;font-size:14px}}</style></head>
-<body><div class="container"><h2>Scan with WhatsApp</h2>{svg}<p>Open WhatsApp &gt; Settings &gt; Linked Devices &gt; Link a Device</p></div></body></html>"#,
+p{{color:#666;margin:16px 0 0;font-size:14px}}.status{{color:#999;font-size:12px;margin-top:8px}}</style></head>
+<body><div class="container"><h2>Scan with WhatsApp</h2>{svg}<p>Open WhatsApp &gt; Settings &gt; Linked Devices &gt; Link a Device</p><p class="status">Auto-refreshing every 5s</p></div></body></html>"#,
             svg = svg
         )
     }
