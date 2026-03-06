@@ -7,12 +7,14 @@
 //!   - LID-to-phone sender normalization
 //!   - Expanded event handling (ban, outdated, stream errors)
 
-use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::dedup::AtomicDedupCache;
+use crate::read_receipts::{ReadReceiptCmd, spawn_scheduler};
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex as ParkingMutex;
@@ -43,55 +45,6 @@ const DEDUP_CACHE_CAPACITY: usize = 4096;
 const MAX_MEDIA_BYTES: u64 = 50 * 1024 * 1024; // 50 MiB
 /// Maximum concurrent media downloads (bounds peak memory usage).
 const MAX_CONCURRENT_DOWNLOADS: usize = 4;
-/// Chats with activity within this window get near-instant read receipts.
-const ACTIVE_CHAT_WINDOW: Duration = Duration::from_secs(30);
-
-/// Tracks last message time per JID for adaptive read receipt timing.
-/// Active conversations get near-instant receipts; cold opens get jittered delay.
-type ActivityTracker = Arc<ParkingMutex<HashMap<String, Instant>>>;
-
-// ---------------------------------------------------------------------------
-// Dedup cache — bounded ring-buffer set to prevent double-processing
-// ---------------------------------------------------------------------------
-
-/// A bounded set that evicts the oldest entry when full.
-/// Uses a VecDeque as a ring buffer + HashSet for O(1) lookup.
-struct DedupCache {
-    order: VecDeque<String>,
-    seen: HashSet<String>,
-    capacity: usize,
-}
-
-impl DedupCache {
-    fn new(capacity: usize) -> Self {
-        Self {
-            order: VecDeque::with_capacity(capacity),
-            seen: HashSet::with_capacity(capacity),
-            capacity,
-        }
-    }
-
-    /// Returns true if the ID was already seen (check only, does not insert).
-    fn is_seen(&self, id: &str) -> bool {
-        self.seen.contains(id)
-    }
-
-    /// Insert an ID into the dedup set (evicts oldest if full).
-    fn insert(&mut self, id: &str) {
-        if self.seen.contains(id) {
-            return;
-        }
-        if self.order.len() >= self.capacity {
-            if let Some(old) = self.order.pop_front() {
-                self.seen.remove(&old);
-            }
-        }
-        let owned = id.to_string();
-        self.seen.insert(owned.clone());
-        self.order.push_back(owned);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -172,10 +125,18 @@ pub enum InboundContent {
         display_name: String,
         vcard: String,
     },
-    /// Emoji reaction on a message.
-    Reaction {
+    /// Emoji reaction added to a message.
+    ReactionAdded {
         target_id: String,
         emoji: String,
+        /// Sender of the original message (for group context).
+        target_sender: Option<String>,
+    },
+    /// Emoji reaction removed from a message.
+    ReactionRemoved {
+        target_id: String,
+        /// Sender of the original message (for group context).
+        target_sender: Option<String>,
     },
     /// Someone edited their message.
     Edit {
@@ -200,7 +161,8 @@ impl InboundContent {
             Self::Sticker { .. } => "sticker",
             Self::Location { .. } => "location",
             Self::Contact { .. } => "contact",
-            Self::Reaction { .. } => "reaction",
+            Self::ReactionAdded { .. } => "reaction",
+            Self::ReactionRemoved { .. } => "reaction-removed",
             Self::Edit { .. } => "edit",
             Self::Revoke { .. } => "revoke",
         }
@@ -249,7 +211,8 @@ impl InboundContent {
                 None => format!("[location: {lat:.5},{lon:.5}]"),
             },
             Self::Contact { display_name, .. } => format!("[contact: {display_name}]"),
-            Self::Reaction { emoji, target_id } => format!("[react {emoji} on {target_id}]"),
+            Self::ReactionAdded { emoji, target_id, .. } => format!("[react {emoji} on {target_id}]"),
+            Self::ReactionRemoved { target_id, .. } => format!("[unreact on {target_id}]"),
             Self::Edit { target_id, new_text } => format!("[edit {target_id}] {new_text}"),
             Self::Revoke { target_id } => format!("[deleted {target_id}]"),
         }
@@ -289,10 +252,44 @@ pub struct WhatsAppInbound {
     pub is_from_me: bool,
 }
 
+/// Reference to a specific message — used for reactions, replies, edits.
+#[derive(Debug, Clone)]
+pub struct MessageRef {
+    pub chat_jid: String,
+    pub message_id: String,
+    pub from_me: bool,
+    /// Sender JID — required for group chats when from_me is false.
+    pub sender_jid: Option<String>,
+}
+
+impl MessageRef {
+    /// Create from an inbound message.
+    pub fn from_inbound(msg: &WhatsAppInbound) -> Self {
+        Self {
+            chat_jid: msg.jid.clone(),
+            message_id: msg.id.clone(),
+            from_me: msg.is_from_me,
+            sender_jid: if msg.is_from_me {
+                None
+            } else {
+                Some(msg.sender_raw.clone())
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WhatsAppOutbound {
     pub jid: String,
     pub text: String,
+}
+
+/// Presence events surfaced to the consumer (typing, recording indicators).
+#[derive(Debug, Clone)]
+pub enum PresenceEvent {
+    Composing { chat_jid: String, sender: String },
+    Recording { chat_jid: String, sender: String },
+    Paused { chat_jid: String, sender: String },
 }
 
 pub struct BridgeConfig {
@@ -309,10 +306,6 @@ pub struct BridgeConfig {
     pub auto_mark_read: bool,
     /// If non-empty, only process inbound messages from these phone numbers (digits only).
     pub allowed_numbers: Vec<String>,
-    /// Minimum delay before sending a read receipt (anti-ban pacing, millis).
-    pub read_receipt_delay_min_ms: u64,
-    /// Maximum delay before sending a read receipt (anti-ban pacing, millis).
-    pub read_receipt_delay_max_ms: u64,
     /// Minimum interval between outbound sends (anti-ban pacing, millis).
     pub min_send_interval_ms: u64,
     /// TCP port for the health endpoint (0 = disabled).
@@ -327,6 +320,8 @@ pub struct BridgeConfig {
     pub prune_interval_secs: u64,
     /// Maximum outbound retries before marking as permanently failed.
     pub max_outbound_retries: i32,
+    /// Optional channel to receive presence events (typing, recording indicators).
+    pub presence_tx: Option<mpsc::Sender<PresenceEvent>>,
 }
 
 impl Default for BridgeConfig {
@@ -339,8 +334,6 @@ impl Default for BridgeConfig {
             skip_history_sync: true,
             auto_mark_read: true,
             allowed_numbers: Vec::new(),
-            read_receipt_delay_min_ms: 500,
-            read_receipt_delay_max_ms: 3000,
             min_send_interval_ms: 400,
             health_port: 0,
             drain_timeout_secs: 10,
@@ -348,6 +341,7 @@ impl Default for BridgeConfig {
             backup_interval_secs: 6 * 3600,
             prune_interval_secs: 3600,
             max_outbound_retries: 3,
+            presence_tx: None,
         }
     }
 }
@@ -364,6 +358,7 @@ pub struct WhatsAppBridge {
     qr_rx: watch::Receiver<Option<String>>,
     cancel: CancellationToken,
     client_handle: Arc<ParkingMutex<Option<Arc<Client>>>>,
+    rr_tx: mpsc::Sender<ReadReceiptCmd>,
 }
 
 impl WhatsAppBridge {
@@ -379,12 +374,14 @@ impl WhatsAppBridge {
         let (outbound_tx, outbound_rx) = mpsc::channel::<WhatsAppOutbound>(256);
         let client_handle: Arc<ParkingMutex<Option<Arc<Client>>>> =
             Arc::new(ParkingMutex::new(None));
+        let rr_tx = spawn_scheduler(None, 200);
 
         let cancel_clone = cancel.clone();
         let ch = client_handle.clone();
+        let rr = rr_tx.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                run_bridge(config, inbound_tx, outbound_rx, state_tx, qr_tx, cancel_clone, ch).await
+                run_bridge(config, inbound_tx, outbound_rx, state_tx, qr_tx, cancel_clone, ch, rr).await
             {
                 error!(error = %e, "WhatsApp bridge exited with error");
             }
@@ -396,6 +393,7 @@ impl WhatsAppBridge {
             qr_rx,
             cancel,
             client_handle,
+            rr_tx,
         }
     }
 
@@ -421,6 +419,14 @@ impl WhatsAppBridge {
 
     pub fn stop(&self) {
         self.cancel.cancel();
+    }
+
+    /// Flush all pending read receipts for a chat (call before replying).
+    pub async fn flush_read_receipts(&self, chat_jid: &str) -> Result<()> {
+        self.rr_tx
+            .send(ReadReceiptCmd::FlushChat(chat_jid.to_string()))
+            .await
+            .map_err(|e| anyhow::anyhow!("receipt scheduler closed: {e}"))
     }
 
     pub async fn wait_stopped(&self, timeout: Duration) -> bool {
@@ -458,6 +464,22 @@ impl WhatsAppBridge {
             .send_paused(&target)
             .await
             .map_err(|e| anyhow::anyhow!("chatstate error: {e}"))
+    }
+
+    /// Send a "recording audio" indicator to a chat.
+    pub async fn start_recording(&self, jid: &str) -> Result<()> {
+        let target = parse_jid(jid)?;
+        let client = get_client_handle(&self.client_handle).context("not connected")?;
+        client
+            .chatstate()
+            .send_recording(&target)
+            .await
+            .map_err(|e| anyhow::anyhow!("chatstate error: {e}"))
+    }
+
+    /// Cancel recording indicator for a chat.
+    pub async fn stop_recording(&self, jid: &str) -> Result<()> {
+        self.stop_typing(jid).await
     }
 
     /// Subscribe to QR code events. Returns `Some(data)` when a QR code is available
@@ -694,22 +716,35 @@ impl WhatsAppBridge {
     }
 
     /// Send an emoji reaction to a message.
+    /// Send an emoji reaction to a message.
     pub async fn send_reaction(
         &self,
-        jid: &str,
+        chat_jid: &str,
         target_message_id: &str,
+        target_sender_jid: Option<&str>,
         emoji: &str,
         target_is_from_me: bool,
     ) -> Result<()> {
-        let target = parse_jid(jid)?;
+        let target = parse_jid(chat_jid)?;
         let client = get_client_handle(&self.client_handle).context("not connected")?;
+        // In group chats, participant must be set to the original sender's JID
+        let participant = if chat_jid.contains("@g.us") && !target_is_from_me {
+            match target_sender_jid {
+                Some(s) => Some(s.to_string()),
+                None => return Err(anyhow::anyhow!(
+                    "target_sender_jid is required for group reactions when target is not from_me"
+                )),
+            }
+        } else {
+            None
+        };
         let msg = wa::Message {
             reaction_message: Some(wa::message::ReactionMessage {
                 key: Some(wa::MessageKey {
                     remote_jid: Some(target.to_string()),
                     id: Some(target_message_id.to_string()),
                     from_me: Some(target_is_from_me),
-                    participant: None,
+                    participant,
                 }),
                 text: Some(emoji.to_string()),
                 sender_timestamp_ms: Some(chrono::Utc::now().timestamp_millis()),
@@ -722,6 +757,17 @@ impl WhatsAppBridge {
             .await
             .map_err(|e| anyhow::anyhow!("send reaction failed: {e}"))?;
         Ok(())
+    }
+
+    /// Remove an emoji reaction from a message.
+    pub async fn remove_reaction(
+        &self,
+        chat_jid: &str,
+        target_message_id: &str,
+        target_sender_jid: Option<&str>,
+        target_is_from_me: bool,
+    ) -> Result<()> {
+        self.send_reaction(chat_jid, target_message_id, target_sender_jid, "", target_is_from_me).await
     }
 
     /// Send a location pin to a chat.
@@ -810,6 +856,7 @@ impl WhatsAppBridge {
 // Bridge runner — reconnection loop with exponential backoff
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn run_bridge(
     config: BridgeConfig,
     inbound_tx: mpsc::Sender<WhatsAppInbound>,
@@ -818,6 +865,7 @@ async fn run_bridge(
     qr_tx: watch::Sender<Option<String>>,
     cancel: CancellationToken,
     client_handle: Arc<ParkingMutex<Option<Arc<Client>>>>,
+    rr_tx: mpsc::Sender<ReadReceiptCmd>,
 ) -> Result<()> {
     info!("WhatsApp bridge starting");
 
@@ -865,7 +913,7 @@ async fn run_bridge(
     }
 
     // Message dedup cache survives reconnections
-    let dedup = Arc::new(ParkingMutex::new(DedupCache::new(DEDUP_CACHE_CAPACITY)));
+    let dedup = Arc::new(AtomicDedupCache::new(DEDUP_CACHE_CAPACITY));
 
     // Secure the database file (Signal Protocol private keys)
     #[cfg(unix)]
@@ -966,6 +1014,7 @@ async fn run_bridge(
             &cancel,
             &client_handle,
             &dedup,
+            &rr_tx,
         )
         .await;
 
@@ -1012,6 +1061,11 @@ async fn run_bridge(
         }
     }
 
+    // Best-effort unavailable presence before final shutdown
+    if let Some(c) = get_client_handle(&client_handle) {
+        let _ = c.presence().set_unavailable().await;
+    }
+
     let _ = state_tx.send(BridgeState::Stopped);
     info!("WhatsApp bridge stopped");
     Ok(())
@@ -1021,6 +1075,7 @@ async fn run_bridge(
 // Single bot session
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn run_bot_session(
     store: &Store,
     config: &BridgeConfig,
@@ -1030,7 +1085,8 @@ async fn run_bot_session(
     qr_tx: &watch::Sender<Option<String>>,
     cancel: &CancellationToken,
     client_handle: &Arc<ParkingMutex<Option<Arc<Client>>>>,
-    dedup: &Arc<ParkingMutex<DedupCache>>,
+    dedup: &Arc<AtomicDedupCache>,
+    rr_tx: &mpsc::Sender<ReadReceiptCmd>,
 ) -> Result<SessionAction> {
     // Clear stale handle from previous session
     set_client_handle(client_handle, None);
@@ -1049,10 +1105,9 @@ async fn run_bot_session(
     let dedup_for_events = dedup.clone();
     let bridge_id = config.bridge_id.clone();
     let dl_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DOWNLOADS));
-    let rr_delay_min = config.read_receipt_delay_min_ms;
-    let rr_delay_max = config.read_receipt_delay_max_ms;
-    let activity: ActivityTracker = Arc::new(ParkingMutex::new(HashMap::new()));
     let qtx = Arc::new(qr_tx.clone());
+    let rr_for_events = rr_tx.clone();
+    let ptx_for_events = config.presence_tx.clone();
 
     // Build the Bot
     let mut builder = Bot::builder()
@@ -1070,9 +1125,10 @@ async fn run_bot_session(
             let dedup = dedup_for_events.clone();
             let bid = bridge_id.clone();
             let dl_sem = dl_semaphore.clone();
-            let act = activity.clone();
+            let rr = rr_for_events.clone();
+            let ptx = ptx_for_events.clone();
             async move {
-                handle_event(event, client, &ch, &itx, &stx, &qtx, &store, &sr, auto_mark_read, &allowed, &dedup, &bid, &dl_sem, rr_delay_min, rr_delay_max, &act)
+                handle_event(event, client, &ch, &itx, &stx, &qtx, &store, &sr, auto_mark_read, &allowed, &dedup, &bid, &dl_sem, &rr, &ptx)
                     .await;
             }
         });
@@ -1187,6 +1243,7 @@ async fn run_bot_session(
 // Event handling — expanded from 5 to 12+ event types
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_event(
     event: Event,
     client: Arc<Client>,
@@ -1198,12 +1255,11 @@ async fn handle_event(
     stop_reconnect: &Arc<AtomicBool>,
     auto_mark_read: bool,
     allowed_numbers: &[String],
-    dedup: &Arc<ParkingMutex<DedupCache>>,
+    dedup: &Arc<AtomicDedupCache>,
     bridge_id: &str,
     dl_semaphore: &Semaphore,
-    rr_delay_min_ms: u64,
-    rr_delay_max_ms: u64,
-    activity: &ActivityTracker,
+    rr_tx: &mpsc::Sender<ReadReceiptCmd>,
+    presence_tx: &Option<mpsc::Sender<PresenceEvent>>,
 ) {
     match event {
         Event::PairingQrCode { code, .. } => {
@@ -1240,11 +1296,19 @@ async fn handle_event(
             info!("WhatsApp connected");
             let _ = qr_tx.send(None); // clear QR on connection
             set_client_handle(client_handle, Some(client.clone()));
+            let _ = rr_tx.send(ReadReceiptCmd::SetClient(Some(client.clone()))).await;
+            // Send Available so server delivers ChatPresence events to us
+            let c = client.clone();
+            tokio::spawn(async move {
+                if let Err(e) = c.presence().set_available().await {
+                    warn!(error = %e, "failed to send available presence on connect");
+                }
+            });
             let _ = state_tx.send(BridgeState::Connected);
         }
         Event::Message(msg, info) => {
-            // Two-phase dedup: check first (don't insert yet)
-            if dedup.lock().is_seen(&info.id) {
+            // Atomic dedup: try_admit returns true if this caller won the race.
+            if !dedup.try_admit(&info.id) {
                 debug!(id = %info.id, "duplicate message, skipping");
                 return;
             }
@@ -1257,7 +1321,7 @@ async fn handle_event(
                 && !info.source.is_from_me
                 && !allowed_numbers.iter().any(|n| n == &sender)
             {
-                dedup.lock().insert(&info.id);
+                dedup.mark_done(&info.id);
                 debug!(sender = %sender, "message from non-allowed sender, skipping");
                 return;
             }
@@ -1284,58 +1348,28 @@ async fn handle_event(
 
                     match inbound_tx.send(inbound).await {
                         Ok(()) => {
-                            // Commit to dedup only after successful enqueue
-                            dedup.lock().insert(&info.id);
+                            dedup.mark_done(&info.id);
+                            if auto_mark_read && !info.source.is_from_me {
+                                let _ = rr_tx.send(ReadReceiptCmd::Seen {
+                                    chat_jid: info.source.chat.to_string(),
+                                    participant_jid: if info.source.is_group {
+                                        Some(info.source.sender.to_string())
+                                    } else {
+                                        None
+                                    },
+                                    message_id: info.id.clone(),
+                                }).await;
+                            }
                         }
                         Err(e) => {
-                            // Channel closed — do NOT insert into dedup so message isn't lost
+                            // Channel closed — remove from dedup so message isn't lost
+                            dedup.remove(&info.id);
                             warn!(error = %e, "inbound channel closed, message NOT deduped");
-                        }
-                    }
-
-                    // Adaptive read receipt: near-instant during active conversation,
-                    // jittered delay on cold opens (anti-ban pacing).
-                    if auto_mark_read && !info.source.is_from_me {
-                        let chat_jid_str = info.source.chat.to_string();
-                        let is_active = {
-                            let tracker = activity.lock();
-                            tracker.get(&chat_jid_str)
-                                .map(|last| last.elapsed() < ACTIVE_CHAT_WINDOW)
-                                .unwrap_or(false)
-                        };
-                        // Record this activity for future lookups
-                        activity.lock().insert(chat_jid_str, Instant::now());
-
-                        let delay = if is_active {
-                            // Active conversation: near-instant (50-150ms)
-                            Duration::from_millis(50 + rand_jitter_ms(200) % 100)
-                        } else {
-                            // Cold open: jittered delay within configured range
-                            let range = rr_delay_max_ms.saturating_sub(rr_delay_min_ms).max(1);
-                            let jitter = rand_jitter_ms(range * 2) % range;
-                            Duration::from_millis(rr_delay_min_ms + jitter)
-                        };
-                        tokio::time::sleep(delay).await;
-                        let group_sender = if info.source.is_group {
-                            Some(&info.source.sender)
-                        } else {
-                            None
-                        };
-                        if let Err(e) = client
-                            .mark_as_read(&info.source.chat, group_sender, vec![info.id.clone()])
-                            .await
-                        {
-                            warn!(
-                                error = %e,
-                                chat = %info.source.chat,
-                                "failed to send read receipt"
-                            );
                         }
                     }
                 }
                 ExtractResult::Unhandled => {
-                    // Unknown type — dedup immediately (no point retrying)
-                    dedup.lock().insert(&info.id);
+                    dedup.mark_done(&info.id);
                     debug!(
                         message_kind = message_kind(&msg),
                         chat = %info.source.chat,
@@ -1344,7 +1378,8 @@ async fn handle_event(
                     );
                 }
                 ExtractResult::TransientFailure => {
-                    // Transient failure — do NOT dedup so the message can be retried on redeliver
+                    // Remove from dedup so the message can be retried on redeliver
+                    dedup.remove(&info.id);
                     warn!(
                         id = %info.id,
                         chat = %info.source.chat,
@@ -1356,6 +1391,7 @@ async fn handle_event(
         Event::LoggedOut(reason) => {
             warn!(reason = ?reason.reason, on_connect = reason.on_connect, "WhatsApp logged out");
             set_client_handle(client_handle, None);
+            let _ = rr_tx.send(ReadReceiptCmd::SetClient(None)).await;
             stop_reconnect.store(true, Ordering::Relaxed);
             request_disconnect(client.clone());
             let _ = state_tx.send(BridgeState::Disconnected);
@@ -1363,11 +1399,13 @@ async fn handle_event(
         Event::StreamError(stream_err) => {
             error!(code = %stream_err.code, "WhatsApp stream error");
             set_client_handle(client_handle, None);
+            let _ = rr_tx.send(ReadReceiptCmd::SetClient(None)).await;
             let _ = state_tx.send(BridgeState::Disconnected);
         }
         Event::StreamReplaced(_) => {
             error!("StreamReplaced: another client connected using this same linked device session — stopping to avoid replacement loop. Check for duplicate bridge processes (ps aux | grep whatsrust) or a competing WhatsApp Web/Desktop session.");
             set_client_handle(client_handle, None);
+            let _ = rr_tx.send(ReadReceiptCmd::SetClient(None)).await;
             stop_reconnect.store(true, Ordering::Relaxed);
             request_disconnect(client.clone());
             let _ = state_tx.send(BridgeState::Disconnected);
@@ -1375,6 +1413,7 @@ async fn handle_event(
         Event::TemporaryBan(ban) => {
             error!(?ban.code, ban_expires_secs = ban.expire.num_seconds(), "temporarily banned by WhatsApp");
             set_client_handle(client_handle, None);
+            let _ = rr_tx.send(ReadReceiptCmd::SetClient(None)).await;
             stop_reconnect.store(true, Ordering::Relaxed);
             request_disconnect(client.clone());
             let _ = state_tx.send(BridgeState::Disconnected);
@@ -1382,6 +1421,7 @@ async fn handle_event(
         Event::ClientOutdated(_) => {
             error!("WhatsApp client version outdated — update required");
             set_client_handle(client_handle, None);
+            let _ = rr_tx.send(ReadReceiptCmd::SetClient(None)).await;
             stop_reconnect.store(true, Ordering::Relaxed);
             request_disconnect(client.clone());
             let _ = state_tx.send(BridgeState::Disconnected);
@@ -1389,6 +1429,7 @@ async fn handle_event(
         Event::ConnectFailure(failure) => {
             error!(reason = ?failure.reason, message = %failure.message, "WhatsApp connect failure");
             set_client_handle(client_handle, None);
+            let _ = rr_tx.send(ReadReceiptCmd::SetClient(None)).await;
             if !failure.reason.should_reconnect() {
                 stop_reconnect.store(true, Ordering::Relaxed);
                 request_disconnect(client.clone());
@@ -1428,6 +1469,7 @@ async fn handle_event(
         Event::Disconnected(_) => {
             warn!("WhatsApp disconnected (transport drop)");
             set_client_handle(client_handle, None);
+            let _ = rr_tx.send(ReadReceiptCmd::SetClient(None)).await;
             let _ = state_tx.send(BridgeState::Disconnected);
         }
         Event::PairSuccess(_) => {
@@ -1435,6 +1477,26 @@ async fn handle_event(
         }
         Event::PairError(err) => {
             error!(?err, "pairing failed");
+        }
+        Event::ChatPresence(update) => {
+            if let Some(ref ptx) = presence_tx {
+                let chat_jid = update.source.chat.to_string();
+                let sender = update.source.sender.to_string();
+                let evt = match update.state {
+                    wacore::types::presence::ChatPresence::Composing => {
+                        match update.media {
+                            wacore::types::presence::ChatPresenceMedia::Audio => {
+                                PresenceEvent::Recording { chat_jid, sender }
+                            }
+                            _ => PresenceEvent::Composing { chat_jid, sender },
+                        }
+                    }
+                    wacore::types::presence::ChatPresence::Paused => {
+                        PresenceEvent::Paused { chat_jid, sender }
+                    }
+                };
+                let _ = ptx.try_send(evt);
+            }
         }
         _ => {
             debug!(?event, "unhandled event");
@@ -1697,10 +1759,21 @@ async fn extract_content_inner(
     // --- Reaction ---
     if let Some(ref reaction) = msg.reaction_message {
         if let Some(ref key) = reaction.key {
-            return ExtractResult::Content(InboundContent::Reaction {
-                target_id: key.id.clone().unwrap_or_default(),
-                emoji: reaction.text.clone().unwrap_or_default(),
-            });
+            let target_id = key.id.clone().unwrap_or_default();
+            let emoji = reaction.text.clone().unwrap_or_default();
+            let target_sender = key.participant.clone();
+            if emoji.is_empty() {
+                return ExtractResult::Content(InboundContent::ReactionRemoved {
+                    target_id,
+                    target_sender,
+                });
+            } else {
+                return ExtractResult::Content(InboundContent::ReactionAdded {
+                    target_id,
+                    emoji,
+                    target_sender,
+                });
+            }
         }
     }
 
@@ -2143,27 +2216,6 @@ mod tests {
     }
 
     #[test]
-    fn test_dedup_cache() {
-        let mut cache = DedupCache::new(3);
-        assert!(!cache.is_seen("a"));
-        cache.insert("a");
-        assert!(cache.is_seen("a")); // now seen
-        cache.insert("b");
-        cache.insert("c"); // cache: [a, b, c] (full)
-        // Inserting "d" evicts "a"
-        cache.insert("d"); // cache: [b, c, d]
-        assert!(!cache.is_seen("a")); // "a" was evicted
-        cache.insert("a"); // cache: [c, d, a]
-        assert!(cache.is_seen("d")); // "d" still in cache
-        assert!(cache.is_seen("c")); // "c" still in cache
-        // Re-inserting existing key is a no-op (no double eviction)
-        cache.insert("d");
-        assert!(cache.is_seen("c"));
-        assert!(cache.is_seen("d"));
-        assert!(cache.is_seen("a"));
-    }
-
-    #[test]
     fn test_rand_jitter_ms() {
         // Zero base should return 0
         assert_eq!(rand_jitter_ms(0), 0);
@@ -2184,5 +2236,86 @@ mod tests {
         // Empty list → no filter (pass all)
         let empty: Vec<String> = vec![];
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn test_message_ref_from_inbound() {
+        let msg = WhatsAppInbound {
+            bridge_id: "default".into(),
+            jid: "group@g.us".into(),
+            id: "msg123".into(),
+            content: InboundContent::Text { body: "hi".into() },
+            sender: "447957491755".into(),
+            sender_raw: "447957491755@s.whatsapp.net".into(),
+            timestamp: 1000,
+            reply_to: None,
+            is_from_me: false,
+        };
+        let mref = MessageRef::from_inbound(&msg);
+        assert_eq!(mref.chat_jid, "group@g.us");
+        assert_eq!(mref.message_id, "msg123");
+        assert!(!mref.from_me);
+        assert_eq!(
+            mref.sender_jid.as_deref(),
+            Some("447957491755@s.whatsapp.net")
+        );
+    }
+
+    #[test]
+    fn test_message_ref_from_me_has_no_sender() {
+        let msg = WhatsAppInbound {
+            bridge_id: "default".into(),
+            jid: "chat@s.whatsapp.net".into(),
+            id: "msg456".into(),
+            content: InboundContent::Text { body: "hi".into() },
+            sender: "myphone".into(),
+            sender_raw: "myphone@s.whatsapp.net".into(),
+            timestamp: 1000,
+            reply_to: None,
+            is_from_me: true,
+        };
+        let mref = MessageRef::from_inbound(&msg);
+        assert!(mref.from_me);
+        assert!(mref.sender_jid.is_none());
+    }
+
+    #[test]
+    fn test_reaction_added_display() {
+        let content = InboundContent::ReactionAdded {
+            target_id: "m1".into(),
+            emoji: "👍".into(),
+            target_sender: None,
+        };
+        assert_eq!(content.kind(), "reaction");
+        assert!(content.display_text().contains("👍"));
+    }
+
+    #[test]
+    fn test_reaction_removed_display() {
+        let content = InboundContent::ReactionRemoved {
+            target_id: "m1".into(),
+            target_sender: None,
+        };
+        assert_eq!(content.kind(), "reaction-removed");
+        assert!(content.display_text().contains("unreact"));
+    }
+
+    #[test]
+    fn test_presence_event_variants() {
+        let composing = PresenceEvent::Composing {
+            chat_jid: "chat@s.whatsapp.net".into(),
+            sender: "user@s.whatsapp.net".into(),
+        };
+        let recording = PresenceEvent::Recording {
+            chat_jid: "chat@s.whatsapp.net".into(),
+            sender: "user@s.whatsapp.net".into(),
+        };
+        let paused = PresenceEvent::Paused {
+            chat_jid: "chat@s.whatsapp.net".into(),
+            sender: "user@s.whatsapp.net".into(),
+        };
+        assert!(format!("{:?}", composing).contains("Composing"));
+        assert!(format!("{:?}", recording).contains("Recording"));
+        assert!(format!("{:?}", paused).contains("Paused"));
     }
 }
