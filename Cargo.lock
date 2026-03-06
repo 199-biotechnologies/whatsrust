@@ -2459,6 +2459,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "dashmap",
  "fs2",
  "parking_lot",
  "png",
