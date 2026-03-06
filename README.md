@@ -70,7 +70,7 @@ WHATSAPP_PAIR_PHONE="+1234567890" cargo run
 WHATSAPP_ALLOWED="1234567890" HEALTH_PORT=8080 cargo run
 ```
 
-The built-in REPL gives you every command: `send`, `reply`, `edit`, `react`, `image`, `audio`, `video`, `doc`, `sticker`, `location`, `contact`, `typing`, `stop-typing`, `groups`, `group-info`, `status`, `quit`.
+The built-in REPL gives you every command: `send`, `reply`, `edit`, `react`, `image`, `audio`, `video`, `doc`, `sticker`, `location`, `contact`, `typing`, `stop-typing`, `groups`, `group-info`, `group-create`, `group-rename`, `group-desc`, `group-add`, `group-remove`, `group-promote`, `group-demote`, `group-invite`, `group-leave`, `status`, `quit`.
 
 ---
 
@@ -170,6 +170,11 @@ bridge.send_message_with_id("1234567890", &reply).await?;
 | `create_group(name, participants)` | Create a new group |
 | `set_group_subject(group_jid, subject)` | Rename a group |
 | `leave_group(group_jid)` | Leave a group |
+| `set_group_description(group_jid, desc)` | Set or clear group description |
+| `add_participants(group_jid, phones)` | Add members to a group |
+| `remove_participants(group_jid, phones)` | Remove members from a group |
+| `promote_participants(group_jid, phones)` | Make members admin |
+| `demote_participants(group_jid, phones)` | Remove admin from members |
 | `get_group_invite_link(group_jid)` | Get group invite link |
 | `stop()` / `wait_stopped(timeout)` | Graceful shutdown |
 

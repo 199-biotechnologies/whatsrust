@@ -592,6 +592,93 @@ impl WhatsAppBridge {
         Ok(link)
     }
 
+    /// Set or clear a group's description.
+    pub async fn set_group_description(
+        &self,
+        group_jid: &str,
+        description: Option<&str>,
+    ) -> Result<()> {
+        use whatsapp_rust::features::GroupDescription;
+        let jid = parse_jid(group_jid)?;
+        let client = get_client_handle(&self.client_handle).context("not connected")?;
+        let desc = description
+            .map(|d| GroupDescription::new(d.to_string()))
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        client.groups().set_description(&jid, desc, None).await?;
+        Ok(())
+    }
+
+    /// Add participants to a group. Returns per-participant status.
+    pub async fn add_participants(
+        &self,
+        group_jid: &str,
+        participants: &[&str],
+    ) -> Result<Vec<(String, Option<String>)>> {
+        let jid = parse_jid(group_jid)?;
+        let client = get_client_handle(&self.client_handle).context("not connected")?;
+        let jids: Vec<_> = participants
+            .iter()
+            .map(|p| parse_jid(p))
+            .collect::<Result<Vec<_>>>()?;
+        let results = client.groups().add_participants(&jid, &jids).await?;
+        Ok(results
+            .into_iter()
+            .map(|r| (r.jid.to_string(), r.status))
+            .collect())
+    }
+
+    /// Remove participants from a group. Returns per-participant status.
+    pub async fn remove_participants(
+        &self,
+        group_jid: &str,
+        participants: &[&str],
+    ) -> Result<Vec<(String, Option<String>)>> {
+        let jid = parse_jid(group_jid)?;
+        let client = get_client_handle(&self.client_handle).context("not connected")?;
+        let jids: Vec<_> = participants
+            .iter()
+            .map(|p| parse_jid(p))
+            .collect::<Result<Vec<_>>>()?;
+        let results = client.groups().remove_participants(&jid, &jids).await?;
+        Ok(results
+            .into_iter()
+            .map(|r| (r.jid.to_string(), r.status))
+            .collect())
+    }
+
+    /// Promote participants to group admin.
+    pub async fn promote_participants(
+        &self,
+        group_jid: &str,
+        participants: &[&str],
+    ) -> Result<()> {
+        let jid = parse_jid(group_jid)?;
+        let client = get_client_handle(&self.client_handle).context("not connected")?;
+        let jids: Vec<_> = participants
+            .iter()
+            .map(|p| parse_jid(p))
+            .collect::<Result<Vec<_>>>()?;
+        client.groups().promote_participants(&jid, &jids).await?;
+        Ok(())
+    }
+
+    /// Demote participants from group admin.
+    pub async fn demote_participants(
+        &self,
+        group_jid: &str,
+        participants: &[&str],
+    ) -> Result<()> {
+        let jid = parse_jid(group_jid)?;
+        let client = get_client_handle(&self.client_handle).context("not connected")?;
+        let jids: Vec<_> = participants
+            .iter()
+            .map(|p| parse_jid(p))
+            .collect::<Result<Vec<_>>>()?;
+        client.groups().demote_participants(&jid, &jids).await?;
+        Ok(())
+    }
+
     /// Flush all pending read receipts for a chat (call before replying).
     pub async fn flush_read_receipts(&self, chat_jid: &str) -> Result<()> {
         self.rr_tx

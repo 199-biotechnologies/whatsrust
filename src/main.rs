@@ -489,6 +489,125 @@ async fn main() -> Result<()> {
                                 }
                             }
                         }
+                        "group-desc" => {
+                            if parts.len() < 2 {
+                                eprintln!("usage: group-desc <group-jid> [description]");
+                            } else {
+                                let jid = parts[1];
+                                let desc = if parts.len() > 2 {
+                                    Some(parts[2..].join(" "))
+                                } else {
+                                    None
+                                };
+                                match bridge_for_repl
+                                    .set_group_description(jid, desc.as_deref())
+                                    .await
+                                {
+                                    Ok(()) => println!("description updated"),
+                                    Err(e) => eprintln!("error: {e}"),
+                                }
+                            }
+                        }
+                        "group-add" => {
+                            if parts.len() < 3 {
+                                eprintln!("usage: group-add <group-jid> <phone> [phone...]");
+                            } else {
+                                let jid = parts[1];
+                                let phones: Vec<&str> = parts[2..].to_vec();
+                                match bridge_for_repl.add_participants(jid, &phones).await {
+                                    Ok(results) => {
+                                        for (p, status) in &results {
+                                            println!("  {} → {}", p, status.as_deref().unwrap_or("ok"));
+                                        }
+                                    }
+                                    Err(e) => eprintln!("error: {e}"),
+                                }
+                            }
+                        }
+                        "group-remove" => {
+                            if parts.len() < 3 {
+                                eprintln!("usage: group-remove <group-jid> <phone> [phone...]");
+                            } else {
+                                let jid = parts[1];
+                                let phones: Vec<&str> = parts[2..].to_vec();
+                                match bridge_for_repl.remove_participants(jid, &phones).await {
+                                    Ok(results) => {
+                                        for (p, status) in &results {
+                                            println!("  {} → {}", p, status.as_deref().unwrap_or("ok"));
+                                        }
+                                    }
+                                    Err(e) => eprintln!("error: {e}"),
+                                }
+                            }
+                        }
+                        "group-promote" => {
+                            if parts.len() < 3 {
+                                eprintln!("usage: group-promote <group-jid> <phone> [phone...]");
+                            } else {
+                                let jid = parts[1];
+                                let phones: Vec<&str> = parts[2..].to_vec();
+                                match bridge_for_repl.promote_participants(jid, &phones).await {
+                                    Ok(()) => println!("promoted"),
+                                    Err(e) => eprintln!("error: {e}"),
+                                }
+                            }
+                        }
+                        "group-demote" => {
+                            if parts.len() < 3 {
+                                eprintln!("usage: group-demote <group-jid> <phone> [phone...]");
+                            } else {
+                                let jid = parts[1];
+                                let phones: Vec<&str> = parts[2..].to_vec();
+                                match bridge_for_repl.demote_participants(jid, &phones).await {
+                                    Ok(()) => println!("demoted"),
+                                    Err(e) => eprintln!("error: {e}"),
+                                }
+                            }
+                        }
+                        "group-invite" => {
+                            if parts.len() < 2 {
+                                eprintln!("usage: group-invite <group-jid>");
+                            } else {
+                                match bridge_for_repl.get_group_invite_link(parts[1]).await {
+                                    Ok(link) => println!("{link}"),
+                                    Err(e) => eprintln!("error: {e}"),
+                                }
+                            }
+                        }
+                        "group-create" => {
+                            if parts.len() < 3 {
+                                eprintln!("usage: group-create <name> <phone> [phone...]");
+                            } else {
+                                let name = parts[1];
+                                let phones: Vec<&str> = parts[2..].to_vec();
+                                match bridge_for_repl.create_group(name, &phones).await {
+                                    Ok(gid) => println!("created group: {gid}"),
+                                    Err(e) => eprintln!("error: {e}"),
+                                }
+                            }
+                        }
+                        "group-leave" => {
+                            if parts.len() < 2 {
+                                eprintln!("usage: group-leave <group-jid>");
+                            } else {
+                                match bridge_for_repl.leave_group(parts[1]).await {
+                                    Ok(()) => println!("left group"),
+                                    Err(e) => eprintln!("error: {e}"),
+                                }
+                            }
+                        }
+                        "group-rename" => {
+                            if parts.len() < 3 {
+                                eprintln!("usage: group-rename <group-jid> <new-name>");
+                            } else {
+                                let jid = parts[1];
+                                let name = parts[2..].join(" ");
+                                match bridge_for_repl.set_group_subject(jid, &name).await {
+                                    Ok(()) => println!("renamed"),
+                                    Err(e) => eprintln!("error: {e}"),
+                                }
+                            }
+                        }
                         "quit" | "q" | "exit" => {
                             cancel_for_repl.cancel();
                             break;
