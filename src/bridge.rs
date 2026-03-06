@@ -1060,6 +1060,11 @@ async fn run_bridge(
         }
     }
 
+    // Best-effort unavailable presence before final shutdown
+    if let Some(c) = get_client_handle(&client_handle) {
+        let _ = c.presence().set_unavailable().await;
+    }
+
     let _ = state_tx.send(BridgeState::Stopped);
     info!("WhatsApp bridge stopped");
     Ok(())
@@ -1289,6 +1294,13 @@ async fn handle_event(
             let _ = qr_tx.send(None); // clear QR on connection
             set_client_handle(client_handle, Some(client.clone()));
             let _ = rr_tx.send(ReadReceiptCmd::SetClient(Some(client.clone()))).await;
+            // Send Available so server delivers ChatPresence events to us
+            let c = client.clone();
+            tokio::spawn(async move {
+                if let Err(e) = c.presence().set_available().await {
+                    warn!(error = %e, "failed to send available presence on connect");
+                }
+            });
             let _ = state_tx.send(BridgeState::Connected);
         }
         Event::Message(msg, info) => {
