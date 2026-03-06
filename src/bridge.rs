@@ -1408,8 +1408,7 @@ async fn run_bot_session(
 
     // Skip history sync to avoid the "deaf client" bug (Issue #125)
     if config.skip_history_sync {
-        // NOTE: Uncomment when skip_history_sync() is available in pinned commit (PR #277)
-        // builder = builder.skip_history_sync();
+        builder = builder.skip_history_sync();
     }
 
     // Set device name shown in WhatsApp's "Linked Devices" list
@@ -1605,6 +1604,13 @@ async fn handle_event(
             let _ = state_tx.send(BridgeState::Connected);
         }
         Event::Message(msg, info) => {
+            // Skip noise JIDs: status broadcasts, newsletter channels, server messages
+            let chat_str = info.source.chat.to_string();
+            if should_ignore_jid(&chat_str) {
+                debug!(chat = %chat_str, "ignoring message from filtered JID");
+                return;
+            }
+
             // Atomic dedup: try_admit returns true if this caller won the race.
             if !dedup.try_admit(&info.id) {
                 debug!(id = %info.id, "duplicate message, skipping");
@@ -2258,11 +2264,14 @@ async fn handle_outbound(
             }
         };
 
-        // Anti-ban pacing: enforce minimum interval between sends
-        let min_interval = Duration::from_millis(min_send_interval_ms);
+        // Anti-ban pacing: enforce minimum interval + random jitter between sends
+        let jitter_ms = (min_send_interval_ms / 4).max(1);
+        let actual_interval = Duration::from_millis(
+            min_send_interval_ms + (row.id as u64 ^ last_send.elapsed().as_millis() as u64) % jitter_ms,
+        );
         let elapsed = last_send.elapsed();
-        if elapsed < min_interval {
-            tokio::time::sleep(min_interval - elapsed).await;
+        if elapsed < actual_interval {
+            tokio::time::sleep(actual_interval - elapsed).await;
         }
 
         let msg = wa::Message {
@@ -2397,6 +2406,17 @@ fn parse_jid(s: &str) -> Result<Jid> {
         Jid::from_str(&format!("{normalized}@{server}"))
             .map_err(|e| anyhow::anyhow!("bad JID from phone: {e}"))
     }
+}
+
+/// Returns true for JIDs that should be silently dropped (status broadcasts,
+/// newsletter channels, server messages, LID-only JIDs).
+/// Mirrors Baileys' `shouldIgnoreJid` logic.
+fn should_ignore_jid(jid: &str) -> bool {
+    jid == "status@broadcast"
+        || jid.ends_with("@broadcast")
+        || jid.ends_with("@newsletter")
+        || jid.ends_with("@lid")
+        || jid == "server@s.whatsapp.net"
 }
 
 fn message_kind(msg: &wa::Message) -> &'static str {
@@ -2637,5 +2657,19 @@ mod tests {
         assert!(format!("{:?}", composing).contains("Composing"));
         assert!(format!("{:?}", recording).contains("Recording"));
         assert!(format!("{:?}", paused).contains("Paused"));
+    }
+
+    #[test]
+    fn test_should_ignore_jid() {
+        // These should be ignored
+        assert!(should_ignore_jid("status@broadcast"));
+        assert!(should_ignore_jid("120363xxxxx@newsletter"));
+        assert!(should_ignore_jid("something@broadcast"));
+        assert!(should_ignore_jid("abcdef@lid"));
+        assert!(should_ignore_jid("server@s.whatsapp.net"));
+        // These should NOT be ignored
+        assert!(!should_ignore_jid("15551234567@s.whatsapp.net"));
+        assert!(!should_ignore_jid("120363xxxxx@g.us"));
+        assert!(!should_ignore_jid("15551234567@c.us"));
     }
 }
