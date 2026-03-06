@@ -1,66 +1,82 @@
+<p align="center">
+  <img src="https://img.shields.io/badge/rust-stable-orange?logo=rust" alt="Rust">
+  <img src="https://img.shields.io/badge/binary_size-~15MB-brightgreen" alt="Binary Size">
+  <img src="https://img.shields.io/badge/memory-~20MB-brightgreen" alt="Memory">
+  <img src="https://img.shields.io/badge/license-MIT-blue" alt="License">
+  <img src="https://img.shields.io/github/stars/199-biotechnologies/whatsrust?style=social" alt="Stars">
+</p>
+
 # whatsrust
 
 **WhatsApp in pure Rust.** Single binary. No Node.js. No Baileys. No kidding.
 
-Built by [Boris Djordjevic](https://github.com/borisdjordjevic) at [199 Biotechnologies](https://github.com/199-biotechnologies).
+Built by [Boris Djordjevic](https://github.com/borisdjordjevic).
 
 ---
 
-## Why does this exist?
+## Why?
 
-Every WhatsApp bot project eventually hits the same wall: Baileys. A Node.js library that works until it doesn't, eats 200MB of RAM to say "hello," and crashes at 3 AM when your on-call engineer is asleep.
+If you've built anything on WhatsApp, you've met Baileys. Node.js. 200MB of node_modules. Crashes at 3 AM. Memory leaks you can set your watch to. Works great until it doesn't, and then you're reading someone else's JavaScript at 4 AM wondering where your life went wrong.
 
-whatsrust fixes that. One Rust binary, ~15MB, handles everything Baileys does -- text, images, audio, video, documents, stickers, locations, contacts, reactions, edits, revokes, replies. It also does things Baileys doesn't: crash-safe message queues, automatic reconnection with jitter, SQLite backups on startup and shutdown, single-instance locking so two bridges can't fight over one session, plus a health endpoint that actually responds to HTTP properly.
+whatsrust replaces all of that with one Rust binary. 15MB. 20MB RAM. Handles every message type Baileys does. Does a bunch of things Baileys doesn't.
 
-We built this because we needed WhatsApp messaging inside agent software and got tired of babysitting a Node.js sidecar. So we replaced it.
+We built this because we needed WhatsApp inside agent software and got tired of babysitting a Node sidecar. So we killed it.
 
 ---
 
-## What can it do?
+## What it does
 
-**Send and receive everything:**
-text, image, audio/voice, video, document, sticker, location, contact card, reaction, edit, revoke, reply/quote.
+**Every message type:** text, image, audio/voice, video, document, sticker, location, contact card, reaction (add + remove), edit, revoke, reply/quote.
 
-**Stay alive when things go wrong:**
-- Persistent outbound queue -- SQLite, crash-safe, claim/send/mark lifecycle
-- Message dedup -- 4096-entry ring buffer, no double-processing
-- Exponential backoff with jitter on reconnect (not the naive kind)
-- Graceful shutdown -- drains inflight messages on SIGINT/SIGTERM
-- Single-instance lock -- flock-based, so two bridges can't fight over one session
-- SQLite backup on startup and shutdown
-- Database pruning of old sent/failed messages
+**Stays alive:**
+- Crash-safe outbound queue in SQLite. Messages survive restarts.
+- Atomic message dedup with DashMap. No double-processing, even under concurrent event handlers.
+- Exponential backoff with jitter on reconnect. Not the naive kind.
+- Graceful shutdown. Drains in-flight messages on SIGINT/SIGTERM.
+- Single-instance flock. Two bridges can't fight over one session.
+- SQLite backup on startup and shutdown. WAL mode, no corruption.
 
-**Ship without drama:**
-- QR + pair-code pairing with multi-format QR rendering (terminal, PNG, HTML, SVG)
-- Health endpoint -- TCP, JSON response with connection state and queue depth
+**Doesn't get you banned:**
+- Read receipt batching. Groups message IDs per chat into single network stanzas on a 200ms coalesce.
+- Flush-before-reply. Marks messages as read before responding, matching the human read-then-type-then-send pattern.
+- Recording indicator. Shows "recording audio" before sending voice notes.
+- Configurable send pacing with randomized intervals.
+- Auto presence management. Available on connect, unavailable on shutdown.
+
+**Ships clean:**
+- QR + pair-code pairing with multi-format rendering (terminal, PNG, HTML, SVG)
+- Health endpoint over TCP with JSON: connection state, queue depth
 - Sender allowlist
-- Anti-ban pacing -- configurable send intervals + randomized read receipt delays
+- Typing and recording indicators (inbound and outbound)
 - LID-to-phone sender resolution
 - 15+ WhatsApp event types handled
 
 ---
 
-## Get started
+## Quick start
 
 ```bash
-# Clone and run (QR pairing)
 git clone https://github.com/199-biotechnologies/whatsrust
 cd whatsrust && cargo run
+```
 
-# Phone number pairing
+Scan the QR with your phone. Done.
+
+```bash
+# Phone number pairing instead of QR
 WHATSAPP_PAIR_PHONE="+1234567890" cargo run
 
 # With allowlist + health check
 WHATSAPP_ALLOWED="1234567890" HEALTH_PORT=8080 cargo run
 ```
 
-Scan the QR code with your phone. You're connected. The built-in REPL gives you every message type: `send`, `reply`, `edit`, `react`, `image`, `audio`, `video`, `doc`, `sticker`, `location`, `contact`, `typing`, `status`, `quit`.
+The built-in REPL gives you every command: `send`, `reply`, `edit`, `react`, `image`, `audio`, `video`, `doc`, `sticker`, `location`, `contact`, `typing`, `stop-typing`, `status`, `quit`.
 
 ---
 
-## Use it as a library
+## Use as a library
 
-This was designed to be embedded. Add it to your project and wire it up in about 10 lines:
+Designed to be embedded. About 10 lines to wire up:
 
 ```rust
 use whatsrust::bridge::{BridgeConfig, WhatsAppBridge, WhatsAppInbound};
@@ -89,9 +105,9 @@ while let Some(msg) = inbound_rx.recv().await {
 }
 ```
 
-### QR code for your UI
+### QR for your UI
 
-Subscribe to QR events and render however you want -- terminal, HTML dashboard, native GUI:
+Subscribe to QR events and render however you want:
 
 ```rust
 use whatsrust::qr::QrRender;
@@ -100,74 +116,89 @@ let mut qr_rx = bridge.subscribe_qr();
 while qr_rx.changed().await.is_ok() {
     if let Some(data) = qr_rx.borrow().as_ref() {
         let qr = QrRender::new(data).unwrap();
-
-        print!("{}", qr.terminal());       // half-block Unicode, compact
+        print!("{}", qr.terminal());       // Unicode half-block, compact
         let html = qr.html();              // self-contained HTML page
         let svg = qr.svg();                // SVG for embedding
-        let png = qr.png(8);               // PNG bytes, 8px per module
-        qr.save_png("/tmp/qr.png", 10)?;   // save to file
+        let png = qr.png(8);               // PNG bytes, 8px module
+        qr.save_png("/tmp/qr.png", 10)?;   // file
     }
 }
+```
+
+### Flush receipts before replying
+
+The anti-ban pattern: mark as read, wait, type, send. whatsrust handles the first part:
+
+```rust
+// Before your bot sends a reply:
+bridge.flush_read_receipts("1234567890@s.whatsapp.net").await?;
+bridge.start_typing("1234567890").await?;
+// ... generate reply ...
+bridge.stop_typing("1234567890").await?;
+bridge.send_message_with_id("1234567890", &reply).await?;
 ```
 
 ---
 
 ## Full API
 
-| Method | What it does |
-|--------|-------------|
-| `WhatsAppBridge::start(config, tx, cancel)` | Start the bridge, get a handle back |
+| Method | Does |
+|--------|------|
+| `WhatsAppBridge::start(config, tx, cancel)` | Start bridge, get handle |
 | `send_message(jid, text)` | Queue a text message |
-| `send_message_with_id(jid, text)` | Send text, get the message ID back |
-| `send_image(jid, data, mime, caption)` | Send an image |
-| `send_audio(jid, data, mime, caption)` | Send audio or voice note |
-| `send_video(jid, data, mime, caption)` | Send video |
-| `send_document(jid, data, mime, filename)` | Send a file |
-| `send_sticker(jid, data, mime, animated)` | Send a sticker |
-| `send_location(jid, lat, lon, name, addr)` | Drop a pin |
-| `send_contact(jid, name, vcard)` | Send a contact card |
-| `send_reply(jid, reply_id, sender, text)` | Reply quoting a message |
-| `send_reaction(jid, msg_id, emoji, from_me)` | React with an emoji |
-| `edit_message(jid, msg_id, new_text)` | Edit a sent message |
-| `revoke_message(jid, msg_id)` | Delete a sent message |
+| `send_message_with_id(jid, text)` | Send text, get message ID back |
+| `send_image(jid, data, mime, caption)` | Image |
+| `send_audio(jid, data, mime, caption)` | Audio or voice note |
+| `send_video(jid, data, mime, caption)` | Video |
+| `send_document(jid, data, mime, filename)` | File |
+| `send_sticker(jid, data, mime, animated)` | Sticker |
+| `send_location(jid, lat, lon, name, addr)` | Pin |
+| `send_contact(jid, name, vcard)` | Contact card |
+| `send_reply(jid, reply_id, sender, text)` | Quote reply |
+| `send_reaction(jid, msg_id, sender, emoji, from_me)` | React (works in groups) |
+| `remove_reaction(jid, msg_id, sender, from_me)` | Remove reaction |
+| `edit_message(jid, msg_id, new_text)` | Edit sent message |
+| `revoke_message(jid, msg_id)` | Delete sent message |
 | `start_typing(jid)` / `stop_typing(jid)` | Typing indicators |
-| `state()` | Current connection state |
-| `is_connected()` | Quick check: are we online? |
-| `subscribe_qr()` | Watch for QR code events |
-| `subscribe_state()` | Watch for state changes |
-| `stop()` / `wait_stopped(timeout)` | Shut down gracefully |
+| `start_recording(jid)` / `stop_recording(jid)` | Recording indicators |
+| `flush_read_receipts(chat_jid)` | Force-send pending read receipts |
+| `state()` / `is_connected()` | Connection state |
+| `subscribe_qr()` | QR code events |
+| `subscribe_state()` | State change events |
+| `stop()` / `wait_stopped(timeout)` | Graceful shutdown |
 
 ### Inbound messages
 
-Every inbound message lands in your `mpsc` channel as a `WhatsAppInbound` with `sender`, `jid`, `reply_to`, `bridge_id`, and one of these:
+Every message hits your `mpsc` channel as a `WhatsAppInbound` with `sender`, `jid`, `id`, `reply_to`, `is_from_me`, and content:
 
-| Type | What you get |
-|------|-------------|
+| Type | Fields |
+|------|--------|
 | `Text` | `body` |
-| `Image` | `data`, `mime`, `caption` -- bytes included, no extra download |
+| `Image` | `data`, `mime`, `caption` (bytes included, no extra download) |
 | `Audio` | `data`, `mime`, `seconds`, `is_voice` |
 | `Video` | `data`, `mime`, `caption` |
 | `Document` | `data`, `mime`, `filename` |
 | `Sticker` | `data`, `mime`, `is_animated` |
 | `Location` | `lat`, `lon`, `name`, `address` |
 | `Contact` | `display_name`, `vcard` |
-| `Reaction` | `target_id`, `emoji` |
+| `ReactionAdded` | `target_id`, `emoji`, `target_sender` |
+| `ReactionRemoved` | `target_id`, `target_sender` |
 | `Edit` | `target_id`, `new_text` |
 | `Revoke` | `target_id` |
 
-Media arrives as raw bytes. No second download step. Open it, process it, do what you want with it.
+Media arrives as raw bytes. No second download step.
 
 ---
 
 ## Config
 
-| Variable | Default | What it controls |
-|----------|---------|-----------------|
+| Variable | Default | Controls |
+|----------|---------|----------|
 | `WHATSAPP_PAIR_PHONE` | *(QR mode)* | Phone number for pair-code linking |
 | `WHATSAPP_ALLOWED` | *(everyone)* | Comma-separated sender allowlist |
 | `HEALTH_PORT` | `0` (off) | TCP port for health endpoint |
-| `BACKUP_DIR` | `whatsapp.db.backups` | Where SQLite backups go |
-| `RUST_LOG` | `info` | Log verbosity (`debug` for protocol internals) |
+| `BACKUP_DIR` | `whatsapp.db.backups` | SQLite backup directory |
+| `RUST_LOG` | `info` | Log level (`debug` for protocol) |
 
 ---
 
@@ -175,24 +206,27 @@ Media arrives as raw bytes. No second download step. Open it, process it, do wha
 
 ```
 src/
-  main.rs           REPL + signals + instance lock          507 lines
-  bridge.rs         Events, messaging, queue, health       2157 lines
-  storage.rs        rusqlite Signal Protocol store          1469 lines
-  qr.rs             QR rendering (terminal/PNG/HTML/SVG)     235 lines
-  instance_lock.rs  flock-based single-instance guard         98 lines
-                                                    total: 4466 lines
+  main.rs            REPL + signals + instance lock
+  bridge.rs          Events, messaging, queue, health, presence
+  storage.rs         rusqlite Signal Protocol store
+  dedup.rs           Atomic DashMap dedup (concurrent-safe)
+  read_receipts.rs   Batched receipt scheduler with flush-before-reply
+  qr.rs              QR rendering (terminal/PNG/HTML/SVG)
+  instance_lock.rs   flock-based single-instance guard
+  lib.rs             Library crate exports
 ```
 
-Five files. Under 4500 lines. That's the whole thing.
+Seven files. Under 5000 lines. That's the whole thing.
 
-**Design choices worth knowing about:**
-- `parking_lot::Mutex<Connection>` + `spawn_blocking` -- no async SQLite headaches
-- WAL mode + `synchronous=NORMAL` -- fast writes, no corruption
-- Channel architecture (`mpsc` inbound, `mpsc` outbound) -- clean for consumers
-- `watch` channel for state + QR events -- multiple subscribers, zero polling
-- Single-device only -- no `device_id` column, cuts query complexity in half
+**Design decisions:**
+- `parking_lot::Mutex<Connection>` + `spawn_blocking` for SQLite. No async DB headaches.
+- WAL mode + `synchronous=NORMAL`. Fast writes, no corruption.
+- `DashMap::entry()` for dedup. Lock-free, atomic, handles concurrent event handlers from wa-rs's `tokio::spawn` per event.
+- Channel architecture: `mpsc` inbound, `mpsc` outbound, `watch` for state + QR. Clean for consumers.
+- Read receipt coalescing on a timer. Groups IDs by (chat, participant) into batched stanzas, matching what WhatsApp Web does.
+- Single-device only. No `device_id` column. Cuts query complexity in half.
 
-**Dependencies:** `tokio`, `rusqlite` (bundled), `anyhow`, `tracing`, `whatsapp-rust` (git-pinned), `wacore`, `waproto`, `prost`, `parking_lot`, `chrono`, `fs2`, `qrcode`, `png`, `serde`, `serde_json`. Single binary. No Node.js runtime. No Diesel ORM. No migration framework. `cargo build --release` and you're done.
+**Dependencies:** `tokio`, `rusqlite` (bundled), `dashmap`, `anyhow`, `tracing`, `whatsapp-rust` (git-pinned), `wacore`, `waproto`, `prost`, `parking_lot`, `chrono`, `fs2`, `qrcode`, `png`, `serde`, `serde_json`. Single binary. No Node.js runtime. No Diesel. No migration framework. `cargo build --release` and ship.
 
 ---
 
@@ -205,12 +239,19 @@ Five files. Under 4500 lines. That's the whole thing.
 | Memory at idle | ~150MB | ~20MB |
 | Crash recovery | Roll your own | Built-in queue + backoff |
 | Message types | All | All |
+| Message dedup | None | Atomic DashMap (concurrent-safe) |
+| Read receipts | Per-message, inline | Batched, coalesced, flush-before-reply |
 | Instance locking | No | flock-based |
 | Health endpoint | No | JSON over TCP |
 | SQLite backups | No | Automatic |
+| Recording indicator | Manual | Built-in |
 | Dependencies | npm install and pray | cargo build |
 
 ---
+
+## Contributing
+
+PRs welcome. Tests required. Run `cargo test` and `cargo clippy` before submitting.
 
 ## License
 
