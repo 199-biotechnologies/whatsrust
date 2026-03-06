@@ -2093,10 +2093,8 @@ async fn handle_outbound(
                     );
                 }
                 let _ = store.mark_outbound_failed(row.id, max_retries).await;
-                tokio::select! {
-                    _ = tokio::time::sleep(OUTBOUND_RETRY_DELAY) => {}
-                    _ = cancel.cancelled() => break,
-                }
+                // No sleep needed — retry_after in SQLite handles per-message backoff.
+                // The loop will claim the next eligible message immediately.
             }
         }
 

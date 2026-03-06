@@ -166,6 +166,7 @@ CREATE TABLE IF NOT EXISTS outbound_queue (
     payload TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'queued',
     retries INTEGER NOT NULL DEFAULT 0,
+    retry_after INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
@@ -176,7 +177,7 @@ CREATE INDEX IF NOT EXISTS idx_tc_tokens_ts ON tc_tokens(token_timestamp);
 CREATE INDEX IF NOT EXISTS idx_outbound_status ON outbound_queue(status, id);
 ";
 
-const CURRENT_SCHEMA_VERSION: i64 = 2;
+const CURRENT_SCHEMA_VERSION: i64 = 3;
 
 // ---------------------------------------------------------------------------
 // Store
@@ -313,8 +314,8 @@ impl Store {
             let row = tx
                 .query_row(
                     "SELECT id, jid, payload, retries FROM outbound_queue
-                     WHERE status = 'queued' ORDER BY id LIMIT 1",
-                    [],
+                     WHERE status = 'queued' AND retry_after <= ?1 ORDER BY id LIMIT 1",
+                    params![ts],
                     |row| {
                         Ok(OutboundRow {
                             id: row.get(0)?,
@@ -354,17 +355,31 @@ impl Store {
     }
 
     /// Mark an outbound message as failed (increment retries).
-    /// If retries >= max_retries, status becomes 'failed'; otherwise back to 'queued'.
+    /// If retries >= max_retries, status becomes 'failed'; otherwise back to 'queued'
+    /// with exponential backoff via `retry_after` (1s, 2s, 4s, 8s, ...).
+    /// This prevents head-of-line blocking: newer messages flow while failed ones wait.
     pub async fn mark_outbound_failed(&self, id: i64, max_retries: i32) -> Result<()> {
         let ts = now_secs();
         self.run(move |c| {
+            // Read current retry count to compute backoff
+            let retries: i32 = c
+                .query_row(
+                    "SELECT retries FROM outbound_queue WHERE id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(db_err)?
+                .unwrap_or(0);
+            let backoff_secs = 1i64 << retries.min(6); // 1, 2, 4, 8, 16, 32, 64 max
             c.execute(
                 "UPDATE outbound_queue SET
                     retries = retries + 1,
                     status = CASE WHEN retries + 1 >= ?1 THEN 'failed' ELSE 'queued' END,
+                    retry_after = CASE WHEN retries + 1 >= ?1 THEN 0 ELSE ?4 END,
                     updated_at = ?2
                  WHERE id = ?3",
-                params![max_retries, ts, id],
+                params![max_retries, ts, id, ts + backoff_secs],
             )
             .map_err(db_err)?;
             Ok(())
@@ -508,6 +523,14 @@ fn run_schema_migrations(conn: &Connection, from_version: i64) -> Result<()> {
         // v1→v2: outbound_queue table (idempotent — CREATE IF NOT EXISTS in SCHEMA).
         // For existing DBs: the table was already created by the SCHEMA batch above.
         // Just stamp the version.
+    }
+
+    if from_version < 3 {
+        // v2→v3: add retry_after column for per-message exponential backoff.
+        // Prevents head-of-line blocking: failing messages are skipped until their backoff expires.
+        conn.execute_batch(
+            "ALTER TABLE outbound_queue ADD COLUMN retry_after INTEGER NOT NULL DEFAULT 0;"
+        ).ok(); // Ignore error if column already exists (fresh DB has it in schema)
     }
 
     if from_version < CURRENT_SCHEMA_VERSION {
