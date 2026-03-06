@@ -856,6 +856,7 @@ impl WhatsAppBridge {
 // Bridge runner — reconnection loop with exponential backoff
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn run_bridge(
     config: BridgeConfig,
     inbound_tx: mpsc::Sender<WhatsAppInbound>,
@@ -1074,6 +1075,7 @@ async fn run_bridge(
 // Single bot session
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn run_bot_session(
     store: &Store,
     config: &BridgeConfig,
@@ -1241,6 +1243,7 @@ async fn run_bot_session(
 // Event handling — expanded from 5 to 12+ event types
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_event(
     event: Event,
     client: Arc<Client>,
