@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::dedup::AtomicDedupCache;
+use crate::read_receipts::{ReadReceiptCmd, spawn_scheduler};
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex as ParkingMutex;
@@ -310,6 +311,7 @@ pub struct WhatsAppBridge {
     qr_rx: watch::Receiver<Option<String>>,
     cancel: CancellationToken,
     client_handle: Arc<ParkingMutex<Option<Arc<Client>>>>,
+    rr_tx: mpsc::Sender<ReadReceiptCmd>,
 }
 
 impl WhatsAppBridge {
@@ -325,12 +327,14 @@ impl WhatsAppBridge {
         let (outbound_tx, outbound_rx) = mpsc::channel::<WhatsAppOutbound>(256);
         let client_handle: Arc<ParkingMutex<Option<Arc<Client>>>> =
             Arc::new(ParkingMutex::new(None));
+        let rr_tx = spawn_scheduler(None, 200);
 
         let cancel_clone = cancel.clone();
         let ch = client_handle.clone();
+        let rr = rr_tx.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                run_bridge(config, inbound_tx, outbound_rx, state_tx, qr_tx, cancel_clone, ch).await
+                run_bridge(config, inbound_tx, outbound_rx, state_tx, qr_tx, cancel_clone, ch, rr).await
             {
                 error!(error = %e, "WhatsApp bridge exited with error");
             }
@@ -342,6 +346,7 @@ impl WhatsAppBridge {
             qr_rx,
             cancel,
             client_handle,
+            rr_tx,
         }
     }
 
@@ -367,6 +372,14 @@ impl WhatsAppBridge {
 
     pub fn stop(&self) {
         self.cancel.cancel();
+    }
+
+    /// Flush all pending read receipts for a chat (call before replying).
+    pub async fn flush_read_receipts(&self, chat_jid: &str) -> Result<()> {
+        self.rr_tx
+            .send(ReadReceiptCmd::FlushChat(chat_jid.to_string()))
+            .await
+            .map_err(|e| anyhow::anyhow!("receipt scheduler closed: {e}"))
     }
 
     pub async fn wait_stopped(&self, timeout: Duration) -> bool {
@@ -764,6 +777,7 @@ async fn run_bridge(
     qr_tx: watch::Sender<Option<String>>,
     cancel: CancellationToken,
     client_handle: Arc<ParkingMutex<Option<Arc<Client>>>>,
+    rr_tx: mpsc::Sender<ReadReceiptCmd>,
 ) -> Result<()> {
     info!("WhatsApp bridge starting");
 
@@ -912,6 +926,7 @@ async fn run_bridge(
             &cancel,
             &client_handle,
             &dedup,
+            &rr_tx,
         )
         .await;
 
@@ -977,6 +992,7 @@ async fn run_bot_session(
     cancel: &CancellationToken,
     client_handle: &Arc<ParkingMutex<Option<Arc<Client>>>>,
     dedup: &Arc<AtomicDedupCache>,
+    rr_tx: &mpsc::Sender<ReadReceiptCmd>,
 ) -> Result<SessionAction> {
     // Clear stale handle from previous session
     set_client_handle(client_handle, None);
@@ -996,6 +1012,7 @@ async fn run_bot_session(
     let bridge_id = config.bridge_id.clone();
     let dl_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DOWNLOADS));
     let qtx = Arc::new(qr_tx.clone());
+    let rr_for_events = rr_tx.clone();
 
     // Build the Bot
     let mut builder = Bot::builder()
@@ -1013,8 +1030,9 @@ async fn run_bot_session(
             let dedup = dedup_for_events.clone();
             let bid = bridge_id.clone();
             let dl_sem = dl_semaphore.clone();
+            let rr = rr_for_events.clone();
             async move {
-                handle_event(event, client, &ch, &itx, &stx, &qtx, &store, &sr, auto_mark_read, &allowed, &dedup, &bid, &dl_sem)
+                handle_event(event, client, &ch, &itx, &stx, &qtx, &store, &sr, auto_mark_read, &allowed, &dedup, &bid, &dl_sem, &rr)
                     .await;
             }
         });
@@ -1143,6 +1161,7 @@ async fn handle_event(
     dedup: &Arc<AtomicDedupCache>,
     bridge_id: &str,
     dl_semaphore: &Semaphore,
+    rr_tx: &mpsc::Sender<ReadReceiptCmd>,
 ) {
     match event {
         Event::PairingQrCode { code, .. } => {
@@ -1179,6 +1198,7 @@ async fn handle_event(
             info!("WhatsApp connected");
             let _ = qr_tx.send(None); // clear QR on connection
             set_client_handle(client_handle, Some(client.clone()));
+            let _ = rr_tx.send(ReadReceiptCmd::SetClient(Some(client.clone()))).await;
             let _ = state_tx.send(BridgeState::Connected);
         }
         Event::Message(msg, info) => {
@@ -1224,24 +1244,16 @@ async fn handle_event(
                     match inbound_tx.send(inbound).await {
                         Ok(()) => {
                             dedup.mark_done(&info.id);
-                            // Read receipts are handled by the ReadReceiptScheduler
-                            // (wired in Task 3 — for now, mark_as_read inline as before)
                             if auto_mark_read && !info.source.is_from_me {
-                                let group_sender = if info.source.is_group {
-                                    Some(&info.source.sender)
-                                } else {
-                                    None
-                                };
-                                if let Err(e) = client
-                                    .mark_as_read(&info.source.chat, group_sender, vec![info.id.clone()])
-                                    .await
-                                {
-                                    warn!(
-                                        error = %e,
-                                        chat = %info.source.chat,
-                                        "failed to send read receipt"
-                                    );
-                                }
+                                let _ = rr_tx.send(ReadReceiptCmd::Seen {
+                                    chat_jid: info.source.chat.to_string(),
+                                    participant_jid: if info.source.is_group {
+                                        Some(info.source.sender.to_string())
+                                    } else {
+                                        None
+                                    },
+                                    message_id: info.id.clone(),
+                                }).await;
                             }
                         }
                         Err(e) => {
@@ -1274,6 +1286,7 @@ async fn handle_event(
         Event::LoggedOut(reason) => {
             warn!(reason = ?reason.reason, on_connect = reason.on_connect, "WhatsApp logged out");
             set_client_handle(client_handle, None);
+            let _ = rr_tx.send(ReadReceiptCmd::SetClient(None)).await;
             stop_reconnect.store(true, Ordering::Relaxed);
             request_disconnect(client.clone());
             let _ = state_tx.send(BridgeState::Disconnected);
@@ -1281,11 +1294,13 @@ async fn handle_event(
         Event::StreamError(stream_err) => {
             error!(code = %stream_err.code, "WhatsApp stream error");
             set_client_handle(client_handle, None);
+            let _ = rr_tx.send(ReadReceiptCmd::SetClient(None)).await;
             let _ = state_tx.send(BridgeState::Disconnected);
         }
         Event::StreamReplaced(_) => {
             error!("StreamReplaced: another client connected using this same linked device session — stopping to avoid replacement loop. Check for duplicate bridge processes (ps aux | grep whatsrust) or a competing WhatsApp Web/Desktop session.");
             set_client_handle(client_handle, None);
+            let _ = rr_tx.send(ReadReceiptCmd::SetClient(None)).await;
             stop_reconnect.store(true, Ordering::Relaxed);
             request_disconnect(client.clone());
             let _ = state_tx.send(BridgeState::Disconnected);
@@ -1293,6 +1308,7 @@ async fn handle_event(
         Event::TemporaryBan(ban) => {
             error!(?ban.code, ban_expires_secs = ban.expire.num_seconds(), "temporarily banned by WhatsApp");
             set_client_handle(client_handle, None);
+            let _ = rr_tx.send(ReadReceiptCmd::SetClient(None)).await;
             stop_reconnect.store(true, Ordering::Relaxed);
             request_disconnect(client.clone());
             let _ = state_tx.send(BridgeState::Disconnected);
@@ -1300,6 +1316,7 @@ async fn handle_event(
         Event::ClientOutdated(_) => {
             error!("WhatsApp client version outdated — update required");
             set_client_handle(client_handle, None);
+            let _ = rr_tx.send(ReadReceiptCmd::SetClient(None)).await;
             stop_reconnect.store(true, Ordering::Relaxed);
             request_disconnect(client.clone());
             let _ = state_tx.send(BridgeState::Disconnected);
@@ -1307,6 +1324,7 @@ async fn handle_event(
         Event::ConnectFailure(failure) => {
             error!(reason = ?failure.reason, message = %failure.message, "WhatsApp connect failure");
             set_client_handle(client_handle, None);
+            let _ = rr_tx.send(ReadReceiptCmd::SetClient(None)).await;
             if !failure.reason.should_reconnect() {
                 stop_reconnect.store(true, Ordering::Relaxed);
                 request_disconnect(client.clone());
@@ -1346,6 +1364,7 @@ async fn handle_event(
         Event::Disconnected(_) => {
             warn!("WhatsApp disconnected (transport drop)");
             set_client_handle(client_handle, None);
+            let _ = rr_tx.send(ReadReceiptCmd::SetClient(None)).await;
             let _ = state_tx.send(BridgeState::Disconnected);
         }
         Event::PairSuccess(_) => {
