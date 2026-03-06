@@ -70,7 +70,7 @@ WHATSAPP_PAIR_PHONE="+1234567890" cargo run
 WHATSAPP_ALLOWED="1234567890" HEALTH_PORT=8080 cargo run
 ```
 
-The built-in REPL gives you every command: `send`, `reply`, `edit`, `react`, `image`, `audio`, `video`, `doc`, `sticker`, `location`, `contact`, `typing`, `stop-typing`, `status`, `quit`.
+The built-in REPL gives you every command: `send`, `reply`, `edit`, `react`, `image`, `audio`, `video`, `doc`, `sticker`, `location`, `contact`, `typing`, `stop-typing`, `groups`, `group-info`, `status`, `quit`.
 
 ---
 
@@ -165,6 +165,12 @@ bridge.send_message_with_id("1234567890", &reply).await?;
 | `state()` / `is_connected()` | Connection state |
 | `subscribe_qr()` | QR code events |
 | `subscribe_state()` | State change events |
+| `get_joined_groups()` | List all groups you're in |
+| `get_group_info(group_jid)` | Group metadata + participants |
+| `create_group(name, participants)` | Create a new group |
+| `set_group_subject(group_jid, subject)` | Rename a group |
+| `leave_group(group_jid)` | Leave a group |
+| `get_group_invite_link(group_jid)` | Get group invite link |
 | `stop()` / `wait_stopped(timeout)` | Graceful shutdown |
 
 ### Inbound messages

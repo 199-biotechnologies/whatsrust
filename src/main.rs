@@ -460,6 +460,35 @@ async fn main() -> Result<()> {
                                 bridge_for_repl.is_connected()
                             );
                         }
+                        "groups" => {
+                            match bridge_for_repl.get_joined_groups().await {
+                                Ok(groups) => {
+                                    println!("joined {} groups:", groups.len());
+                                    for g in &groups {
+                                        println!("  {} — {} ({} members)", g.jid, g.subject, g.participants.len());
+                                    }
+                                }
+                                Err(e) => eprintln!("error: {e}"),
+                            }
+                        }
+                        "group-info" => {
+                            if parts.len() < 2 {
+                                eprintln!("usage: group-info <group-jid>");
+                            } else {
+                                let jid = parts[1];
+                                match bridge_for_repl.get_group_info(jid).await {
+                                    Ok(info) => {
+                                        println!("group: {} ({})", info.subject, info.jid);
+                                        for p in &info.participants {
+                                            let role = if p.is_admin { " [admin]" } else { "" };
+                                            let phone = p.phone.as_deref().unwrap_or("?");
+                                            println!("  {} ({}){}", p.jid, phone, role);
+                                        }
+                                    }
+                                    Err(e) => eprintln!("error: {e}"),
+                                }
+                            }
+                        }
                         "quit" | "q" | "exit" => {
                             cancel_for_repl.cancel();
                             break;

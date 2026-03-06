@@ -120,6 +120,22 @@ impl BridgeMetrics {
     }
 }
 
+/// Group metadata returned by group query methods.
+#[derive(Debug, Clone)]
+pub struct GroupInfo {
+    pub jid: String,
+    pub subject: String,
+    pub participants: Vec<GroupParticipantInfo>,
+}
+
+/// A participant in a WhatsApp group.
+#[derive(Debug, Clone)]
+pub struct GroupParticipantInfo {
+    pub jid: String,
+    pub phone: Option<String>,
+    pub is_admin: bool,
+}
+
 /// Tri-state result from content extraction — drives two-phase dedup.
 enum ExtractResult {
     /// Successfully extracted content — dedup after enqueue.
@@ -481,6 +497,99 @@ impl WhatsAppBridge {
 
     pub fn stop(&self) {
         self.cancel.cancel();
+    }
+
+    // -----------------------------------------------------------------------
+    // Group management
+    // -----------------------------------------------------------------------
+
+    /// Get metadata for a group (subject, participants, admin status).
+    pub async fn get_group_info(
+        &self,
+        group_jid: &str,
+    ) -> Result<GroupInfo> {
+        let jid = parse_jid(group_jid)?;
+        let client = get_client_handle(&self.client_handle).context("not connected")?;
+        let metadata = client.groups().get_metadata(&jid).await?;
+        Ok(GroupInfo {
+            jid: metadata.id.to_string(),
+            subject: metadata.subject,
+            participants: metadata
+                .participants
+                .into_iter()
+                .map(|p| GroupParticipantInfo {
+                    jid: p.jid.to_string(),
+                    phone: p.phone_number.map(|pn| pn.to_string()),
+                    is_admin: p.is_admin,
+                })
+                .collect(),
+        })
+    }
+
+    /// Get all groups this device is a member of.
+    pub async fn get_joined_groups(&self) -> Result<Vec<GroupInfo>> {
+        let client = get_client_handle(&self.client_handle).context("not connected")?;
+        let groups = client.groups().get_participating().await?;
+        Ok(groups
+            .into_values()
+            .map(|g| GroupInfo {
+                jid: g.id.to_string(),
+                subject: g.subject,
+                participants: g
+                    .participants
+                    .into_iter()
+                    .map(|p| GroupParticipantInfo {
+                        jid: p.jid.to_string(),
+                        phone: p.phone_number.map(|pn| pn.to_string()),
+                        is_admin: p.is_admin,
+                    })
+                    .collect(),
+            })
+            .collect())
+    }
+
+    /// Create a new group with the given name and participant phone numbers.
+    pub async fn create_group(
+        &self,
+        name: &str,
+        participants: &[&str],
+    ) -> Result<String> {
+        use whatsapp_rust::features::{GroupCreateOptions, GroupParticipantOptions};
+        let client = get_client_handle(&self.client_handle).context("not connected")?;
+        let participant_opts: Vec<GroupParticipantOptions> = participants
+            .iter()
+            .map(|p| GroupParticipantOptions::new(parse_jid(p).expect("valid JID")))
+            .collect();
+        let opts = GroupCreateOptions::new(name).with_participants(participant_opts);
+        let result = client.groups().create_group(opts).await?;
+        Ok(result.gid.to_string())
+    }
+
+    /// Set the subject (title) of a group.
+    pub async fn set_group_subject(&self, group_jid: &str, subject: &str) -> Result<()> {
+        use whatsapp_rust::features::GroupSubject;
+        let jid = parse_jid(group_jid)?;
+        let client = get_client_handle(&self.client_handle).context("not connected")?;
+        let validated_subject = GroupSubject::new(subject.to_string())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        client.groups().set_subject(&jid, validated_subject).await?;
+        Ok(())
+    }
+
+    /// Leave a group.
+    pub async fn leave_group(&self, group_jid: &str) -> Result<()> {
+        let jid = parse_jid(group_jid)?;
+        let client = get_client_handle(&self.client_handle).context("not connected")?;
+        client.groups().leave(&jid).await?;
+        Ok(())
+    }
+
+    /// Get the invite link for a group.
+    pub async fn get_group_invite_link(&self, group_jid: &str) -> Result<String> {
+        let jid = parse_jid(group_jid)?;
+        let client = get_client_handle(&self.client_handle).context("not connected")?;
+        let link = client.groups().get_invite_link(&jid, false).await?;
+        Ok(link)
     }
 
     /// Flush all pending read receipts for a chat (call before replying).
