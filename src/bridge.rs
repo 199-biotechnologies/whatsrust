@@ -7,12 +7,13 @@
 //!   - LID-to-phone sender normalization
 //!   - Expanded event handling (ban, outdated, stream errors)
 
-use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::dedup::AtomicDedupCache;
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex as ParkingMutex;
@@ -43,55 +44,6 @@ const DEDUP_CACHE_CAPACITY: usize = 4096;
 const MAX_MEDIA_BYTES: u64 = 50 * 1024 * 1024; // 50 MiB
 /// Maximum concurrent media downloads (bounds peak memory usage).
 const MAX_CONCURRENT_DOWNLOADS: usize = 4;
-/// Chats with activity within this window get near-instant read receipts.
-const ACTIVE_CHAT_WINDOW: Duration = Duration::from_secs(30);
-
-/// Tracks last message time per JID for adaptive read receipt timing.
-/// Active conversations get near-instant receipts; cold opens get jittered delay.
-type ActivityTracker = Arc<ParkingMutex<HashMap<String, Instant>>>;
-
-// ---------------------------------------------------------------------------
-// Dedup cache — bounded ring-buffer set to prevent double-processing
-// ---------------------------------------------------------------------------
-
-/// A bounded set that evicts the oldest entry when full.
-/// Uses a VecDeque as a ring buffer + HashSet for O(1) lookup.
-struct DedupCache {
-    order: VecDeque<String>,
-    seen: HashSet<String>,
-    capacity: usize,
-}
-
-impl DedupCache {
-    fn new(capacity: usize) -> Self {
-        Self {
-            order: VecDeque::with_capacity(capacity),
-            seen: HashSet::with_capacity(capacity),
-            capacity,
-        }
-    }
-
-    /// Returns true if the ID was already seen (check only, does not insert).
-    fn is_seen(&self, id: &str) -> bool {
-        self.seen.contains(id)
-    }
-
-    /// Insert an ID into the dedup set (evicts oldest if full).
-    fn insert(&mut self, id: &str) {
-        if self.seen.contains(id) {
-            return;
-        }
-        if self.order.len() >= self.capacity {
-            if let Some(old) = self.order.pop_front() {
-                self.seen.remove(&old);
-            }
-        }
-        let owned = id.to_string();
-        self.seen.insert(owned.clone());
-        self.order.push_back(owned);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -309,10 +261,6 @@ pub struct BridgeConfig {
     pub auto_mark_read: bool,
     /// If non-empty, only process inbound messages from these phone numbers (digits only).
     pub allowed_numbers: Vec<String>,
-    /// Minimum delay before sending a read receipt (anti-ban pacing, millis).
-    pub read_receipt_delay_min_ms: u64,
-    /// Maximum delay before sending a read receipt (anti-ban pacing, millis).
-    pub read_receipt_delay_max_ms: u64,
     /// Minimum interval between outbound sends (anti-ban pacing, millis).
     pub min_send_interval_ms: u64,
     /// TCP port for the health endpoint (0 = disabled).
@@ -339,8 +287,6 @@ impl Default for BridgeConfig {
             skip_history_sync: true,
             auto_mark_read: true,
             allowed_numbers: Vec::new(),
-            read_receipt_delay_min_ms: 500,
-            read_receipt_delay_max_ms: 3000,
             min_send_interval_ms: 400,
             health_port: 0,
             drain_timeout_secs: 10,
@@ -865,7 +811,7 @@ async fn run_bridge(
     }
 
     // Message dedup cache survives reconnections
-    let dedup = Arc::new(ParkingMutex::new(DedupCache::new(DEDUP_CACHE_CAPACITY)));
+    let dedup = Arc::new(AtomicDedupCache::new(DEDUP_CACHE_CAPACITY));
 
     // Secure the database file (Signal Protocol private keys)
     #[cfg(unix)]
@@ -1030,7 +976,7 @@ async fn run_bot_session(
     qr_tx: &watch::Sender<Option<String>>,
     cancel: &CancellationToken,
     client_handle: &Arc<ParkingMutex<Option<Arc<Client>>>>,
-    dedup: &Arc<ParkingMutex<DedupCache>>,
+    dedup: &Arc<AtomicDedupCache>,
 ) -> Result<SessionAction> {
     // Clear stale handle from previous session
     set_client_handle(client_handle, None);
@@ -1049,9 +995,6 @@ async fn run_bot_session(
     let dedup_for_events = dedup.clone();
     let bridge_id = config.bridge_id.clone();
     let dl_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DOWNLOADS));
-    let rr_delay_min = config.read_receipt_delay_min_ms;
-    let rr_delay_max = config.read_receipt_delay_max_ms;
-    let activity: ActivityTracker = Arc::new(ParkingMutex::new(HashMap::new()));
     let qtx = Arc::new(qr_tx.clone());
 
     // Build the Bot
@@ -1070,9 +1013,8 @@ async fn run_bot_session(
             let dedup = dedup_for_events.clone();
             let bid = bridge_id.clone();
             let dl_sem = dl_semaphore.clone();
-            let act = activity.clone();
             async move {
-                handle_event(event, client, &ch, &itx, &stx, &qtx, &store, &sr, auto_mark_read, &allowed, &dedup, &bid, &dl_sem, rr_delay_min, rr_delay_max, &act)
+                handle_event(event, client, &ch, &itx, &stx, &qtx, &store, &sr, auto_mark_read, &allowed, &dedup, &bid, &dl_sem)
                     .await;
             }
         });
@@ -1198,12 +1140,9 @@ async fn handle_event(
     stop_reconnect: &Arc<AtomicBool>,
     auto_mark_read: bool,
     allowed_numbers: &[String],
-    dedup: &Arc<ParkingMutex<DedupCache>>,
+    dedup: &Arc<AtomicDedupCache>,
     bridge_id: &str,
     dl_semaphore: &Semaphore,
-    rr_delay_min_ms: u64,
-    rr_delay_max_ms: u64,
-    activity: &ActivityTracker,
 ) {
     match event {
         Event::PairingQrCode { code, .. } => {
@@ -1243,8 +1182,8 @@ async fn handle_event(
             let _ = state_tx.send(BridgeState::Connected);
         }
         Event::Message(msg, info) => {
-            // Two-phase dedup: check first (don't insert yet)
-            if dedup.lock().is_seen(&info.id) {
+            // Atomic dedup: try_admit returns true if this caller won the race.
+            if !dedup.try_admit(&info.id) {
                 debug!(id = %info.id, "duplicate message, skipping");
                 return;
             }
@@ -1257,7 +1196,7 @@ async fn handle_event(
                 && !info.source.is_from_me
                 && !allowed_numbers.iter().any(|n| n == &sender)
             {
-                dedup.lock().insert(&info.id);
+                dedup.mark_done(&info.id);
                 debug!(sender = %sender, "message from non-allowed sender, skipping");
                 return;
             }
@@ -1284,58 +1223,36 @@ async fn handle_event(
 
                     match inbound_tx.send(inbound).await {
                         Ok(()) => {
-                            // Commit to dedup only after successful enqueue
-                            dedup.lock().insert(&info.id);
+                            dedup.mark_done(&info.id);
+                            // Read receipts are handled by the ReadReceiptScheduler
+                            // (wired in Task 3 — for now, mark_as_read inline as before)
+                            if auto_mark_read && !info.source.is_from_me {
+                                let group_sender = if info.source.is_group {
+                                    Some(&info.source.sender)
+                                } else {
+                                    None
+                                };
+                                if let Err(e) = client
+                                    .mark_as_read(&info.source.chat, group_sender, vec![info.id.clone()])
+                                    .await
+                                {
+                                    warn!(
+                                        error = %e,
+                                        chat = %info.source.chat,
+                                        "failed to send read receipt"
+                                    );
+                                }
+                            }
                         }
                         Err(e) => {
-                            // Channel closed — do NOT insert into dedup so message isn't lost
+                            // Channel closed — remove from dedup so message isn't lost
+                            dedup.remove(&info.id);
                             warn!(error = %e, "inbound channel closed, message NOT deduped");
-                        }
-                    }
-
-                    // Adaptive read receipt: near-instant during active conversation,
-                    // jittered delay on cold opens (anti-ban pacing).
-                    if auto_mark_read && !info.source.is_from_me {
-                        let chat_jid_str = info.source.chat.to_string();
-                        let is_active = {
-                            let tracker = activity.lock();
-                            tracker.get(&chat_jid_str)
-                                .map(|last| last.elapsed() < ACTIVE_CHAT_WINDOW)
-                                .unwrap_or(false)
-                        };
-                        // Record this activity for future lookups
-                        activity.lock().insert(chat_jid_str, Instant::now());
-
-                        let delay = if is_active {
-                            // Active conversation: near-instant (50-150ms)
-                            Duration::from_millis(50 + rand_jitter_ms(200) % 100)
-                        } else {
-                            // Cold open: jittered delay within configured range
-                            let range = rr_delay_max_ms.saturating_sub(rr_delay_min_ms).max(1);
-                            let jitter = rand_jitter_ms(range * 2) % range;
-                            Duration::from_millis(rr_delay_min_ms + jitter)
-                        };
-                        tokio::time::sleep(delay).await;
-                        let group_sender = if info.source.is_group {
-                            Some(&info.source.sender)
-                        } else {
-                            None
-                        };
-                        if let Err(e) = client
-                            .mark_as_read(&info.source.chat, group_sender, vec![info.id.clone()])
-                            .await
-                        {
-                            warn!(
-                                error = %e,
-                                chat = %info.source.chat,
-                                "failed to send read receipt"
-                            );
                         }
                     }
                 }
                 ExtractResult::Unhandled => {
-                    // Unknown type — dedup immediately (no point retrying)
-                    dedup.lock().insert(&info.id);
+                    dedup.mark_done(&info.id);
                     debug!(
                         message_kind = message_kind(&msg),
                         chat = %info.source.chat,
@@ -1344,7 +1261,8 @@ async fn handle_event(
                     );
                 }
                 ExtractResult::TransientFailure => {
-                    // Transient failure — do NOT dedup so the message can be retried on redeliver
+                    // Remove from dedup so the message can be retried on redeliver
+                    dedup.remove(&info.id);
                     warn!(
                         id = %info.id,
                         chat = %info.source.chat,
@@ -2140,27 +2058,6 @@ mod tests {
     fn test_message_kind_default() {
         let msg = wa::Message::default();
         assert_eq!(message_kind(&msg), "other");
-    }
-
-    #[test]
-    fn test_dedup_cache() {
-        let mut cache = DedupCache::new(3);
-        assert!(!cache.is_seen("a"));
-        cache.insert("a");
-        assert!(cache.is_seen("a")); // now seen
-        cache.insert("b");
-        cache.insert("c"); // cache: [a, b, c] (full)
-        // Inserting "d" evicts "a"
-        cache.insert("d"); // cache: [b, c, d]
-        assert!(!cache.is_seen("a")); // "a" was evicted
-        cache.insert("a"); // cache: [c, d, a]
-        assert!(cache.is_seen("d")); // "d" still in cache
-        assert!(cache.is_seen("c")); // "c" still in cache
-        // Re-inserting existing key is a no-op (no double eviction)
-        cache.insert("d");
-        assert!(cache.is_seen("c"));
-        assert!(cache.is_seen("d"));
-        assert!(cache.is_seen("a"));
     }
 
     #[test]
