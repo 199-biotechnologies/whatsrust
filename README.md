@@ -28,11 +28,15 @@ We built this because we needed WhatsApp inside agent software and got tired of 
 
 **Every message type:** text, image, audio/voice, video, document, sticker, location, contact card, reaction (add + remove), edit, revoke, reply/quote.
 
+**Full group management:** list groups, get group info, create, rename, set description, add/remove/promote/demote participants, invite links.
+
 **Stays alive:**
 - Crash-safe outbound queue in SQLite. Messages survive restarts.
 - Atomic message dedup with DashMap. No double-processing, even under concurrent event handlers.
-- Exponential backoff with jitter on reconnect. Not the naive kind.
+- Per-message exponential backoff in the outbound queue. One stuck message doesn't block the rest.
+- Graduated reconnect backoff with jitter. Not the naive kind.
 - Graceful shutdown. Drains in-flight messages on SIGINT/SIGTERM.
+- JID filtering. Drops status broadcasts, newsletter, and server noise before processing.
 - Single-instance flock. Two bridges can't fight over one session.
 - SQLite backup on startup and shutdown. WAL mode, no corruption.
 
@@ -40,7 +44,7 @@ We built this because we needed WhatsApp inside agent software and got tired of 
 - Read receipt batching. Groups message IDs per chat into single network stanzas on a 200ms coalesce.
 - Flush-before-reply. Marks messages as read before responding, matching the human read-then-type-then-send pattern.
 - Recording indicator. Shows "recording audio" before sending voice notes.
-- Configurable send pacing with randomized intervals.
+- Configurable send pacing with randomized jitter intervals.
 - Auto presence management. Available on connect, unavailable on shutdown.
 
 **Ships clean:**
@@ -218,7 +222,7 @@ Media arrives as raw bytes. No second download step.
 ```
 src/
   main.rs            REPL + signals + instance lock
-  bridge.rs          Events, messaging, queue, health, presence
+  bridge.rs          Events, messaging, queue, health, presence, groups
   storage.rs         rusqlite Signal Protocol store
   dedup.rs           Atomic DashMap dedup (concurrent-safe)
   read_receipts.rs   Batched receipt scheduler with flush-before-reply
@@ -227,14 +231,16 @@ src/
   lib.rs             Library crate exports
 ```
 
-Seven files. Under 5000 lines. That's the whole thing.
+Eight files. Under 6000 lines. That's the whole thing.
 
 **Design decisions:**
 - `parking_lot::Mutex<Connection>` + `spawn_blocking` for SQLite. No async DB headaches.
 - WAL mode + `synchronous=NORMAL`. Fast writes, no corruption.
-- `DashMap::entry()` for dedup. Lock-free, atomic, handles concurrent event handlers from wa-rs's `tokio::spawn` per event.
+- Generation-tracked `DashMap` for dedup. Lock-free, atomic, handles concurrent event handlers. Generation counter prevents eviction corruption on remove+re-admit cycles.
 - Channel architecture: `mpsc` inbound, `mpsc` outbound, `watch` for state + QR. Clean for consumers.
+- Per-message exponential backoff via `retry_after` column. Failing messages wait out their backoff while newer messages flow through — no head-of-line blocking.
 - Read receipt coalescing on a timer. Groups IDs by (chat, participant) into batched stanzas, matching what WhatsApp Web does.
+- `AtomicU64` bridge metrics. No locks, no DB reads for health checks.
 - Single-device only. No `device_id` column. Cuts query complexity in half.
 
 **Dependencies:** `tokio`, `rusqlite` (bundled), `dashmap`, `anyhow`, `tracing`, `whatsapp-rust` (git-pinned), `wacore`, `waproto`, `prost`, `parking_lot`, `chrono`, `fs2`, `qrcode`, `png`, `serde`, `serde_json`. Single binary. No Node.js runtime. No Diesel. No migration framework. `cargo build --release` and ship.
@@ -255,7 +261,9 @@ Seven files. Under 5000 lines. That's the whole thing.
 | Instance locking | No | flock-based |
 | Health endpoint | No | JSON over TCP |
 | SQLite backups | No | Automatic |
+| Group management | Manual API calls | 12 methods, full CRUD |
 | Recording indicator | Manual | Built-in |
+| Outbound queue | None | SQLite-backed, per-message backoff |
 | Dependencies | npm install and pray | cargo build |
 
 ---
