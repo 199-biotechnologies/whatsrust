@@ -1,5 +1,6 @@
 use dashmap::DashMap;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 /// Dedup state: InFlight means extraction in progress, Done means fully processed.
@@ -10,11 +11,15 @@ pub enum DedupState {
 }
 
 /// Thread-safe, atomic dedup cache with bounded capacity.
+///
 /// Uses DashMap for lock-free concurrent access and a Mutex<VecDeque> for eviction order.
+/// A generation counter ensures that remove+re-admit sequences don't corrupt eviction:
+/// stale `order` entries are skipped when their generation doesn't match the live map entry.
 pub struct AtomicDedupCache {
-    map: DashMap<String, DedupState>,
-    order: Mutex<VecDeque<String>>,
+    map: DashMap<String, (DedupState, u64)>,
+    order: Mutex<VecDeque<(String, u64)>>,
     capacity: usize,
+    gen: AtomicU64,
 }
 
 impl AtomicDedupCache {
@@ -23,6 +28,7 @@ impl AtomicDedupCache {
             map: DashMap::with_capacity(capacity),
             order: Mutex::new(VecDeque::with_capacity(capacity)),
             capacity,
+            gen: AtomicU64::new(0),
         }
     }
 
@@ -30,16 +36,27 @@ impl AtomicDedupCache {
     /// (inserted as InFlight). Returns `false` if already present.
     pub fn try_admit(&self, id: &str) -> bool {
         use dashmap::mapref::entry::Entry;
+        let gen = self.gen.fetch_add(1, Ordering::Relaxed);
         match self.map.entry(id.to_string()) {
             Entry::Occupied(_) => false,
             Entry::Vacant(v) => {
-                v.insert(DedupState::InFlight);
+                v.insert((DedupState::InFlight, gen));
                 let mut order = self.order.lock().unwrap();
-                order.push_back(id.to_string());
-                // Evict oldest if over capacity
-                while order.len() > self.capacity {
-                    if let Some(old) = order.pop_front() {
-                        self.map.remove(&old);
+                order.push_back((id.to_string(), gen));
+                // Evict oldest if over capacity — skip stale entries whose
+                // generation no longer matches (removed then re-admitted).
+                while self.map.len() > self.capacity {
+                    if let Some((old_id, old_gen)) = order.pop_front() {
+                        if let Some(entry) = self.map.get(&old_id) {
+                            if entry.1 == old_gen {
+                                drop(entry);
+                                self.map.remove(&old_id);
+                            }
+                            // else: re-admitted with newer gen, skip
+                        }
+                        // else: already removed, skip
+                    } else {
+                        break;
                     }
                 }
                 true
@@ -50,11 +67,12 @@ impl AtomicDedupCache {
     /// Mark a message as fully processed.
     pub fn mark_done(&self, id: &str) {
         if let Some(mut entry) = self.map.get_mut(id) {
-            *entry = DedupState::Done;
+            entry.0 = DedupState::Done;
         }
     }
 
     /// Remove a message from dedup (allows retry on transient failure).
+    /// The stale entry in `order` is harmless — eviction skips it via generation mismatch.
     pub fn remove(&self, id: &str) {
         self.map.remove(id);
     }
@@ -117,6 +135,28 @@ mod tests {
         assert!(!cache.contains("a"));
         assert!(cache.contains("b"));
         assert!(cache.contains("d"));
+    }
+
+    #[test]
+    fn test_remove_readmit_eviction_correctness() {
+        // Regression: remove+re-admit used to leave stale entries in `order`,
+        // causing eviction to delete the live re-admitted entry.
+        let cache = AtomicDedupCache::new(3);
+        cache.try_admit("a");
+        cache.try_admit("b");
+        cache.try_admit("c");
+        // Remove "a" and re-admit it — now "a" should be the *newest* entry
+        cache.remove("a");
+        assert!(cache.try_admit("a")); // re-admitted with new generation
+        // Admit "d" — this triggers eviction. Should evict "b" (oldest live), not "a".
+        cache.try_admit("d");
+        assert!(cache.contains("a"), "re-admitted 'a' must survive eviction");
+        assert!(cache.contains("d"), "'d' must be present");
+        // "b" or "c" should have been evicted, not "a"
+        assert!(
+            !cache.contains("b") || !cache.contains("c"),
+            "one of b/c must be evicted"
+        );
     }
 
     #[test]

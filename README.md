@@ -1,7 +1,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/rust-stable-orange?logo=rust" alt="Rust">
-  <img src="https://img.shields.io/badge/binary_size-~15MB-brightgreen" alt="Binary Size">
-  <img src="https://img.shields.io/badge/memory-~20MB-brightgreen" alt="Memory">
+  <img src="https://img.shields.io/badge/binary_size-5MB-brightgreen" alt="Binary Size">
+  <img src="https://img.shields.io/badge/memory-~15MB-brightgreen" alt="Memory">
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="License">
   <img src="https://img.shields.io/github/stars/199-biotechnologies/whatsrust?style=social" alt="Stars">
 </p>
@@ -18,7 +18,7 @@ Built by [Boris Djordjevic](https://github.com/borisdjordjevic).
 
 If you've built anything on WhatsApp, you've met Baileys. Node.js. 200MB of node_modules. Crashes at 3 AM. Memory leaks you can set your watch to. Works great until it doesn't, and then you're reading someone else's JavaScript at 4 AM wondering where your life went wrong.
 
-whatsrust replaces all of that with one Rust binary. 15MB. 20MB RAM. Handles every message type Baileys does. Does a bunch of things Baileys doesn't.
+whatsrust replaces all of that with one Rust binary. 5MB. 15MB RAM. Handles every message type Baileys does. Does a bunch of things Baileys doesn't.
 
 We built this because we needed WhatsApp inside agent software and got tired of babysitting a Node sidecar. So we killed it.
 
@@ -235,8 +235,8 @@ Seven files. Under 5000 lines. That's the whole thing.
 | | Baileys | whatsrust |
 |---|---------|-----------|
 | Language | Node.js | Rust |
-| Binary size | ~200MB with node_modules | ~15MB |
-| Memory at idle | ~150MB | ~20MB |
+| Binary size | ~90MB with node_modules + runtime | 5MB |
+| Memory at idle | ~50MB | ~15MB |
 | Crash recovery | Roll your own | Built-in queue + backoff |
 | Message types | All | All |
 | Message dedup | None | Atomic DashMap (concurrent-safe) |

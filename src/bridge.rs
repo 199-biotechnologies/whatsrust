@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -62,6 +62,62 @@ pub enum BridgeState {
 enum SessionAction {
     Retry,
     Stop,
+}
+
+/// Atomic counters for bridge health metrics — no locks, no DB reads.
+pub struct BridgeMetrics {
+    started_at: std::time::Instant,
+    messages_sent: AtomicU64,
+    messages_received: AtomicU64,
+    reconnect_count: AtomicU64,
+    last_connect_epoch: AtomicU64,
+    last_disconnect_epoch: AtomicU64,
+    last_inbound_epoch: AtomicU64,
+    last_outbound_epoch: AtomicU64,
+}
+
+impl BridgeMetrics {
+    fn new() -> Self {
+        Self {
+            started_at: std::time::Instant::now(),
+            messages_sent: AtomicU64::new(0),
+            messages_received: AtomicU64::new(0),
+            reconnect_count: AtomicU64::new(0),
+            last_connect_epoch: AtomicU64::new(0),
+            last_disconnect_epoch: AtomicU64::new(0),
+            last_inbound_epoch: AtomicU64::new(0),
+            last_outbound_epoch: AtomicU64::new(0),
+        }
+    }
+
+    fn epoch_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    pub fn record_sent(&self) {
+        self.messages_sent.fetch_add(1, Ordering::Relaxed);
+        self.last_outbound_epoch.store(Self::epoch_now(), Ordering::Relaxed);
+    }
+
+    pub fn record_received(&self) {
+        self.messages_received.fetch_add(1, Ordering::Relaxed);
+        self.last_inbound_epoch.store(Self::epoch_now(), Ordering::Relaxed);
+    }
+
+    pub fn record_connect(&self) {
+        self.last_connect_epoch.store(Self::epoch_now(), Ordering::Relaxed);
+    }
+
+    pub fn record_disconnect(&self) {
+        self.last_disconnect_epoch.store(Self::epoch_now(), Ordering::Relaxed);
+    }
+
+    pub fn record_reconnect(&self) {
+        self.reconnect_count.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Tri-state result from content extraction — drives two-phase dedup.
@@ -324,6 +380,8 @@ pub struct BridgeConfig {
     pub presence_tx: Option<mpsc::Sender<PresenceEvent>>,
     /// Device name shown in WhatsApp's "Linked Devices" list (default: "RustClaw").
     pub device_name: String,
+    /// Maximum message IDs tracked for dedup (default: 4096).
+    pub dedup_capacity: usize,
 }
 
 impl Default for BridgeConfig {
@@ -345,6 +403,7 @@ impl Default for BridgeConfig {
             max_outbound_retries: 3,
             presence_tx: None,
             device_name: "RustClaw".to_string(),
+            dedup_capacity: DEDUP_CACHE_CAPACITY,
         }
     }
 }
@@ -916,7 +975,10 @@ async fn run_bridge(
     }
 
     // Message dedup cache survives reconnections
-    let dedup = Arc::new(AtomicDedupCache::new(DEDUP_CACHE_CAPACITY));
+    let dedup = Arc::new(AtomicDedupCache::new(config.dedup_capacity));
+
+    // Bridge-wide metrics (atomic, no locks)
+    let metrics = Arc::new(BridgeMetrics::new());
 
     // Secure the database file (Signal Protocol private keys)
     #[cfg(unix)]
@@ -934,8 +996,9 @@ async fn run_bridge(
         let health_state_rx = state_tx.subscribe();
         let health_store = store.clone();
         let health_cancel = cancel.clone();
+        let health_metrics = metrics.clone();
         tokio::spawn(async move {
-            spawn_health_server(config.health_port, health_state_rx, health_store, health_cancel).await;
+            spawn_health_server(config.health_port, health_state_rx, health_store, health_cancel, health_metrics).await;
         });
         info!(port = config.health_port, "health endpoint started");
     }
@@ -1018,6 +1081,7 @@ async fn run_bridge(
             &client_handle,
             &dedup,
             &rr_tx,
+            &metrics,
         )
         .await;
 
@@ -1032,7 +1096,10 @@ async fn run_bridge(
             }
             Ok(SessionAction::Retry) => {
                 info!("bot session ended; reconnecting");
-                backoff = Duration::from_secs(1); // reset on clean exit
+                // Graduated reset: halve backoff instead of zeroing it.
+                // Prevents reconnect storms on flapping connections while still
+                // recovering quickly from a single clean disconnect.
+                backoff = std::cmp::max(Duration::from_secs(1), backoff / 2);
             }
             Err(e) => {
                 error!(error = %e, "bot session failed");
@@ -1040,6 +1107,7 @@ async fn run_bridge(
         }
 
         // Exponential backoff with jitter before reconnect (clamped to max)
+        metrics.record_reconnect();
         let jitter_ms = rand_jitter_ms(backoff.as_millis() as u64);
         let delay = (backoff + Duration::from_millis(jitter_ms)).min(config.max_reconnect_delay);
         let _ = state_tx.send(BridgeState::Reconnecting);
@@ -1090,6 +1158,7 @@ async fn run_bot_session(
     client_handle: &Arc<ParkingMutex<Option<Arc<Client>>>>,
     dedup: &Arc<AtomicDedupCache>,
     rr_tx: &mpsc::Sender<ReadReceiptCmd>,
+    metrics: &Arc<BridgeMetrics>,
 ) -> Result<SessionAction> {
     // Clear stale handle from previous session
     set_client_handle(client_handle, None);
@@ -1111,6 +1180,7 @@ async fn run_bot_session(
     let qtx = Arc::new(qr_tx.clone());
     let rr_for_events = rr_tx.clone();
     let ptx_for_events = config.presence_tx.clone();
+    let metrics_for_events = metrics.clone();
     // Track previous QR terminal height for in-place overwrite on refresh
     let prev_qr_lines = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
@@ -1133,8 +1203,9 @@ async fn run_bot_session(
             let rr = rr_for_events.clone();
             let ptx = ptx_for_events.clone();
             let pql = prev_qr_lines.clone();
+            let met = metrics_for_events.clone();
             async move {
-                handle_event(event, client, &ch, &itx, &stx, &qtx, &store, &sr, auto_mark_read, &allowed, &dedup, &bid, &dl_sem, &rr, &ptx, &pql)
+                handle_event(event, client, &ch, &itx, &stx, &qtx, &store, &sr, auto_mark_read, &allowed, &dedup, &bid, &dl_sem, &rr, &ptx, &pql, &met)
                     .await;
             }
         });
@@ -1183,7 +1254,7 @@ async fn run_bot_session(
                 }
             }
         }
-        _ = handle_outbound(outbound_rx, &client_handle, cancel, config.min_send_interval_ms, store, config.max_outbound_retries) => {
+        _ = handle_outbound(outbound_rx, &client_handle, cancel, config.min_send_interval_ms, store, config.max_outbound_retries, metrics) => {
             if cancel.is_cancelled() || stop_reconnect.load(Ordering::Relaxed) {
                 Ok(SessionAction::Stop)
             } else {
@@ -1224,8 +1295,8 @@ async fn run_bot_session(
                                 sent += 1;
                             }
                             Err(_) => {
-                                // Put back for next session
-                                let _ = store.mark_outbound_failed(row.id, config.max_outbound_retries).await;
+                                // Put back for next session (don't burn retry budget)
+                                let _ = store.requeue_outbound(row.id).await;
                                 break;
                             }
                         }
@@ -1274,6 +1345,7 @@ async fn handle_event(
     rr_tx: &mpsc::Sender<ReadReceiptCmd>,
     presence_tx: &Option<mpsc::Sender<PresenceEvent>>,
     prev_qr_lines: &Arc<std::sync::atomic::AtomicUsize>,
+    metrics: &Arc<BridgeMetrics>,
 ) {
     match event {
         Event::PairingQrCode { code, .. } => {
@@ -1333,6 +1405,7 @@ async fn handle_event(
                     warn!(error = %e, "failed to send available presence on connect");
                 }
             });
+            metrics.record_connect();
             let _ = state_tx.send(BridgeState::Connected);
         }
         Event::Message(msg, info) => {
@@ -1377,6 +1450,7 @@ async fn handle_event(
 
                     match inbound_tx.send(inbound).await {
                         Ok(()) => {
+                            metrics.record_received();
                             dedup.mark_done(&info.id);
                             if auto_mark_read && !info.source.is_from_me {
                                 let _ = rr_tx.send(ReadReceiptCmd::Seen {
@@ -1425,15 +1499,16 @@ async fn handle_event(
             if let Err(e) = store.clear_device().await {
                 error!(error = %e, "failed to clear device auth after logout");
             }
-            stop_reconnect.store(true, Ordering::Relaxed);
             request_disconnect(client.clone());
+            metrics.record_disconnect();
             let _ = state_tx.send(BridgeState::Disconnected);
-            // Note: stop_reconnect is NOT set — bridge will reconnect and show QR
+            // stop_reconnect is NOT set — bridge will reconnect and show QR
         }
         Event::StreamError(stream_err) => {
             error!(code = %stream_err.code, "WhatsApp stream error");
             set_client_handle(client_handle, None);
             let _ = rr_tx.send(ReadReceiptCmd::SetClient(None)).await;
+            metrics.record_disconnect();
             let _ = state_tx.send(BridgeState::Disconnected);
         }
         Event::StreamReplaced(_) => {
@@ -1442,6 +1517,7 @@ async fn handle_event(
             let _ = rr_tx.send(ReadReceiptCmd::SetClient(None)).await;
             stop_reconnect.store(true, Ordering::Relaxed);
             request_disconnect(client.clone());
+            metrics.record_disconnect();
             let _ = state_tx.send(BridgeState::Disconnected);
         }
         Event::TemporaryBan(ban) => {
@@ -1450,6 +1526,7 @@ async fn handle_event(
             let _ = rr_tx.send(ReadReceiptCmd::SetClient(None)).await;
             stop_reconnect.store(true, Ordering::Relaxed);
             request_disconnect(client.clone());
+            metrics.record_disconnect();
             let _ = state_tx.send(BridgeState::Disconnected);
         }
         Event::ClientOutdated(_) => {
@@ -1458,6 +1535,7 @@ async fn handle_event(
             let _ = rr_tx.send(ReadReceiptCmd::SetClient(None)).await;
             stop_reconnect.store(true, Ordering::Relaxed);
             request_disconnect(client.clone());
+            metrics.record_disconnect();
             let _ = state_tx.send(BridgeState::Disconnected);
         }
         Event::ConnectFailure(failure) => {
@@ -1468,6 +1546,7 @@ async fn handle_event(
                 stop_reconnect.store(true, Ordering::Relaxed);
                 request_disconnect(client.clone());
             }
+            metrics.record_disconnect();
             let _ = state_tx.send(BridgeState::Disconnected);
         }
         Event::UndecryptableMessage(info) => {
@@ -1904,6 +1983,7 @@ async fn handle_outbound(
     min_send_interval_ms: u64,
     store: &Store,
     max_retries: i32,
+    metrics: &Arc<BridgeMetrics>,
 ) {
     let mut outbound_closed = false;
     let mut last_send = tokio::time::Instant::now() - Duration::from_secs(60);
@@ -1997,6 +2077,7 @@ async fn handle_outbound(
         match client.send_message(jid, msg).await {
             Ok(_msg_id) => {
                 last_send = tokio::time::Instant::now();
+                metrics.record_sent();
                 let _ = store.mark_outbound_sent(row.id).await;
             }
             Err(e) => {
@@ -2039,6 +2120,7 @@ async fn spawn_health_server(
     state_rx: watch::Receiver<BridgeState>,
     store: Store,
     cancel: CancellationToken,
+    metrics: Arc<BridgeMetrics>,
 ) {
     let listener = match TcpListener::bind(("0.0.0.0", port)).await {
         Ok(l) => l,
@@ -2071,8 +2153,18 @@ async fn spawn_health_server(
                 };
 
                 let body = format!(
-                    r#"{{"status":"{}","state":"{:?}","queue_depth":{}}}"#,
-                    status_str, state, queue_depth
+                    r#"{{"status":"{}","state":"{:?}","queue_depth":{},"uptime_secs":{},"messages_sent":{},"messages_received":{},"reconnect_count":{},"last_connect_epoch":{},"last_disconnect_epoch":{},"last_inbound_epoch":{},"last_outbound_epoch":{}}}"#,
+                    status_str,
+                    state,
+                    queue_depth,
+                    metrics.started_at.elapsed().as_secs(),
+                    metrics.messages_sent.load(Ordering::Relaxed),
+                    metrics.messages_received.load(Ordering::Relaxed),
+                    metrics.reconnect_count.load(Ordering::Relaxed),
+                    metrics.last_connect_epoch.load(Ordering::Relaxed),
+                    metrics.last_disconnect_epoch.load(Ordering::Relaxed),
+                    metrics.last_inbound_epoch.load(Ordering::Relaxed),
+                    metrics.last_outbound_epoch.load(Ordering::Relaxed),
                 );
                 let response = format!(
                     "{}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",

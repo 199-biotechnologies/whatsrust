@@ -102,12 +102,13 @@ async fn run_scheduler(
                         pending.insert(chat_jid, participant_jid, message_id);
                     }
                     Some(ReadReceiptCmd::FlushChat(chat)) => {
-                        let flushed = pending.drain_chat(&chat);
                         if let Some(ref c) = client {
+                            let flushed = pending.drain_chat(&chat);
                             for ((chat_jid, participant), msg_ids) in flushed {
                                 send_receipt(c, &chat_jid, participant.as_deref(), msg_ids).await;
                             }
                         }
+                        // If no client, leave receipts pending — they'll flush on next tick after reconnect
                     }
                     Some(ReadReceiptCmd::SetClient(c)) => {
                         client = c;
