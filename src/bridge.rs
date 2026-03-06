@@ -125,10 +125,18 @@ pub enum InboundContent {
         display_name: String,
         vcard: String,
     },
-    /// Emoji reaction on a message.
-    Reaction {
+    /// Emoji reaction added to a message.
+    ReactionAdded {
         target_id: String,
         emoji: String,
+        /// Sender of the original message (for group context).
+        target_sender: Option<String>,
+    },
+    /// Emoji reaction removed from a message.
+    ReactionRemoved {
+        target_id: String,
+        /// Sender of the original message (for group context).
+        target_sender: Option<String>,
     },
     /// Someone edited their message.
     Edit {
@@ -153,7 +161,8 @@ impl InboundContent {
             Self::Sticker { .. } => "sticker",
             Self::Location { .. } => "location",
             Self::Contact { .. } => "contact",
-            Self::Reaction { .. } => "reaction",
+            Self::ReactionAdded { .. } => "reaction",
+            Self::ReactionRemoved { .. } => "reaction-removed",
             Self::Edit { .. } => "edit",
             Self::Revoke { .. } => "revoke",
         }
@@ -202,7 +211,8 @@ impl InboundContent {
                 None => format!("[location: {lat:.5},{lon:.5}]"),
             },
             Self::Contact { display_name, .. } => format!("[contact: {display_name}]"),
-            Self::Reaction { emoji, target_id } => format!("[react {emoji} on {target_id}]"),
+            Self::ReactionAdded { emoji, target_id, .. } => format!("[react {emoji} on {target_id}]"),
+            Self::ReactionRemoved { target_id, .. } => format!("[unreact on {target_id}]"),
             Self::Edit { target_id, new_text } => format!("[edit {target_id}] {new_text}"),
             Self::Revoke { target_id } => format!("[deleted {target_id}]"),
         }
@@ -240,6 +250,32 @@ pub struct WhatsAppInbound {
     pub reply_to: Option<String>,
     /// Whether this is from our own account
     pub is_from_me: bool,
+}
+
+/// Reference to a specific message — used for reactions, replies, edits.
+#[derive(Debug, Clone)]
+pub struct MessageRef {
+    pub chat_jid: String,
+    pub message_id: String,
+    pub from_me: bool,
+    /// Sender JID — required for group chats when from_me is false.
+    pub sender_jid: Option<String>,
+}
+
+impl MessageRef {
+    /// Create from an inbound message.
+    pub fn from_inbound(msg: &WhatsAppInbound) -> Self {
+        Self {
+            chat_jid: msg.jid.clone(),
+            message_id: msg.id.clone(),
+            from_me: msg.is_from_me,
+            sender_jid: if msg.is_from_me {
+                None
+            } else {
+                Some(msg.sender_raw.clone())
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -653,22 +689,35 @@ impl WhatsAppBridge {
     }
 
     /// Send an emoji reaction to a message.
+    /// Send an emoji reaction to a message.
     pub async fn send_reaction(
         &self,
-        jid: &str,
+        chat_jid: &str,
         target_message_id: &str,
+        target_sender_jid: Option<&str>,
         emoji: &str,
         target_is_from_me: bool,
     ) -> Result<()> {
-        let target = parse_jid(jid)?;
+        let target = parse_jid(chat_jid)?;
         let client = get_client_handle(&self.client_handle).context("not connected")?;
+        // In group chats, participant must be set to the original sender's JID
+        let participant = if chat_jid.contains("@g.us") && !target_is_from_me {
+            match target_sender_jid {
+                Some(s) => Some(s.to_string()),
+                None => return Err(anyhow::anyhow!(
+                    "target_sender_jid is required for group reactions when target is not from_me"
+                )),
+            }
+        } else {
+            None
+        };
         let msg = wa::Message {
             reaction_message: Some(wa::message::ReactionMessage {
                 key: Some(wa::MessageKey {
                     remote_jid: Some(target.to_string()),
                     id: Some(target_message_id.to_string()),
                     from_me: Some(target_is_from_me),
-                    participant: None,
+                    participant,
                 }),
                 text: Some(emoji.to_string()),
                 sender_timestamp_ms: Some(chrono::Utc::now().timestamp_millis()),
@@ -681,6 +730,17 @@ impl WhatsAppBridge {
             .await
             .map_err(|e| anyhow::anyhow!("send reaction failed: {e}"))?;
         Ok(())
+    }
+
+    /// Remove an emoji reaction from a message.
+    pub async fn remove_reaction(
+        &self,
+        chat_jid: &str,
+        target_message_id: &str,
+        target_sender_jid: Option<&str>,
+        target_is_from_me: bool,
+    ) -> Result<()> {
+        self.send_reaction(chat_jid, target_message_id, target_sender_jid, "", target_is_from_me).await
     }
 
     /// Send a location pin to a chat.
@@ -1634,10 +1694,21 @@ async fn extract_content_inner(
     // --- Reaction ---
     if let Some(ref reaction) = msg.reaction_message {
         if let Some(ref key) = reaction.key {
-            return ExtractResult::Content(InboundContent::Reaction {
-                target_id: key.id.clone().unwrap_or_default(),
-                emoji: reaction.text.clone().unwrap_or_default(),
-            });
+            let target_id = key.id.clone().unwrap_or_default();
+            let emoji = reaction.text.clone().unwrap_or_default();
+            let target_sender = key.participant.clone();
+            if emoji.is_empty() {
+                return ExtractResult::Content(InboundContent::ReactionRemoved {
+                    target_id,
+                    target_sender,
+                });
+            } else {
+                return ExtractResult::Content(InboundContent::ReactionAdded {
+                    target_id,
+                    emoji,
+                    target_sender,
+                });
+            }
         }
     }
 
@@ -2100,5 +2171,67 @@ mod tests {
         // Empty list → no filter (pass all)
         let empty: Vec<String> = vec![];
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn test_message_ref_from_inbound() {
+        let msg = WhatsAppInbound {
+            bridge_id: "default".into(),
+            jid: "group@g.us".into(),
+            id: "msg123".into(),
+            content: InboundContent::Text { body: "hi".into() },
+            sender: "447957491755".into(),
+            sender_raw: "447957491755@s.whatsapp.net".into(),
+            timestamp: 1000,
+            reply_to: None,
+            is_from_me: false,
+        };
+        let mref = MessageRef::from_inbound(&msg);
+        assert_eq!(mref.chat_jid, "group@g.us");
+        assert_eq!(mref.message_id, "msg123");
+        assert!(!mref.from_me);
+        assert_eq!(
+            mref.sender_jid.as_deref(),
+            Some("447957491755@s.whatsapp.net")
+        );
+    }
+
+    #[test]
+    fn test_message_ref_from_me_has_no_sender() {
+        let msg = WhatsAppInbound {
+            bridge_id: "default".into(),
+            jid: "chat@s.whatsapp.net".into(),
+            id: "msg456".into(),
+            content: InboundContent::Text { body: "hi".into() },
+            sender: "myphone".into(),
+            sender_raw: "myphone@s.whatsapp.net".into(),
+            timestamp: 1000,
+            reply_to: None,
+            is_from_me: true,
+        };
+        let mref = MessageRef::from_inbound(&msg);
+        assert!(mref.from_me);
+        assert!(mref.sender_jid.is_none());
+    }
+
+    #[test]
+    fn test_reaction_added_display() {
+        let content = InboundContent::ReactionAdded {
+            target_id: "m1".into(),
+            emoji: "👍".into(),
+            target_sender: None,
+        };
+        assert_eq!(content.kind(), "reaction");
+        assert!(content.display_text().contains("👍"));
+    }
+
+    #[test]
+    fn test_reaction_removed_display() {
+        let content = InboundContent::ReactionRemoved {
+            target_id: "m1".into(),
+            target_sender: None,
+        };
+        assert_eq!(content.kind(), "reaction-removed");
+        assert!(content.display_text().contains("unreact"));
     }
 }

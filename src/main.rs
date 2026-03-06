@@ -122,7 +122,7 @@ async fn main() -> Result<()> {
         println!("  send <jid> <message>           — send text (prints msg ID)");
         println!("  reply <jid> <id> <sender> <msg>— reply quoting a message");
         println!("  edit <jid> <id> <new text>     — edit a sent message");
-        println!("  react <jid> <id> <emoji>       — react to a message");
+        println!("  react <jid> <id> <emoji> [from_me] [sender_jid] — react to a message");
         println!("  image <jid> <path>             — send an image file");
         println!("  audio <jid> <path>             — send audio as voice note");
         println!("  video <jid> <path>             — send a video file");
@@ -297,21 +297,22 @@ async fn main() -> Result<()> {
                             }
                         }
                         "react" => {
-                            // react <jid> <msg_id> <emoji> [from_me]
-                            // from_me defaults to true (reacting to own sent msgs)
-                            let react_parts: Vec<&str> = line.splitn(5, ' ').collect();
+                            // react <jid> <msg_id> <emoji> [from_me] [sender_jid]
+                            let react_parts: Vec<&str> = line.splitn(6, ' ').collect();
                             if react_parts.len() < 4 {
-                                println!("usage: react <jid> <msg_id> <emoji> [from_me=true]");
+                                println!("usage: react <jid> <msg_id> <emoji> [from_me=true] [sender_jid]");
                                 continue;
                             }
                             let from_me = react_parts
                                 .get(4)
                                 .map(|v| *v != "false" && *v != "0")
                                 .unwrap_or(true);
+                            let sender_jid = react_parts.get(5).copied();
                             match bridge_for_repl
                                 .send_reaction(
                                     react_parts[1],
                                     react_parts[2],
+                                    sender_jid,
                                     react_parts[3],
                                     from_me,
                                 )
