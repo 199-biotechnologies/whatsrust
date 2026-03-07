@@ -26,9 +26,11 @@ We built this because we needed WhatsApp inside agent software and got tired of 
 
 ## What it does
 
-**Every message type:** text, image, audio/voice, video, document, sticker, location, contact card, reaction (add + remove), edit, revoke, reply/quote.
+**Every message type:** text, image, audio/voice, video, document, sticker, location, contact card, reaction (add + remove), edit, revoke, reply/quote, forward, view-once (image/video), poll (create + encrypted vote decryption).
 
 **Full group management:** list groups, get group info, create, rename, set description, add/remove/promote/demote participants, invite links.
+
+**Presence:** subscribe to contact online/offline status, typing/recording indicators with `MessageFlags` (forwarded, view-once) on every inbound message.
 
 **Stays alive:**
 - Crash-safe outbound queue in SQLite. Messages survive restarts.
@@ -74,7 +76,7 @@ WHATSAPP_PAIR_PHONE="+1234567890" cargo run
 WHATSAPP_ALLOWED="1234567890" HEALTH_PORT=8080 cargo run
 ```
 
-The built-in REPL gives you every command: `send`, `reply`, `edit`, `react`, `image`, `audio`, `video`, `doc`, `sticker`, `location`, `contact`, `typing`, `stop-typing`, `groups`, `group-info`, `group-create`, `group-rename`, `group-desc`, `group-add`, `group-remove`, `group-promote`, `group-demote`, `group-invite`, `group-leave`, `status`, `quit`.
+The built-in REPL gives you every command: `send`, `reply`, `edit`, `react`, `image`, `audio`, `video`, `doc`, `sticker`, `location`, `contact`, `forward`/`fwd`, `vo-image`, `vo-video`, `poll`, `subscribe`, `typing`, `stop-typing`, `groups`, `group-info`, `group-create`, `group-rename`, `group-desc`, `group-add`, `group-remove`, `group-promote`, `group-demote`, `group-invite`, `group-leave`, `status`, `quit`.
 
 ---
 
@@ -180,11 +182,16 @@ bridge.send_message_with_id("1234567890", &reply).await?;
 | `promote_participants(group_jid, phones)` | Make members admin |
 | `demote_participants(group_jid, phones)` | Remove admin from members |
 | `get_group_invite_link(group_jid)` | Get group invite link |
+| `forward_message(dst_jid, msg_id)` | Forward a cached message |
+| `send_view_once_image(jid, data, mime, caption)` | Ephemeral image |
+| `send_view_once_video(jid, data, mime, caption)` | Ephemeral video |
+| `send_poll(jid, question, options, selectable_count)` | Create a poll |
+| `subscribe_presence(jid)` | Online/offline notifications |
 | `stop()` / `wait_stopped(timeout)` | Graceful shutdown |
 
 ### Inbound messages
 
-Every message hits your `mpsc` channel as a `WhatsAppInbound` with `sender`, `jid`, `id`, `reply_to`, `is_from_me`, and content:
+Every message hits your `mpsc` channel as a `WhatsAppInbound` with `sender`, `jid`, `id`, `reply_to`, `is_from_me`, `flags` (`MessageFlags` — `is_forwarded`, `forwarding_score`, `is_view_once`), and content:
 
 | Type | Fields |
 |------|--------|
@@ -200,6 +207,8 @@ Every message hits your `mpsc` channel as a `WhatsAppInbound` with `sender`, `ji
 | `ReactionRemoved` | `target_id`, `target_sender` |
 | `Edit` | `target_id`, `new_text` |
 | `Revoke` | `target_id` |
+| `PollCreated` | `question`, `options`, `selectable_count` |
+| `PollVote` | `poll_id`, `selected_options` (decrypted) |
 
 Media arrives as raw bytes. No second download step.
 

@@ -171,13 +171,23 @@ CREATE TABLE IF NOT EXISTS outbound_queue (
     updated_at INTEGER NOT NULL
 );
 
+-- Poll encryption keys (for decrypting incoming votes)
+CREATE TABLE IF NOT EXISTS poll_keys (
+    chat_jid TEXT NOT NULL,
+    poll_id TEXT NOT NULL,
+    enc_key BLOB NOT NULL,
+    options_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (chat_jid, poll_id)
+);
+
 -- Indexes for non-PK lookups
 CREATE INDEX IF NOT EXISTS idx_lid_pn_phone ON lid_pn_mapping(phone_number);
 CREATE INDEX IF NOT EXISTS idx_tc_tokens_ts ON tc_tokens(token_timestamp);
 CREATE INDEX IF NOT EXISTS idx_outbound_status ON outbound_queue(status, id);
 ";
 
-const CURRENT_SCHEMA_VERSION: i64 = 3;
+const CURRENT_SCHEMA_VERSION: i64 = 4;
 
 // ---------------------------------------------------------------------------
 // Store
@@ -506,6 +516,69 @@ impl Store {
 
         Ok(dest_path)
     }
+
+    // -----------------------------------------------------------------------
+    // Poll key storage
+    // -----------------------------------------------------------------------
+
+    /// Store a poll's encryption key and option names for later vote decryption.
+    pub async fn store_poll_key(
+        &self,
+        chat_jid: &str,
+        poll_id: &str,
+        enc_key: &[u8],
+        options: &[String],
+    ) -> Result<()> {
+        let chat_jid = chat_jid.to_string();
+        let poll_id = poll_id.to_string();
+        let enc_key = enc_key.to_vec();
+        let options_json = serde_json::to_string(options).map_err(|e| {
+            StoreError::Serialization(format!("poll options: {e}"))
+        })?;
+        self.run(move |c| {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            c.execute(
+                "INSERT OR REPLACE INTO poll_keys (chat_jid, poll_id, enc_key, options_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![chat_jid, poll_id, enc_key, options_json, now],
+            )
+            .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Retrieve a poll's encryption key and option names.
+    pub async fn get_poll_key(
+        &self,
+        chat_jid: &str,
+        poll_id: &str,
+    ) -> Result<Option<(Vec<u8>, Vec<String>)>> {
+        let chat_jid = chat_jid.to_string();
+        let poll_id = poll_id.to_string();
+        self.run(move |c| {
+            let result: Option<(Vec<u8>, String)> = c
+                .query_row(
+                    "SELECT enc_key, options_json FROM poll_keys WHERE chat_jid = ?1 AND poll_id = ?2",
+                    params![chat_jid, poll_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(db_err)?;
+            match result {
+                Some((enc_key, options_json)) => {
+                    let options: Vec<String> = serde_json::from_str(&options_json)
+                        .map_err(|e| StoreError::Serialization(format!("poll options: {e}")))?;
+                    Ok(Some((enc_key, options)))
+                }
+                None => Ok(None),
+            }
+        })
+        .await
+    }
 }
 
 fn run_schema_migrations(conn: &Connection, from_version: i64) -> Result<()> {
@@ -527,10 +600,23 @@ fn run_schema_migrations(conn: &Connection, from_version: i64) -> Result<()> {
 
     if from_version < 3 {
         // v2→v3: add retry_after column for per-message exponential backoff.
-        // Prevents head-of-line blocking: failing messages are skipped until their backoff expires.
         conn.execute_batch(
             "ALTER TABLE outbound_queue ADD COLUMN retry_after INTEGER NOT NULL DEFAULT 0;"
         ).ok(); // Ignore error if column already exists (fresh DB has it in schema)
+    }
+
+    if from_version < 4 {
+        // v3→v4: poll_keys table for decrypting incoming poll votes.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS poll_keys (
+                chat_jid TEXT NOT NULL,
+                poll_id TEXT NOT NULL,
+                enc_key BLOB NOT NULL,
+                options_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (chat_jid, poll_id)
+            );"
+        ).map_err(db_err)?;
     }
 
     if from_version < CURRENT_SCHEMA_VERSION {

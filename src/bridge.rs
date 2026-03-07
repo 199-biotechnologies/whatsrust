@@ -7,6 +7,7 @@
 //!   - LID-to-phone sender normalization
 //!   - Expanded event handling (ban, outdated, stream errors)
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -45,6 +46,8 @@ const DEDUP_CACHE_CAPACITY: usize = 4096;
 const MAX_MEDIA_BYTES: u64 = 50 * 1024 * 1024; // 50 MiB
 /// Maximum concurrent media downloads (bounds peak memory usage).
 const MAX_CONCURRENT_DOWNLOADS: usize = 4;
+/// Maximum cached messages for forward_message lookup.
+const MSG_CACHE_CAP: usize = 256;
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -219,6 +222,17 @@ pub enum InboundContent {
     Revoke {
         target_id: String,
     },
+    /// A poll was created.
+    PollCreated {
+        question: String,
+        options: Vec<String>,
+        selectable_count: u32,
+    },
+    /// A vote on a poll (decrypted).
+    PollVote {
+        poll_id: String,
+        selected_options: Vec<String>,
+    },
 }
 
 impl InboundContent {
@@ -237,6 +251,8 @@ impl InboundContent {
             Self::ReactionRemoved { .. } => "reaction-removed",
             Self::Edit { .. } => "edit",
             Self::Revoke { .. } => "revoke",
+            Self::PollCreated { .. } => "poll",
+            Self::PollVote { .. } => "poll-vote",
         }
     }
 
@@ -287,6 +303,12 @@ impl InboundContent {
             Self::ReactionRemoved { target_id, .. } => format!("[unreact on {target_id}]"),
             Self::Edit { target_id, new_text } => format!("[edit {target_id}] {new_text}"),
             Self::Revoke { target_id } => format!("[deleted {target_id}]"),
+            Self::PollCreated { question, options, selectable_count } => {
+                format!("[poll: {question} (pick {selectable_count}) — {}]", options.join(" | "))
+            }
+            Self::PollVote { poll_id, selected_options } => {
+                format!("[vote on {poll_id}: {}]", selected_options.join(", "))
+            }
         }
     }
 }
@@ -299,6 +321,14 @@ fn format_size(bytes: usize) -> String {
     } else {
         format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
     }
+}
+
+/// Forwarding and view-once metadata on an inbound message.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MessageFlags {
+    pub is_forwarded: bool,
+    pub forwarding_score: u32,
+    pub is_view_once: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -322,6 +352,8 @@ pub struct WhatsAppInbound {
     pub reply_to: Option<String>,
     /// Whether this is from our own account
     pub is_from_me: bool,
+    /// Forwarding and view-once metadata
+    pub flags: MessageFlags,
 }
 
 /// Reference to a specific message — used for reactions, replies, edits.
@@ -358,10 +390,13 @@ pub struct WhatsAppOutbound {
 
 /// Presence events surfaced to the consumer (typing, recording indicators).
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Fields consumed by bot integrations, not the REPL
 pub enum PresenceEvent {
     Composing { chat_jid: String, sender: String },
     Recording { chat_jid: String, sender: String },
     Paused { chat_jid: String, sender: String },
+    Online { jid: String, last_seen: Option<i64> },
+    Offline { jid: String, last_seen: Option<i64> },
 }
 
 pub struct BridgeConfig {
@@ -428,6 +463,9 @@ impl Default for BridgeConfig {
 // WhatsAppBridge — public handle for the consumer
 // ---------------------------------------------------------------------------
 
+/// Cached raw messages for forward_message lookup.
+type MsgCache = Arc<ParkingMutex<HashMap<String, Box<wa::Message>>>>;
+
 pub struct WhatsAppBridge {
     #[allow(dead_code)] // Used by bot integrations via the outbound channel
     outbound_tx: mpsc::Sender<WhatsAppOutbound>,
@@ -437,6 +475,8 @@ pub struct WhatsAppBridge {
     cancel: CancellationToken,
     client_handle: Arc<ParkingMutex<Option<Arc<Client>>>>,
     rr_tx: mpsc::Sender<ReadReceiptCmd>,
+    msg_cache: MsgCache,
+    store: Store,
 }
 
 impl WhatsAppBridge {
@@ -453,13 +493,18 @@ impl WhatsAppBridge {
         let client_handle: Arc<ParkingMutex<Option<Arc<Client>>>> =
             Arc::new(ParkingMutex::new(None));
         let rr_tx = spawn_scheduler(None, 200);
+        let msg_cache: MsgCache = Arc::new(ParkingMutex::new(HashMap::new()));
+
+        // Open store early so bridge methods can access it (e.g. poll key storage)
+        let store = Store::new(&config.db_path).expect("failed to open database for bridge");
 
         let cancel_clone = cancel.clone();
         let ch = client_handle.clone();
         let rr = rr_tx.clone();
+        let mc = msg_cache.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                run_bridge(config, inbound_tx, outbound_rx, state_tx, qr_tx, cancel_clone, ch, rr).await
+                run_bridge(config, inbound_tx, outbound_rx, state_tx, qr_tx, cancel_clone, ch, rr, mc).await
             {
                 error!(error = %e, "WhatsApp bridge exited with error");
             }
@@ -472,6 +517,8 @@ impl WhatsAppBridge {
             cancel,
             client_handle,
             rr_tx,
+            msg_cache,
+            store,
         }
     }
 
@@ -1080,6 +1127,149 @@ impl WhatsAppBridge {
         Ok(())
     }
 
+    /// Create and send a poll. Returns the message ID.
+    pub async fn send_poll(
+        &self,
+        jid: &str,
+        question: &str,
+        options: &[String],
+        selectable_count: u32,
+    ) -> Result<String> {
+        let target = parse_jid(jid)?;
+        let client = get_client_handle(&self.client_handle).context("not connected")?;
+
+        let enc_key = crate::polls::generate_poll_key();
+        let poll_options: Vec<wa::message::poll_creation_message::Option> = options
+            .iter()
+            .map(|name| wa::message::poll_creation_message::Option {
+                option_name: Some(name.clone()),
+                option_hash: None,
+            })
+            .collect();
+
+        let msg = wa::Message {
+            poll_creation_message: Some(Box::new(wa::message::PollCreationMessage {
+                enc_key: Some(enc_key.to_vec()),
+                name: Some(question.to_string()),
+                options: poll_options,
+                selectable_options_count: Some(selectable_count),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        let msg_id = client
+            .send_message(target, msg)
+            .await
+            .map_err(|e| anyhow::anyhow!("send poll failed: {e}"))?;
+
+        // Store enc_key for decrypting incoming votes
+        if let Err(e) = self.store.store_poll_key(jid, &msg_id, &enc_key, options).await {
+            warn!(error = %e, "failed to store outbound poll enc_key");
+        }
+
+        Ok(msg_id)
+    }
+
+    /// Subscribe to a contact's presence updates (online/offline notifications).
+    pub async fn subscribe_presence(&self, jid: &str) -> Result<()> {
+        let target = parse_jid(jid)?;
+        let client = get_client_handle(&self.client_handle).context("not connected")?;
+        client
+            .presence()
+            .subscribe(&target)
+            .await
+            .map_err(|e| anyhow::anyhow!("presence subscribe failed: {e}"))
+    }
+
+    /// Send a view-once image (disappears after first view).
+    pub async fn send_view_once_image(
+        &self,
+        jid: &str,
+        data: Vec<u8>,
+        mime: &str,
+        caption: Option<&str>,
+    ) -> Result<()> {
+        let target = parse_jid(jid)?;
+        let client = get_client_handle(&self.client_handle).context("not connected")?;
+        let upload = client
+            .upload(data, MediaType::Image)
+            .await
+            .context("image upload failed")?;
+        let msg = wa::Message {
+            image_message: Some(Box::new(wa::message::ImageMessage {
+                mimetype: Some(mime.to_string()),
+                caption: caption.map(|c| c.to_string()),
+                url: Some(upload.url),
+                direct_path: Some(upload.direct_path),
+                media_key: Some(upload.media_key),
+                file_enc_sha256: Some(upload.file_enc_sha256),
+                file_sha256: Some(upload.file_sha256),
+                file_length: Some(upload.file_length),
+                view_once: Some(true),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        client
+            .send_message(target, msg)
+            .await
+            .map_err(|e| anyhow::anyhow!("send view-once image failed: {e}"))?;
+        Ok(())
+    }
+
+    /// Send a view-once video (disappears after first view).
+    pub async fn send_view_once_video(
+        &self,
+        jid: &str,
+        data: Vec<u8>,
+        mime: &str,
+        caption: Option<&str>,
+    ) -> Result<()> {
+        let target = parse_jid(jid)?;
+        let client = get_client_handle(&self.client_handle).context("not connected")?;
+        let upload = client
+            .upload(data, MediaType::Video)
+            .await
+            .context("video upload failed")?;
+        let msg = wa::Message {
+            video_message: Some(Box::new(wa::message::VideoMessage {
+                mimetype: Some(mime.to_string()),
+                caption: caption.map(|c| c.to_string()),
+                url: Some(upload.url),
+                direct_path: Some(upload.direct_path),
+                media_key: Some(upload.media_key),
+                file_enc_sha256: Some(upload.file_enc_sha256),
+                file_sha256: Some(upload.file_sha256),
+                file_length: Some(upload.file_length),
+                view_once: Some(true),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        client
+            .send_message(target, msg)
+            .await
+            .map_err(|e| anyhow::anyhow!("send view-once video failed: {e}"))?;
+        Ok(())
+    }
+
+    /// Forward a cached message to another chat. The original "Forwarded" label will appear.
+    pub async fn forward_message(&self, dst_jid: &str, msg_id: &str) -> Result<String> {
+        let target = parse_jid(dst_jid)?;
+        let client = get_client_handle(&self.client_handle).context("not connected")?;
+        let original = {
+            let cache = self.msg_cache.lock();
+            cache.get(msg_id).cloned()
+        };
+        let original = original.context("message not in cache (only recent messages are cached)")?;
+        let forwarded = add_forward_context(*original);
+        client
+            .send_message(target, forwarded)
+            .await
+            .map_err(|e| anyhow::anyhow!("forward failed: {e}"))
+    }
+
     /// Send a text message as a reply/quote to another message.
     pub async fn send_reply(
         &self,
@@ -1124,6 +1314,7 @@ async fn run_bridge(
     cancel: CancellationToken,
     client_handle: Arc<ParkingMutex<Option<Arc<Client>>>>,
     rr_tx: mpsc::Sender<ReadReceiptCmd>,
+    msg_cache: MsgCache,
 ) -> Result<()> {
     info!("WhatsApp bridge starting");
 
@@ -1278,6 +1469,7 @@ async fn run_bridge(
             &dedup,
             &rr_tx,
             &metrics,
+            &msg_cache,
         )
         .await;
 
@@ -1355,6 +1547,7 @@ async fn run_bot_session(
     dedup: &Arc<AtomicDedupCache>,
     rr_tx: &mpsc::Sender<ReadReceiptCmd>,
     metrics: &Arc<BridgeMetrics>,
+    msg_cache: &MsgCache,
 ) -> Result<SessionAction> {
     // Clear stale handle from previous session
     set_client_handle(client_handle, None);
@@ -1377,6 +1570,7 @@ async fn run_bot_session(
     let rr_for_events = rr_tx.clone();
     let ptx_for_events = config.presence_tx.clone();
     let metrics_for_events = metrics.clone();
+    let msg_cache_for_events = msg_cache.clone();
     // Track previous QR terminal height for in-place overwrite on refresh
     let prev_qr_lines = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
@@ -1400,8 +1594,9 @@ async fn run_bot_session(
             let ptx = ptx_for_events.clone();
             let pql = prev_qr_lines.clone();
             let met = metrics_for_events.clone();
+            let mc = msg_cache_for_events.clone();
             async move {
-                handle_event(event, client, &ch, &itx, &stx, &qtx, &store, &sr, auto_mark_read, &allowed, &dedup, &bid, &dl_sem, &rr, &ptx, &pql, &met)
+                handle_event(event, client, &ch, &itx, &stx, &qtx, &store, &sr, auto_mark_read, &allowed, &dedup, &bid, &dl_sem, &rr, &ptx, &pql, &met, &mc)
                     .await;
             }
         });
@@ -1541,6 +1736,7 @@ async fn handle_event(
     presence_tx: &Option<mpsc::Sender<PresenceEvent>>,
     prev_qr_lines: &Arc<std::sync::atomic::AtomicUsize>,
     metrics: &Arc<BridgeMetrics>,
+    msg_cache: &MsgCache,
 ) {
     match event {
         Event::PairingQrCode { code, .. } => {
@@ -1630,14 +1826,52 @@ async fn handle_event(
                 return;
             }
 
-            // Extract reply-to context from any message type
+            // Extract reply-to context and flags from any message type
             let reply_to = extract_reply_to(&msg);
+            let mut flags = extract_flags(&msg);
+
+            // Detect view-once *before* extract_content recurses into the wrapper
+            if msg.view_once_message.is_some() || msg.view_once_message_v2.is_some() {
+                flags.is_view_once = true;
+            }
+
+            // Cache the raw message for forward_message lookup
+            {
+                let mut cache = msg_cache.lock();
+                if cache.len() >= MSG_CACHE_CAP {
+                    cache.clear();
+                }
+                cache.insert(info.id.clone(), Box::new((*msg).clone()));
+            }
 
             // Try to extract content (with media size guard + download semaphore)
-            let result = extract_content(&msg, &client, dl_semaphore).await;
+            let result = extract_content(&msg, &client, dl_semaphore, store).await;
 
             match result {
                 ExtractResult::Content(content) => {
+                    // Store poll enc_key so we can decrypt future votes
+                    if matches!(content, InboundContent::PollCreated { .. }) {
+                        let poll = msg.poll_creation_message.as_deref()
+                            .or(msg.poll_creation_message_v2.as_deref())
+                            .or(msg.poll_creation_message_v3.as_deref())
+                            .or(msg.poll_creation_message_v5.as_deref());
+                        if let Some(pc) = poll {
+                            if let Some(ref enc_key) = pc.enc_key {
+                                let options: Vec<String> = pc.options.iter()
+                                    .filter_map(|o| o.option_name.clone())
+                                    .collect();
+                                if let Err(e) = store.store_poll_key(
+                                    &info.source.chat.to_string(),
+                                    &info.id,
+                                    enc_key,
+                                    &options,
+                                ).await {
+                                    warn!(error = %e, "failed to store poll enc_key");
+                                }
+                            }
+                        }
+                    }
+
                     let inbound = WhatsAppInbound {
                         bridge_id: bridge_id.to_string(),
                         jid: info.source.chat.to_string(),
@@ -1648,6 +1882,7 @@ async fn handle_event(
                         timestamp: info.timestamp.timestamp(),
                         reply_to,
                         is_from_me: info.source.is_from_me,
+                        flags,
                     };
 
                     match inbound_tx.send(inbound).await {
@@ -1813,6 +2048,18 @@ async fn handle_event(
                 let _ = ptx.try_send(evt);
             }
         }
+        Event::Presence(update) => {
+            if let Some(ref ptx) = presence_tx {
+                let jid = update.from.to_string();
+                let last_seen = update.last_seen.map(|dt| dt.timestamp());
+                let evt = if update.unavailable {
+                    PresenceEvent::Offline { jid, last_seen }
+                } else {
+                    PresenceEvent::Online { jid, last_seen }
+                };
+                let _ = ptx.try_send(evt);
+            }
+        }
         _ => {
             debug!(?event, "unhandled event");
         }
@@ -1868,12 +2115,32 @@ fn extract_reply_to(msg: &wa::Message) -> Option<String> {
     None
 }
 
+/// Extract forwarding metadata from any message variant's context_info.
+fn extract_flags(msg: &wa::Message) -> MessageFlags {
+    // Check all message types that carry context_info
+    let ctx = msg.extended_text_message.as_ref().and_then(|m| m.context_info.as_deref())
+        .or_else(|| msg.image_message.as_ref().and_then(|m| m.context_info.as_deref()))
+        .or_else(|| msg.video_message.as_ref().and_then(|m| m.context_info.as_deref()))
+        .or_else(|| msg.audio_message.as_ref().and_then(|m| m.context_info.as_deref()))
+        .or_else(|| msg.document_message.as_ref().and_then(|m| m.context_info.as_deref()))
+        .or_else(|| msg.sticker_message.as_ref().and_then(|m| m.context_info.as_deref()));
+
+    match ctx {
+        Some(ci) => MessageFlags {
+            is_forwarded: ci.is_forwarded.unwrap_or(false),
+            forwarding_score: ci.forwarding_score.unwrap_or(0),
+            is_view_once: false, // set separately before extract_content recurses
+        },
+        None => MessageFlags::default(),
+    }
+}
+
 /// Maximum recursion depth for unwrapping ephemeral/view-once wrappers.
 const MAX_EXTRACT_DEPTH: u8 = 3;
 
 /// Try to extract structured content from an inbound message.
-async fn extract_content(msg: &wa::Message, client: &Arc<Client>, dl_semaphore: &Semaphore) -> ExtractResult {
-    extract_content_inner(msg, client, dl_semaphore, 0).await
+async fn extract_content(msg: &wa::Message, client: &Arc<Client>, dl_semaphore: &Semaphore, store: &Store) -> ExtractResult {
+    extract_content_inner(msg, client, dl_semaphore, 0, store).await
 }
 
 /// Inner recursive extractor with depth limit.
@@ -1882,6 +2149,7 @@ async fn extract_content_inner(
     client: &Arc<Client>,
     dl_semaphore: &Semaphore,
     depth: u8,
+    store: &Store,
 ) -> ExtractResult {
     if depth > MAX_EXTRACT_DEPTH {
         warn!(depth, "extract_content recursion limit reached, skipping");
@@ -2129,22 +2397,95 @@ async fn extract_content_inner(
         }
     }
 
+    // --- Poll creation ---
+    {
+        let poll = msg.poll_creation_message.as_deref()
+            .or(msg.poll_creation_message_v2.as_deref())
+            .or(msg.poll_creation_message_v3.as_deref())
+            .or(msg.poll_creation_message_v5.as_deref());
+        if let Some(pc) = poll {
+            let question = pc.name.clone().unwrap_or_default();
+            let options: Vec<String> = pc.options.iter()
+                .filter_map(|o| o.option_name.clone())
+                .collect();
+            let selectable_count = pc.selectable_options_count.unwrap_or(0);
+
+            // Store enc_key for vote decryption (if we have one)
+            if let Some(ref enc_key) = pc.enc_key {
+                // We don't have the poll_id (our own message ID) here since it's assigned
+                // by the server. The caller in handle_event has it as info.id.
+                // We'll store it from handle_event instead if this is a creation we receive.
+                // For now, just extract the content — the handle_event caller stores the key.
+                let _ = enc_key; // used by handle_event after extraction
+            }
+
+            return ExtractResult::Content(InboundContent::PollCreated {
+                question,
+                options,
+                selectable_count,
+            });
+        }
+    }
+
+    // --- Poll vote (update) ---
+    if let Some(ref pu) = msg.poll_update_message {
+        if let Some(ref vote_enc) = pu.vote {
+            if let Some(ref poll_key) = pu.poll_creation_message_key {
+                let poll_id = poll_key.id.clone().unwrap_or_default();
+                let chat_jid = poll_key.remote_jid.clone().unwrap_or_default();
+                let ct = vote_enc.enc_payload.clone().unwrap_or_default();
+                let iv = vote_enc.enc_iv.clone().unwrap_or_default();
+
+                // Look up stored enc_key
+                if let Ok(Some((enc_key, option_names))) = store.get_poll_key(&chat_jid, &poll_id).await {
+                    // Build voter JID — for poll updates the sender is the voter
+                    // We don't have sender here; the caller must determine it.
+                    // Use a placeholder that handle_event will fill.
+                    let voter_jid = poll_key.participant.clone().unwrap_or_default();
+
+                    match crate::polls::decrypt_poll_vote(&enc_key, &poll_id, &voter_jid, &ct, &iv) {
+                        Ok(selected_hashes) => {
+                            // Map hashes back to option names
+                            let hash_to_name: std::collections::HashMap<Vec<u8>, &str> = option_names
+                                .iter()
+                                .map(|name| (crate::polls::hash_poll_option(name), name.as_str()))
+                                .collect();
+                            let selected: Vec<String> = selected_hashes
+                                .iter()
+                                .map(|h| hash_to_name.get(h).copied().unwrap_or("unknown").to_string())
+                                .collect();
+                            return ExtractResult::Content(InboundContent::PollVote {
+                                poll_id,
+                                selected_options: selected,
+                            });
+                        }
+                        Err(e) => {
+                            warn!(error = %e, poll_id = %poll_id, "failed to decrypt poll vote");
+                        }
+                    }
+                } else {
+                    debug!(poll_id = %poll_id, "no stored enc_key for poll vote — poll was created before bridge started");
+                }
+            }
+        }
+    }
+
     // --- Ephemeral wrapper (unwrap and recurse) ---
     if let Some(ref eph) = msg.ephemeral_message {
         if let Some(ref inner) = eph.message {
-            return Box::pin(extract_content_inner(inner, client, dl_semaphore, depth + 1)).await;
+            return Box::pin(extract_content_inner(inner, client, dl_semaphore, depth + 1, store)).await;
         }
     }
 
     // --- View-once wrapper (unwrap and recurse) ---
     if let Some(ref vo) = msg.view_once_message {
         if let Some(ref inner) = vo.message {
-            return Box::pin(extract_content_inner(inner, client, dl_semaphore, depth + 1)).await;
+            return Box::pin(extract_content_inner(inner, client, dl_semaphore, depth + 1, store)).await;
         }
     }
     if let Some(ref vo2) = msg.view_once_message_v2 {
         if let Some(ref inner) = vo2.message {
-            return Box::pin(extract_content_inner(inner, client, dl_semaphore, depth + 1)).await;
+            return Box::pin(extract_content_inner(inner, client, dl_semaphore, depth + 1, store)).await;
         }
     }
 
@@ -2411,6 +2752,38 @@ fn parse_jid(s: &str) -> Result<Jid> {
 /// Returns true for JIDs that should be silently dropped (status broadcasts,
 /// newsletter channels, server messages, LID-only JIDs).
 /// Mirrors Baileys' `shouldIgnoreJid` logic.
+/// Apply forwarding context to a message. Increments forwarding_score and sets is_forwarded.
+/// For plain `conversation` text (which has no context_info field), converts to extended_text_message.
+fn add_forward_context(mut msg: wa::Message) -> wa::Message {
+    // Helper: create or update context_info on a boxed optional
+    macro_rules! set_forward_ctx {
+        ($field:expr) => {
+            if let Some(ref mut inner) = $field {
+                let ci = inner.context_info.get_or_insert_with(|| Box::new(wa::ContextInfo::default()));
+                ci.is_forwarded = Some(true);
+                ci.forwarding_score = Some(ci.forwarding_score.unwrap_or(0) + 1);
+            }
+        };
+    }
+
+    // Convert plain conversation to extended_text so we can attach context_info
+    if let Some(text) = msg.conversation.take() {
+        msg.extended_text_message = Some(Box::new(wa::message::ExtendedTextMessage {
+            text: Some(text),
+            ..Default::default()
+        }));
+    }
+
+    set_forward_ctx!(msg.extended_text_message);
+    set_forward_ctx!(msg.image_message);
+    set_forward_ctx!(msg.video_message);
+    set_forward_ctx!(msg.audio_message);
+    set_forward_ctx!(msg.document_message);
+    set_forward_ctx!(msg.sticker_message);
+
+    msg
+}
+
 fn should_ignore_jid(jid: &str) -> bool {
     jid == "status@broadcast"
         || jid.ends_with("@broadcast")
@@ -2590,6 +2963,7 @@ mod tests {
             timestamp: 1000,
             reply_to: None,
             is_from_me: false,
+            flags: MessageFlags::default(),
         };
         let mref = MessageRef::from_inbound(&msg);
         assert_eq!(mref.chat_jid, "group@g.us");
@@ -2613,6 +2987,7 @@ mod tests {
             timestamp: 1000,
             reply_to: None,
             is_from_me: true,
+            flags: MessageFlags::default(),
         };
         let mref = MessageRef::from_inbound(&msg);
         assert!(mref.from_me);

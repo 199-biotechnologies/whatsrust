@@ -7,6 +7,7 @@
 mod bridge;
 mod dedup;
 mod instance_lock;
+mod polls;
 pub mod qr;
 mod read_receipts;
 mod storage;
@@ -97,12 +98,23 @@ async fn main() -> Result<()> {
                 .as_deref()
                 .map(|id| format!(" (reply to {id})"))
                 .unwrap_or_default();
+            let flags_tag = {
+                let mut parts = Vec::new();
+                if msg.flags.is_forwarded {
+                    parts.push(format!("fwd:{}", msg.flags.forwarding_score));
+                }
+                if msg.flags.is_view_once {
+                    parts.push("view-once".to_string());
+                }
+                if parts.is_empty() { String::new() } else { format!(" [{}]", parts.join(",")) }
+            };
             println!(
-                "\n<< [{}] {} ({}){}: {}",
+                "\n<< [{}] {} ({}){}{}: {}",
                 msg.jid,
                 msg.sender,
                 msg.content.kind(),
                 reply_tag,
+                flags_tag,
                 msg.content.display_text()
             );
             if bridge_for_rx.is_connected() {
@@ -130,6 +142,11 @@ async fn main() -> Result<()> {
         println!("  sticker <jid> <path>           — send a WebP sticker");
         println!("  location <jid> <lat> <lon>     — send a location pin");
         println!("  contact <jid> <name> <phone>   — send a contact card");
+        println!("  forward <jid> <msg_id>         — forward a cached message (fwd)");
+        println!("  vo-image <jid> <path> [cap]    — send view-once image");
+        println!("  vo-video <jid> <path> [cap]    — send view-once video");
+        println!("  poll <jid> <N> <Q> | opt | ... — create a poll (N = selectable count)");
+        println!("  subscribe <jid>                — subscribe to contact presence");
         println!("  typing <jid>                   — show typing indicator");
         println!("  stop-typing <jid>              — cancel typing indicator");
         println!("  status                         — show bridge state");
@@ -339,6 +356,116 @@ async fn main() -> Result<()> {
                                     }
                                 }
                                 Err(e) => println!("!! cannot read file: {e}"),
+                            }
+                        }
+                        "vo-image" => {
+                            let vo_parts: Vec<&str> = line.splitn(4, ' ').collect();
+                            if vo_parts.len() < 3 {
+                                println!("usage: vo-image <jid> <path> [caption]");
+                                continue;
+                            }
+                            let path = std::path::Path::new(vo_parts[2]);
+                            match std::fs::read(path) {
+                                Ok(data) => {
+                                    let mime = match path.extension().and_then(|e| e.to_str()) {
+                                        Some("png") => "image/png",
+                                        Some("gif") => "image/gif",
+                                        Some("webp") => "image/webp",
+                                        _ => "image/jpeg",
+                                    };
+                                    let caption = vo_parts.get(3).copied();
+                                    match bridge_for_repl
+                                        .send_view_once_image(vo_parts[1], data, mime, caption)
+                                        .await
+                                    {
+                                        Ok(()) => println!(">> view-once image sent to {}", vo_parts[1]),
+                                        Err(e) => println!("!! vo-image failed: {e}"),
+                                    }
+                                }
+                                Err(e) => println!("!! cannot read file: {e}"),
+                            }
+                        }
+                        "vo-video" => {
+                            let vo_parts: Vec<&str> = line.splitn(4, ' ').collect();
+                            if vo_parts.len() < 3 {
+                                println!("usage: vo-video <jid> <path> [caption]");
+                                continue;
+                            }
+                            let path = std::path::Path::new(vo_parts[2]);
+                            match std::fs::read(path) {
+                                Ok(data) => {
+                                    let mime = match path.extension().and_then(|e| e.to_str()) {
+                                        Some("webm") => "video/webm",
+                                        Some("mov") => "video/quicktime",
+                                        Some("3gp") => "video/3gpp",
+                                        _ => "video/mp4",
+                                    };
+                                    let caption = vo_parts.get(3).copied();
+                                    match bridge_for_repl
+                                        .send_view_once_video(vo_parts[1], data, mime, caption)
+                                        .await
+                                    {
+                                        Ok(()) => println!(">> view-once video sent to {}", vo_parts[1]),
+                                        Err(e) => println!("!! vo-video failed: {e}"),
+                                    }
+                                }
+                                Err(e) => println!("!! cannot read file: {e}"),
+                            }
+                        }
+                        "poll" => {
+                            // poll <jid> <count> <question> | <opt1> | <opt2> ...
+                            let poll_parts: Vec<&str> = line.splitn(4, ' ').collect();
+                            if poll_parts.len() < 4 {
+                                println!("usage: poll <jid> <count> <question> | opt1 | opt2 ...");
+                                continue;
+                            }
+                            let jid = poll_parts[1];
+                            let count: u32 = match poll_parts[2].parse() {
+                                Ok(v) => v,
+                                Err(_) => {
+                                    println!("!! invalid selectable count");
+                                    continue;
+                                }
+                            };
+                            let rest = poll_parts[3];
+                            let segments: Vec<&str> = rest.split('|').collect();
+                            if segments.len() < 2 {
+                                println!("!! need at least a question and one option separated by |");
+                                continue;
+                            }
+                            let question = segments[0].trim();
+                            let options: Vec<String> = segments[1..]
+                                .iter()
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                                .collect();
+                            if options.is_empty() {
+                                println!("!! need at least one option");
+                                continue;
+                            }
+                            match bridge_for_repl.send_poll(jid, question, &options, count).await {
+                                Ok(id) => println!(">> poll sent to {} (id: {})", jid, id),
+                                Err(e) => println!("!! poll failed: {e}"),
+                            }
+                        }
+                        "subscribe" | "sub" => {
+                            if parts.len() < 2 {
+                                println!("usage: subscribe <jid>");
+                                continue;
+                            }
+                            match bridge_for_repl.subscribe_presence(parts[1]).await {
+                                Ok(()) => println!(">> subscribed to presence of {}", parts[1]),
+                                Err(e) => println!("!! subscribe failed: {e}"),
+                            }
+                        }
+                        "forward" | "fwd" => {
+                            if parts.len() < 3 {
+                                println!("usage: forward <jid> <msg_id>");
+                                continue;
+                            }
+                            match bridge_for_repl.forward_message(parts[1], parts[2]).await {
+                                Ok(id) => println!(">> forwarded to {} (id: {})", parts[1], id),
+                                Err(e) => println!("!! forward failed: {e}"),
                             }
                         }
                         "location" | "loc" => {
