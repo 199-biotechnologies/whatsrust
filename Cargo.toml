@@ -36,15 +36,16 @@ tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# whatsapp-rust — git-pinned to main (crates.io v0.2.0 requires nightly)
+# whatsapp-rust — 199-biotechnologies fork, rev-pinned
 # We skip the default sqlite-storage feature to avoid Diesel/libsqlite3-sys conflicts.
 # Our own rusqlite backend (src/storage.rs) replaces it.
-whatsapp-rust = { git = "https://github.com/jlucaso1/whatsapp-rust", default-features = false }
-wacore = { git = "https://github.com/jlucaso1/whatsapp-rust" }
-wacore-binary = { git = "https://github.com/jlucaso1/whatsapp-rust" }
-waproto = { git = "https://github.com/jlucaso1/whatsapp-rust" }
-whatsapp-rust-tokio-transport = { git = "https://github.com/jlucaso1/whatsapp-rust" }
-whatsapp-rust-ureq-http-client = { git = "https://github.com/jlucaso1/whatsapp-rust" }
+# For local dev, .cargo/config.toml patches these to ../whatsapp-rust path deps.
+whatsapp-rust = { git = "https://github.com/199-biotechnologies/whatsapp-rust", rev = "181d527196bdf8de6d2529b16b489293a48c4b41", default-features = false }
+wacore = { git = "https://github.com/199-biotechnologies/whatsapp-rust", rev = "181d527196bdf8de6d2529b16b489293a48c4b41" }
+wacore-binary = { git = "https://github.com/199-biotechnologies/whatsapp-rust", rev = "181d527196bdf8de6d2529b16b489293a48c4b41" }
+waproto = { git = "https://github.com/199-biotechnologies/whatsapp-rust", rev = "181d527196bdf8de6d2529b16b489293a48c4b41" }
+whatsapp-rust-tokio-transport = { git = "https://github.com/199-biotechnologies/whatsapp-rust", rev = "181d527196bdf8de6d2529b16b489293a48c4b41" }
+whatsapp-rust-ureq-http-client = { git = "https://github.com/199-biotechnologies/whatsapp-rust", rev = "181d527196bdf8de6d2529b16b489293a48c4b41" }
 
 [profile.release]
 opt-level = "z"

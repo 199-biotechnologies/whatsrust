@@ -2161,7 +2161,6 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "wacore"
 version = "0.2.0"
-source = "git+https://github.com/jlucaso1/whatsapp-rust#181d527196bdf8de6d2529b16b489293a48c4b41"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2201,7 +2200,6 @@ dependencies = [
 [[package]]
 name = "wacore-appstate"
 version = "0.2.0"
-source = "git+https://github.com/jlucaso1/whatsapp-rust#181d527196bdf8de6d2529b16b489293a48c4b41"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -2222,7 +2220,6 @@ dependencies = [
 [[package]]
 name = "wacore-binary"
 version = "0.2.0"
-source = "git+https://github.com/jlucaso1/whatsapp-rust#181d527196bdf8de6d2529b16b489293a48c4b41"
 dependencies = [
  "flate2",
  "phf",
@@ -2234,7 +2231,6 @@ dependencies = [
 [[package]]
 name = "wacore-derive"
 version = "0.2.0"
-source = "git+https://github.com/jlucaso1/whatsapp-rust#181d527196bdf8de6d2529b16b489293a48c4b41"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2244,7 +2240,6 @@ dependencies = [
 [[package]]
 name = "wacore-libsignal"
 version = "0.2.0"
-source = "git+https://github.com/jlucaso1/whatsapp-rust#181d527196bdf8de6d2529b16b489293a48c4b41"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2277,7 +2272,6 @@ dependencies = [
 [[package]]
 name = "wacore-noise"
 version = "0.2.0"
-source = "git+https://github.com/jlucaso1/whatsapp-rust#181d527196bdf8de6d2529b16b489293a48c4b41"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2297,7 +2291,6 @@ dependencies = [
 [[package]]
 name = "waproto"
 version = "0.2.0"
-source = "git+https://github.com/jlucaso1/whatsapp-rust#181d527196bdf8de6d2529b16b489293a48c4b41"
 dependencies = [
  "prost",
  "prost-build",
@@ -2419,7 +2412,6 @@ dependencies = [
 [[package]]
 name = "whatsapp-rust"
 version = "0.2.0"
-source = "git+https://github.com/jlucaso1/whatsapp-rust#181d527196bdf8de6d2529b16b489293a48c4b41"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -2448,7 +2440,6 @@ dependencies = [
 [[package]]
 name = "whatsapp-rust-tokio-transport"
 version = "0.2.0"
-source = "git+https://github.com/jlucaso1/whatsapp-rust#181d527196bdf8de6d2529b16b489293a48c4b41"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -2468,7 +2459,6 @@ dependencies = [
 [[package]]
 name = "whatsapp-rust-ureq-http-client"
 version = "0.2.0"
-source = "git+https://github.com/jlucaso1/whatsapp-rust#181d527196bdf8de6d2529b16b489293a48c4b41"
 dependencies = [
  "anyhow",
  "async-trait",

@@ -4,3 +4,4 @@
 *.db-wal
 .claude/
 .worktrees/
+.cargo/config.toml
