@@ -827,8 +827,8 @@ async fn cli_main(args: &[String]) -> Result<()> {
             Ok(())
         }
         "status" => {
-            let (_, body) = api::cli_get(port, "/api/status").await?;
-            print_json(&body);
+            let (status, body) = api::cli_get(port, "/api/status").await?;
+            print_json_result(status, &body)?;
             Ok(())
         }
         "qr" => {
@@ -839,115 +839,117 @@ async fn cli_main(args: &[String]) -> Result<()> {
                     std::fs::write(&args[2], &body)?;
                     println!("{}", json!({"ok": true, "path": args[2]}));
                 } else {
-                    print_json(&body);
+                    print_json_result(status, &body)?;
                     std::process::exit(1);
                 }
             } else {
-                let (_, body) = api::cli_get(port, "/api/qr?format=terminal").await?;
-                // Terminal format is plain text, print directly
+                let (status, body) = api::cli_get(port, "/api/qr?format=terminal").await?;
                 let text = String::from_utf8_lossy(&body);
                 print!("{text}");
+                if status >= 400 {
+                    std::process::exit(1);
+                }
             }
             Ok(())
         }
         "groups" => {
-            let (_, body) = api::cli_get(port, "/api/groups").await?;
-            print_json(&body);
+            let (status, body) = api::cli_get(port, "/api/groups").await?;
+            print_json_result(status, &body)?;
             Ok(())
         }
         "group-info" => {
             require_args(args, 2, "group-info <jid>")?;
-            let (_, body) = api::cli_get(port, &format!("/api/group-info?jid={}", args[1])).await?;
-            print_json(&body);
+            let (status, body) = api::cli_get(port, &format!("/api/group-info?jid={}", args[1])).await?;
+            print_json_result(status, &body)?;
             Ok(())
         }
         "send" => {
             require_args(args, 3, "send <jid> <text>")?;
             let text = args[2..].join(" ");
             let body = json!({"jid": args[1], "text": text}).to_string();
-            let (_, resp) = api::cli_post(port, "/api/send", &body).await?;
-            print_json(&resp);
+            let (status, resp) = api::cli_post(port, "/api/send", &body).await?;
+            print_json_result(status, &resp)?;
             Ok(())
         }
         "reply" => {
             require_args(args, 5, "reply <jid> <msg_id> <sender_jid> <text>")?;
             let text = args[4..].join(" ");
             let body = json!({"jid": args[1], "id": args[2], "sender": args[3], "text": text}).to_string();
-            let (_, resp) = api::cli_post(port, "/api/reply", &body).await?;
-            print_json(&resp);
+            let (status, resp) = api::cli_post(port, "/api/reply", &body).await?;
+            print_json_result(status, &resp)?;
             Ok(())
         }
         "edit" => {
             require_args(args, 4, "edit <jid> <msg_id> <new text>")?;
             let text = args[3..].join(" ");
             let body = json!({"jid": args[1], "id": args[2], "text": text}).to_string();
-            let (_, resp) = api::cli_post(port, "/api/edit", &body).await?;
-            print_json(&resp);
+            let (status, resp) = api::cli_post(port, "/api/edit", &body).await?;
+            print_json_result(status, &resp)?;
             Ok(())
         }
         "react" => {
             require_args(args, 4, "react <jid> <msg_id> <emoji>")?;
             let body = json!({"jid": args[1], "id": args[2], "emoji": args[3]}).to_string();
-            let (_, resp) = api::cli_post(port, "/api/react", &body).await?;
-            print_json(&resp);
+            let (status, resp) = api::cli_post(port, "/api/react", &body).await?;
+            print_json_result(status, &resp)?;
             Ok(())
         }
         "image" => {
             require_args(args, 3, "image <jid> <path> [caption]")?;
             let caption = if args.len() > 3 { Some(args[3..].join(" ")) } else { None };
             let body = json!({"jid": args[1], "path": args[2], "caption": caption}).to_string();
-            let (_, resp) = api::cli_post(port, "/api/image", &body).await?;
-            print_json(&resp);
+            let (status, resp) = api::cli_post(port, "/api/image", &body).await?;
+            print_json_result(status, &resp)?;
             Ok(())
         }
         "video" => {
             require_args(args, 3, "video <jid> <path> [caption]")?;
             let caption = if args.len() > 3 { Some(args[3..].join(" ")) } else { None };
             let body = json!({"jid": args[1], "path": args[2], "caption": caption}).to_string();
-            let (_, resp) = api::cli_post(port, "/api/video", &body).await?;
-            print_json(&resp);
+            let (status, resp) = api::cli_post(port, "/api/video", &body).await?;
+            print_json_result(status, &resp)?;
             Ok(())
         }
         "audio" => {
             require_args(args, 3, "audio <jid> <path>")?;
             let body = json!({"jid": args[1], "path": args[2]}).to_string();
-            let (_, resp) = api::cli_post(port, "/api/audio", &body).await?;
-            print_json(&resp);
+            let (status, resp) = api::cli_post(port, "/api/audio", &body).await?;
+            print_json_result(status, &resp)?;
             Ok(())
         }
         "doc" => {
             require_args(args, 3, "doc <jid> <path>")?;
             let body = json!({"jid": args[1], "path": args[2]}).to_string();
-            let (_, resp) = api::cli_post(port, "/api/doc", &body).await?;
-            print_json(&resp);
+            let (status, resp) = api::cli_post(port, "/api/doc", &body).await?;
+            print_json_result(status, &resp)?;
             Ok(())
         }
         "sticker" => {
             require_args(args, 3, "sticker <jid> <path>")?;
             let body = json!({"jid": args[1], "path": args[2]}).to_string();
-            let (_, resp) = api::cli_post(port, "/api/sticker", &body).await?;
-            print_json(&resp);
+            let (status, resp) = api::cli_post(port, "/api/sticker", &body).await?;
+            print_json_result(status, &resp)?;
             Ok(())
         }
         "location" => {
             require_args(args, 4, "location <jid> <lat> <lon>")?;
             let body = json!({"jid": args[1], "lat": args[2].parse::<f64>()?, "lon": args[3].parse::<f64>()?}).to_string();
-            let (_, resp) = api::cli_post(port, "/api/location", &body).await?;
-            print_json(&resp);
+            let (status, resp) = api::cli_post(port, "/api/location", &body).await?;
+            print_json_result(status, &resp)?;
             Ok(())
         }
         "contact" => {
             require_args(args, 4, "contact <jid> <name> <phone>")?;
             let body = json!({"jid": args[1], "name": args[2], "phone": args[3]}).to_string();
-            let (_, resp) = api::cli_post(port, "/api/contact", &body).await?;
-            print_json(&resp);
+            let (status, resp) = api::cli_post(port, "/api/contact", &body).await?;
+            print_json_result(status, &resp)?;
             Ok(())
         }
         "forward" => {
             require_args(args, 3, "forward <jid> <msg_id>")?;
             let body = json!({"jid": args[1], "msg_id": args[2]}).to_string();
-            let (_, resp) = api::cli_post(port, "/api/forward", &body).await?;
-            print_json(&resp);
+            let (status, resp) = api::cli_post(port, "/api/forward", &body).await?;
+            print_json_result(status, &resp)?;
             Ok(())
         }
         "poll" => {
@@ -970,8 +972,8 @@ async fn cli_main(args: &[String]) -> Result<()> {
                 }
             };
             let body = json!({"jid": args[1], "question": question, "options": options, "selectable_count": count}).to_string();
-            let (_, resp) = api::cli_post(port, "/api/poll", &body).await?;
-            print_json(&resp);
+            let (status, resp) = api::cli_post(port, "/api/poll", &body).await?;
+            print_json_result(status, &resp)?;
             Ok(())
         }
         _ => {
@@ -989,13 +991,21 @@ fn require_args(args: &[String], min: usize, usage: &str) -> Result<()> {
     Ok(())
 }
 
-fn print_json(body: &[u8]) {
-    // Try to pretty-print if valid JSON, otherwise print raw
+/// Print JSON response and return error if `ok` field is false.
+fn print_json_result(status: u16, body: &[u8]) -> Result<()> {
     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
         println!("{}", serde_json::to_string_pretty(&v).unwrap());
+        // Exit with error if server returned non-200 or ok=false
+        if status >= 400 || v.get("ok") == Some(&serde_json::Value::Bool(false)) {
+            std::process::exit(1);
+        }
     } else {
         println!("{}", String::from_utf8_lossy(body));
+        if status >= 400 {
+            std::process::exit(1);
+        }
     }
+    Ok(())
 }
 
 fn print_cli_help() {

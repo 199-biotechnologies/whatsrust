@@ -144,6 +144,12 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<HttpRequest>
         }
     }
 
+    // Reject oversized bodies (1 MiB limit — largest payload is a file path in JSON)
+    const MAX_BODY: usize = 1024 * 1024;
+    if content_length > MAX_BODY {
+        return None;
+    }
+
     // Read body
     let body_start = header_end + 4;
     let body = if content_length > 0 {
