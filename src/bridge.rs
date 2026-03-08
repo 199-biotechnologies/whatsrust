@@ -19,8 +19,6 @@ use crate::read_receipts::{ReadReceiptCmd, spawn_scheduler};
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex as ParkingMutex;
-use tokio::io::AsyncWriteExt;
-use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -69,18 +67,18 @@ enum SessionAction {
 
 /// Atomic counters for bridge health metrics — no locks, no DB reads.
 pub struct BridgeMetrics {
-    started_at: std::time::Instant,
-    messages_sent: AtomicU64,
-    messages_received: AtomicU64,
-    reconnect_count: AtomicU64,
-    last_connect_epoch: AtomicU64,
-    last_disconnect_epoch: AtomicU64,
-    last_inbound_epoch: AtomicU64,
-    last_outbound_epoch: AtomicU64,
+    pub started_at: std::time::Instant,
+    pub messages_sent: AtomicU64,
+    pub messages_received: AtomicU64,
+    pub reconnect_count: AtomicU64,
+    pub last_connect_epoch: AtomicU64,
+    pub last_disconnect_epoch: AtomicU64,
+    pub last_inbound_epoch: AtomicU64,
+    pub last_outbound_epoch: AtomicU64,
 }
 
 impl BridgeMetrics {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             started_at: std::time::Instant::now(),
             messages_sent: AtomicU64::new(0),
@@ -477,6 +475,7 @@ pub struct WhatsAppBridge {
     rr_tx: mpsc::Sender<ReadReceiptCmd>,
     msg_cache: MsgCache,
     store: Store,
+    metrics: Arc<BridgeMetrics>,
 }
 
 impl WhatsAppBridge {
@@ -497,14 +496,16 @@ impl WhatsAppBridge {
 
         // Open store early so bridge methods can access it (e.g. poll key storage)
         let store = Store::new(&config.db_path).expect("failed to open database for bridge");
+        let metrics = Arc::new(BridgeMetrics::new());
 
         let cancel_clone = cancel.clone();
         let ch = client_handle.clone();
         let rr = rr_tx.clone();
         let mc = msg_cache.clone();
+        let met = metrics.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                run_bridge(config, inbound_tx, outbound_rx, state_tx, qr_tx, cancel_clone, ch, rr, mc).await
+                run_bridge(config, inbound_tx, outbound_rx, state_tx, qr_tx, cancel_clone, ch, rr, mc, met).await
             {
                 error!(error = %e, "WhatsApp bridge exited with error");
             }
@@ -519,6 +520,7 @@ impl WhatsAppBridge {
             rr_tx,
             msg_cache,
             store,
+            metrics,
         }
     }
 
@@ -796,6 +798,19 @@ impl WhatsAppBridge {
     }
 
     /// Check if the bridge has an active WhatsApp connection.
+    pub fn metrics(&self) -> &BridgeMetrics {
+        &self.metrics
+    }
+
+    pub async fn queue_depth(&self) -> i64 {
+        self.store.outbound_queue_depth().await.unwrap_or(-1)
+    }
+
+    /// Get the current QR code data (None if already paired or not yet generated).
+    pub fn current_qr(&self) -> Option<String> {
+        self.qr_rx.borrow().clone()
+    }
+
     pub fn is_connected(&self) -> bool {
         self.state() == BridgeState::Connected && get_client_handle(&self.client_handle).is_some()
     }
@@ -1315,6 +1330,7 @@ async fn run_bridge(
     client_handle: Arc<ParkingMutex<Option<Arc<Client>>>>,
     rr_tx: mpsc::Sender<ReadReceiptCmd>,
     msg_cache: MsgCache,
+    metrics: Arc<BridgeMetrics>,
 ) -> Result<()> {
     info!("WhatsApp bridge starting");
 
@@ -1364,9 +1380,6 @@ async fn run_bridge(
     // Message dedup cache survives reconnections
     let dedup = Arc::new(AtomicDedupCache::new(config.dedup_capacity));
 
-    // Bridge-wide metrics (atomic, no locks)
-    let metrics = Arc::new(BridgeMetrics::new());
-
     // Secure the database file (Signal Protocol private keys)
     #[cfg(unix)]
     {
@@ -1378,17 +1391,7 @@ async fn run_bridge(
         }
     }
 
-    // Spawn health endpoint
-    if config.health_port > 0 {
-        let health_state_rx = state_tx.subscribe();
-        let health_store = store.clone();
-        let health_cancel = cancel.clone();
-        let health_metrics = metrics.clone();
-        tokio::spawn(async move {
-            spawn_health_server(config.health_port, health_state_rx, health_store, health_cancel, health_metrics).await;
-        });
-        info!(port = config.health_port, "health endpoint started");
-    }
+    // API server is spawned externally (main.rs) — replaces the old health-only endpoint
 
     // Spawn periodic backup task
     if let Some(ref backup_dir) = config.backup_dir {
@@ -2655,74 +2658,7 @@ async fn handle_outbound(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Health endpoint — raw TCP, no framework dependencies
-// ---------------------------------------------------------------------------
-
-async fn spawn_health_server(
-    port: u16,
-    state_rx: watch::Receiver<BridgeState>,
-    store: Store,
-    cancel: CancellationToken,
-    metrics: Arc<BridgeMetrics>,
-) {
-    let listener = match TcpListener::bind(("0.0.0.0", port)).await {
-        Ok(l) => l,
-        Err(e) => {
-            error!(error = %e, port = port, "failed to bind health endpoint");
-            return;
-        }
-    };
-
-    loop {
-        tokio::select! {
-            result = listener.accept() => {
-                let Ok((mut stream, _)) = result else { continue };
-
-                // Read the HTTP request before responding (prevents client hangs)
-                let mut buf = [0u8; 1024];
-                let _ = tokio::time::timeout(
-                    Duration::from_secs(2),
-                    tokio::io::AsyncReadExt::read(&mut stream, &mut buf),
-                ).await;
-
-                let state = *state_rx.borrow();
-                let connected = state == BridgeState::Connected;
-                let queue_depth = store.outbound_queue_depth().await.unwrap_or(-1);
-
-                let (status_line, status_str) = if connected {
-                    ("HTTP/1.1 200 OK", "ok")
-                } else {
-                    ("HTTP/1.1 503 Service Unavailable", "disconnected")
-                };
-
-                let body = format!(
-                    r#"{{"status":"{}","state":"{:?}","queue_depth":{},"uptime_secs":{},"messages_sent":{},"messages_received":{},"reconnect_count":{},"last_connect_epoch":{},"last_disconnect_epoch":{},"last_inbound_epoch":{},"last_outbound_epoch":{}}}"#,
-                    status_str,
-                    state,
-                    queue_depth,
-                    metrics.started_at.elapsed().as_secs(),
-                    metrics.messages_sent.load(Ordering::Relaxed),
-                    metrics.messages_received.load(Ordering::Relaxed),
-                    metrics.reconnect_count.load(Ordering::Relaxed),
-                    metrics.last_connect_epoch.load(Ordering::Relaxed),
-                    metrics.last_disconnect_epoch.load(Ordering::Relaxed),
-                    metrics.last_inbound_epoch.load(Ordering::Relaxed),
-                    metrics.last_outbound_epoch.load(Ordering::Relaxed),
-                );
-                let response = format!(
-                    "{}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
-                    status_line,
-                    body.len(),
-                    body
-                );
-
-                let _ = stream.write_all(response.as_bytes()).await;
-            }
-            _ = cancel.cancelled() => break,
-        }
-    }
-}
+// Health endpoint replaced by api::serve() — see src/api.rs
 
 // ---------------------------------------------------------------------------
 // Helpers

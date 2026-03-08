@@ -1,3 +1,4 @@
+pub mod api;
 pub mod bridge;
 pub mod dedup;
 pub mod instance_lock;

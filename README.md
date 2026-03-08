@@ -51,7 +51,9 @@ We built this because we needed WhatsApp inside agent software and got tired of 
 
 **Ships clean:**
 - QR + pair-code pairing with multi-format rendering (terminal, PNG, HTML, SVG)
-- Health endpoint over TCP with JSON: connection state, queue depth
+- REST API on localhost for tool integration (17 endpoints, JSON)
+- CLI mode: `whatsrust send`, `whatsrust image`, etc. — every command returns JSON
+- Claude Code skill for AI-driven WhatsApp messaging
 - Sender allowlist
 - Typing and recording indicators (inbound and outbound)
 - LID-to-phone sender resolution
@@ -72,11 +74,42 @@ Scan the QR with your phone. Done.
 # Phone number pairing instead of QR
 WHATSAPP_PAIR_PHONE="+1234567890" cargo run
 
-# With allowlist + health check
-WHATSAPP_ALLOWED="1234567890" HEALTH_PORT=8080 cargo run
+# With allowlist + custom port
+WHATSAPP_ALLOWED="1234567890" WHATSRUST_PORT=8080 cargo run
 ```
 
 The built-in REPL gives you every command: `send`, `reply`, `edit`, `react`, `image`, `audio`, `video`, `doc`, `sticker`, `location`, `contact`, `forward`/`fwd`, `vo-image`, `vo-video`, `poll`, `subscribe`, `typing`, `stop-typing`, `groups`, `group-info`, `group-create`, `group-rename`, `group-desc`, `group-add`, `group-remove`, `group-promote`, `group-demote`, `group-invite`, `group-leave`, `status`, `quit`.
+
+### CLI mode
+
+With the daemon running, use `whatsrust` as a one-shot CLI. Every command returns JSON to stdout:
+
+```bash
+# Check status
+whatsrust status
+
+# Get QR code (for pairing via agent/script)
+whatsrust qr --png /tmp/qr.png
+
+# Send messages
+whatsrust send 15551234567 "Hello from the CLI"
+whatsrust image 15551234567 /tmp/photo.jpg "Check this out"
+whatsrust video 15551234567 /tmp/clip.mp4
+whatsrust doc 15551234567 /tmp/report.pdf
+whatsrust react 15551234567 MSG_ID "👍"
+whatsrust poll 15551234567 1 "Lunch?" -- "Pizza" "Sushi" "Tacos"
+
+# Groups
+whatsrust groups
+whatsrust group-info 120363012345678901@g.us
+
+# All commands: whatsrust help
+```
+
+Output:
+```json
+{"ok": true, "id": "3EB0A1B2C3D4E5F6"}
+```
 
 ---
 
@@ -220,7 +253,9 @@ Media arrives as raw bytes. No second download step.
 |----------|---------|----------|
 | `WHATSAPP_PAIR_PHONE` | *(QR mode)* | Phone number for pair-code linking |
 | `WHATSAPP_ALLOWED` | *(everyone)* | Comma-separated sender allowlist |
-| `HEALTH_PORT` | `0` (off) | TCP port for health endpoint |
+| `WHATSRUST_PORT` | `7270` | API server port (0 = disabled) |
+| `WHATSRUST_BIND` | `127.0.0.1` | API bind address |
+| `HEALTH_PORT` | *(fallback)* | Legacy alias for `WHATSRUST_PORT` |
 | `BACKUP_DIR` | `whatsapp.db.backups` | SQLite backup directory |
 | `RUST_LOG` | `info` | Log level (`debug` for protocol) |
 
@@ -230,17 +265,19 @@ Media arrives as raw bytes. No second download step.
 
 ```
 src/
-  main.rs            REPL + signals + instance lock
-  bridge.rs          Events, messaging, queue, health, presence, groups
+  main.rs            Daemon mode (REPL) + CLI mode (one-shot commands)
+  api.rs             REST API server + CLI HTTP client
+  bridge.rs          Events, messaging, queue, presence, groups
   storage.rs         rusqlite Signal Protocol store
   dedup.rs           Atomic DashMap dedup (concurrent-safe)
   read_receipts.rs   Batched receipt scheduler with flush-before-reply
   qr.rs              QR rendering (terminal/PNG/HTML/SVG)
+  polls.rs           Poll crypto (HKDF-SHA256 + AES-256-GCM)
   instance_lock.rs   flock-based single-instance guard
   lib.rs             Library crate exports
 ```
 
-Eight files. Under 6000 lines. That's the whole thing.
+Ten files. Under 7000 lines. That's the whole thing.
 
 **Design decisions:**
 - `parking_lot::Mutex<Connection>` + `spawn_blocking` for SQLite. No async DB headaches.
@@ -268,7 +305,7 @@ Eight files. Under 6000 lines. That's the whole thing.
 | Message dedup | None | Atomic DashMap (concurrent-safe) |
 | Read receipts | Per-message, inline | Batched, coalesced, flush-before-reply |
 | Instance locking | No | flock-based |
-| Health endpoint | No | JSON over TCP |
+| REST API | No | 17 endpoints, CLI mode, JSON |
 | SQLite backups | No | Automatic |
 | Group management | Manual API calls | 12 methods, full CRUD |
 | Recording indicator | Manual | Built-in |

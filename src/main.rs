@@ -3,7 +3,12 @@
 //! Lean replacement for the Baileys (Node.js) sidecar.
 //! Uses whatsapp-rust (wa-rs) for the WhatsApp Web protocol
 //! and our own rusqlite backend for Signal Protocol storage.
+//!
+//! Two modes:
+//!   whatsrust              — daemon mode (bridge + REPL + API server)
+//!   whatsrust <command>    — CLI mode (sends HTTP to running daemon, prints JSON)
 
+mod api;
 mod bridge;
 mod dedup;
 mod instance_lock;
@@ -17,6 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use serde_json::json;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -24,8 +30,25 @@ use tracing::{error, info, warn};
 
 use bridge::{BridgeConfig, WhatsAppBridge};
 
+/// Read the API port from env, with fallback chain.
+fn get_port() -> u16 {
+    std::env::var("WHATSRUST_PORT")
+        .or_else(|_| std::env::var("HEALTH_PORT"))
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(7270)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+
+    // CLI mode: fire request to running daemon
+    if args.len() > 1 {
+        return cli_main(&args[1..]).await;
+    }
+
+    // Daemon mode
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -50,10 +73,7 @@ async fn main() -> Result<()> {
         info!(allowed = ?allowed, "sender allowlist active");
     }
 
-    let health_port: u16 = std::env::var("HEALTH_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    let api_port = get_port();
 
     let backup_dir = std::env::var("BACKUP_DIR")
         .ok()
@@ -64,7 +84,7 @@ async fn main() -> Result<()> {
         db_path: PathBuf::from("whatsapp.db"),
         pair_phone: std::env::var("WHATSAPP_PAIR_PHONE").ok(),
         allowed_numbers: allowed,
-        health_port,
+        health_port: api_port,
         backup_dir,
         ..Default::default()
     };
@@ -88,6 +108,15 @@ async fn main() -> Result<()> {
 
     info!("bridge started, state: {:?}", bridge.state());
     info!("waiting for WhatsApp connection (scan QR code or enter pair code)...");
+
+    // Spawn API server
+    if api_port > 0 {
+        let api_bridge = bridge.clone();
+        let api_cancel = cancel.clone();
+        tokio::spawn(async move {
+            api::serve(api_bridge, api_port, api_cancel).await;
+        });
+    }
 
     // Print inbound messages
     let bridge_for_rx = bridge.clone();
@@ -782,4 +811,224 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// CLI client mode
+// ---------------------------------------------------------------------------
+
+async fn cli_main(args: &[String]) -> Result<()> {
+    let port = get_port();
+    let cmd = args[0].as_str();
+
+    match cmd {
+        "help" | "--help" | "-h" => {
+            print_cli_help();
+            Ok(())
+        }
+        "status" => {
+            let (_, body) = api::cli_get(port, "/api/status").await?;
+            print_json(&body);
+            Ok(())
+        }
+        "qr" => {
+            // whatsrust qr [--png /path/to/file.png]
+            if args.len() >= 3 && args[1] == "--png" {
+                let (status, body) = api::cli_get(port, "/api/qr?format=png").await?;
+                if status == 200 {
+                    std::fs::write(&args[2], &body)?;
+                    println!("{}", json!({"ok": true, "path": args[2]}));
+                } else {
+                    print_json(&body);
+                    std::process::exit(1);
+                }
+            } else {
+                let (_, body) = api::cli_get(port, "/api/qr?format=terminal").await?;
+                // Terminal format is plain text, print directly
+                let text = String::from_utf8_lossy(&body);
+                print!("{text}");
+            }
+            Ok(())
+        }
+        "groups" => {
+            let (_, body) = api::cli_get(port, "/api/groups").await?;
+            print_json(&body);
+            Ok(())
+        }
+        "group-info" => {
+            require_args(args, 2, "group-info <jid>")?;
+            let (_, body) = api::cli_get(port, &format!("/api/group-info?jid={}", args[1])).await?;
+            print_json(&body);
+            Ok(())
+        }
+        "send" => {
+            require_args(args, 3, "send <jid> <text>")?;
+            let text = args[2..].join(" ");
+            let body = json!({"jid": args[1], "text": text}).to_string();
+            let (_, resp) = api::cli_post(port, "/api/send", &body).await?;
+            print_json(&resp);
+            Ok(())
+        }
+        "reply" => {
+            require_args(args, 5, "reply <jid> <msg_id> <sender_jid> <text>")?;
+            let text = args[4..].join(" ");
+            let body = json!({"jid": args[1], "id": args[2], "sender": args[3], "text": text}).to_string();
+            let (_, resp) = api::cli_post(port, "/api/reply", &body).await?;
+            print_json(&resp);
+            Ok(())
+        }
+        "edit" => {
+            require_args(args, 4, "edit <jid> <msg_id> <new text>")?;
+            let text = args[3..].join(" ");
+            let body = json!({"jid": args[1], "id": args[2], "text": text}).to_string();
+            let (_, resp) = api::cli_post(port, "/api/edit", &body).await?;
+            print_json(&resp);
+            Ok(())
+        }
+        "react" => {
+            require_args(args, 4, "react <jid> <msg_id> <emoji>")?;
+            let body = json!({"jid": args[1], "id": args[2], "emoji": args[3]}).to_string();
+            let (_, resp) = api::cli_post(port, "/api/react", &body).await?;
+            print_json(&resp);
+            Ok(())
+        }
+        "image" => {
+            require_args(args, 3, "image <jid> <path> [caption]")?;
+            let caption = if args.len() > 3 { Some(args[3..].join(" ")) } else { None };
+            let body = json!({"jid": args[1], "path": args[2], "caption": caption}).to_string();
+            let (_, resp) = api::cli_post(port, "/api/image", &body).await?;
+            print_json(&resp);
+            Ok(())
+        }
+        "video" => {
+            require_args(args, 3, "video <jid> <path> [caption]")?;
+            let caption = if args.len() > 3 { Some(args[3..].join(" ")) } else { None };
+            let body = json!({"jid": args[1], "path": args[2], "caption": caption}).to_string();
+            let (_, resp) = api::cli_post(port, "/api/video", &body).await?;
+            print_json(&resp);
+            Ok(())
+        }
+        "audio" => {
+            require_args(args, 3, "audio <jid> <path>")?;
+            let body = json!({"jid": args[1], "path": args[2]}).to_string();
+            let (_, resp) = api::cli_post(port, "/api/audio", &body).await?;
+            print_json(&resp);
+            Ok(())
+        }
+        "doc" => {
+            require_args(args, 3, "doc <jid> <path>")?;
+            let body = json!({"jid": args[1], "path": args[2]}).to_string();
+            let (_, resp) = api::cli_post(port, "/api/doc", &body).await?;
+            print_json(&resp);
+            Ok(())
+        }
+        "sticker" => {
+            require_args(args, 3, "sticker <jid> <path>")?;
+            let body = json!({"jid": args[1], "path": args[2]}).to_string();
+            let (_, resp) = api::cli_post(port, "/api/sticker", &body).await?;
+            print_json(&resp);
+            Ok(())
+        }
+        "location" => {
+            require_args(args, 4, "location <jid> <lat> <lon>")?;
+            let body = json!({"jid": args[1], "lat": args[2].parse::<f64>()?, "lon": args[3].parse::<f64>()?}).to_string();
+            let (_, resp) = api::cli_post(port, "/api/location", &body).await?;
+            print_json(&resp);
+            Ok(())
+        }
+        "contact" => {
+            require_args(args, 4, "contact <jid> <name> <phone>")?;
+            let body = json!({"jid": args[1], "name": args[2], "phone": args[3]}).to_string();
+            let (_, resp) = api::cli_post(port, "/api/contact", &body).await?;
+            print_json(&resp);
+            Ok(())
+        }
+        "forward" => {
+            require_args(args, 3, "forward <jid> <msg_id>")?;
+            let body = json!({"jid": args[1], "msg_id": args[2]}).to_string();
+            let (_, resp) = api::cli_post(port, "/api/forward", &body).await?;
+            print_json(&resp);
+            Ok(())
+        }
+        "poll" => {
+            // whatsrust poll <jid> <count> <question> -- <opt1> <opt2> ...
+            require_args(args, 4, "poll <jid> <count> <question> -- <opt1> <opt2> ...")?;
+            let count: u32 = args[2].parse().map_err(|_| anyhow::anyhow!("invalid selectable count"))?;
+            // Find -- separator
+            let sep = args.iter().position(|a| a == "--");
+            let (question, options) = match sep {
+                Some(idx) => {
+                    let q = args[3..idx].join(" ");
+                    let opts: Vec<String> = args[idx + 1..].iter().map(|s| s.to_string()).collect();
+                    (q, opts)
+                }
+                None => {
+                    // No separator: question is args[3], remaining are options
+                    let q = args[3].clone();
+                    let opts: Vec<String> = args[4..].iter().map(|s| s.to_string()).collect();
+                    (q, opts)
+                }
+            };
+            let body = json!({"jid": args[1], "question": question, "options": options, "selectable_count": count}).to_string();
+            let (_, resp) = api::cli_post(port, "/api/poll", &body).await?;
+            print_json(&resp);
+            Ok(())
+        }
+        _ => {
+            eprintln!("unknown command: {cmd}");
+            print_cli_help();
+            std::process::exit(1);
+        }
+    }
+}
+
+fn require_args(args: &[String], min: usize, usage: &str) -> Result<()> {
+    if args.len() < min {
+        anyhow::bail!("usage: whatsrust {usage}");
+    }
+    Ok(())
+}
+
+fn print_json(body: &[u8]) {
+    // Try to pretty-print if valid JSON, otherwise print raw
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
+        println!("{}", serde_json::to_string_pretty(&v).unwrap());
+    } else {
+        println!("{}", String::from_utf8_lossy(body));
+    }
+}
+
+fn print_cli_help() {
+    println!("whatsrust v{}", env!("CARGO_PKG_VERSION"));
+    println!();
+    println!("DAEMON MODE:");
+    println!("  whatsrust                              Start bridge with REPL + API server");
+    println!();
+    println!("CLI MODE (requires running daemon):");
+    println!("  whatsrust status                       Bridge state and metrics");
+    println!("  whatsrust qr                           Show QR code in terminal");
+    println!("  whatsrust qr --png <path>              Save QR as PNG file");
+    println!("  whatsrust groups                       List joined groups");
+    println!("  whatsrust group-info <jid>             Group details + members");
+    println!("  whatsrust send <jid> <text>            Send text message");
+    println!("  whatsrust reply <jid> <id> <sender> <text>  Reply to a message");
+    println!("  whatsrust edit <jid> <id> <text>       Edit a sent message");
+    println!("  whatsrust react <jid> <id> <emoji>     React to a message");
+    println!("  whatsrust image <jid> <path> [caption] Send image");
+    println!("  whatsrust video <jid> <path> [caption] Send video");
+    println!("  whatsrust audio <jid> <path>           Send voice note");
+    println!("  whatsrust doc <jid> <path>             Send document");
+    println!("  whatsrust sticker <jid> <path>         Send sticker");
+    println!("  whatsrust location <jid> <lat> <lon>   Send location pin");
+    println!("  whatsrust contact <jid> <name> <phone> Send contact card");
+    println!("  whatsrust forward <jid> <msg_id>       Forward a cached message");
+    println!("  whatsrust poll <jid> <N> <Q> -- <opts> Create poll (N=selectable)");
+    println!();
+    println!("ENVIRONMENT:");
+    println!("  WHATSRUST_PORT   API port (default: 7270, fallback: HEALTH_PORT)");
+    println!("  WHATSRUST_BIND   API bind address (default: 127.0.0.1)");
+    println!();
+    println!("JID FORMAT:");
+    println!("  Phone number: 15551234567 or 15551234567@s.whatsapp.net");
+    println!("  Group: 120363012345678901@g.us");
 }
