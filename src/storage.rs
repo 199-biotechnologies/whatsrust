@@ -189,6 +189,25 @@ CREATE INDEX IF NOT EXISTS idx_outbound_status ON outbound_queue(status, id);
 
 const CURRENT_SCHEMA_VERSION: i64 = 4;
 
+#[cfg(unix)]
+fn secure_backup_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let meta = std::fs::metadata(path)
+        .map_err(|e| StoreError::Database(format!("stat {}: {e}", path.display())))?;
+    let mut perms = meta.permissions();
+    let mode = if meta.is_dir() { 0o700 } else { 0o600 };
+    perms.set_mode(mode);
+    std::fs::set_permissions(path, perms)
+        .map_err(|e| StoreError::Database(format!("chmod {}: {e}", path.display())))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn secure_backup_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Store
 // ---------------------------------------------------------------------------
@@ -481,6 +500,7 @@ impl Store {
         // Ensure backup directory exists
         std::fs::create_dir_all(backup_dir)
             .map_err(|e| StoreError::Database(format!("create backup dir: {e}")))?;
+        secure_backup_permissions(backup_dir)?;
 
         // Generate timestamped filename
         let ts = SystemTime::now()
@@ -492,6 +512,7 @@ impl Store {
 
         // Perform the hot backup
         self.snapshot_db(&dest_path)?;
+        secure_backup_permissions(&dest_path)?;
 
         // Rotate: list backups, sort by name, delete oldest if over limit
         if let Ok(entries) = std::fs::read_dir(backup_dir) {
@@ -1596,5 +1617,54 @@ impl DeviceStore for Store {
             Ok(1)
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("whatsrust-{name}-{ts}"))
+    }
+
+    #[test]
+    fn test_perform_backup_creates_backup_file() {
+        let root = unique_test_dir("backup");
+        let db_path = root.join("whatsapp.db");
+        let backup_dir = root.join("backups");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let store = Store::new(&db_path).unwrap();
+        let backup_path = store.perform_backup(&backup_dir, 3).unwrap();
+
+        assert!(backup_path.exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_perform_backup_hardens_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = unique_test_dir("backup-perms");
+        let db_path = root.join("whatsapp.db");
+        let backup_dir = root.join("backups");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let store = Store::new(&db_path).unwrap();
+        let backup_path = store.perform_backup(&backup_dir, 3).unwrap();
+
+        let dir_mode = std::fs::metadata(&backup_dir).unwrap().permissions().mode() & 0o777;
+        let file_mode = std::fs::metadata(&backup_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -19,7 +19,7 @@ use crate::read_receipts::{ReadReceiptCmd, spawn_scheduler};
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex as ParkingMutex;
-use tokio::sync::{mpsc, watch, Semaphore};
+use tokio::sync::{mpsc, watch, Mutex as TokioMutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -118,6 +118,35 @@ impl BridgeMetrics {
 
     pub fn record_reconnect(&self) {
         self.reconnect_count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Shared pacing gate for all direct and queued outbound sends.
+struct SendPacer {
+    min_send_interval: Duration,
+    last_send: TokioMutex<tokio::time::Instant>,
+}
+
+impl SendPacer {
+    fn new(min_send_interval_ms: u64) -> Self {
+        Self {
+            min_send_interval: Duration::from_millis(min_send_interval_ms),
+            last_send: TokioMutex::new(tokio::time::Instant::now() - Duration::from_secs(60)),
+        }
+    }
+
+    async fn wait_turn(&self) {
+        let mut last_send = self.last_send.lock().await;
+        if !self.min_send_interval.is_zero() {
+            let jitter_base_ms = (self.min_send_interval.as_millis() as u64 / 4).max(1);
+            let actual_interval =
+                self.min_send_interval + Duration::from_millis(rand_jitter_ms(jitter_base_ms));
+            let elapsed = last_send.elapsed();
+            if elapsed < actual_interval {
+                tokio::time::sleep(actual_interval - elapsed).await;
+            }
+        }
+        *last_send = tokio::time::Instant::now();
     }
 }
 
@@ -476,6 +505,7 @@ pub struct WhatsAppBridge {
     msg_cache: MsgCache,
     store: Store,
     metrics: Arc<BridgeMetrics>,
+    send_pacer: Arc<SendPacer>,
 }
 
 impl WhatsAppBridge {
@@ -493,6 +523,7 @@ impl WhatsAppBridge {
             Arc::new(ParkingMutex::new(None));
         let rr_tx = spawn_scheduler(None, 200);
         let msg_cache: MsgCache = Arc::new(ParkingMutex::new(HashMap::new()));
+        let send_pacer = Arc::new(SendPacer::new(config.min_send_interval_ms));
 
         // Open store early so bridge methods can access it (e.g. poll key storage)
         let store = Store::new(&config.db_path).expect("failed to open database for bridge");
@@ -503,9 +534,10 @@ impl WhatsAppBridge {
         let rr = rr_tx.clone();
         let mc = msg_cache.clone();
         let met = metrics.clone();
+        let sp = send_pacer.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                run_bridge(config, inbound_tx, outbound_rx, state_tx, qr_tx, cancel_clone, ch, rr, mc, met).await
+                run_bridge(config, inbound_tx, outbound_rx, state_tx, qr_tx, cancel_clone, ch, rr, mc, met, sp).await
             {
                 error!(error = %e, "WhatsApp bridge exited with error");
             }
@@ -521,6 +553,7 @@ impl WhatsAppBridge {
             msg_cache,
             store,
             metrics,
+            send_pacer,
         }
     }
 
@@ -607,8 +640,8 @@ impl WhatsAppBridge {
         let client = get_client_handle(&self.client_handle).context("not connected")?;
         let participant_opts: Vec<GroupParticipantOptions> = participants
             .iter()
-            .map(|p| GroupParticipantOptions::new(parse_jid(p).expect("valid JID")))
-            .collect();
+            .map(|p| parse_jid(p).map(GroupParticipantOptions::new))
+            .collect::<Result<Vec<_>>>()?;
         let opts = GroupCreateOptions::new(name).with_participants(participant_opts);
         let result = client.groups().create_group(opts).await?;
         Ok(result.gid.to_string())
@@ -815,6 +848,22 @@ impl WhatsAppBridge {
         self.state() == BridgeState::Connected && get_client_handle(&self.client_handle).is_some()
     }
 
+    async fn send_direct_message(
+        &self,
+        target: Jid,
+        msg: wa::Message,
+        action: &'static str,
+    ) -> Result<String> {
+        let client = get_client_handle(&self.client_handle).context("not connected")?;
+        self.send_pacer.wait_turn().await;
+        let msg_id = client
+            .send_message(target, msg)
+            .await
+            .map_err(|e| anyhow::anyhow!("{action}: {e}"))?;
+        self.metrics.record_sent();
+        Ok(msg_id)
+    }
+
     /// Send an image file to a chat.
     pub async fn send_image(
         &self,
@@ -843,10 +892,7 @@ impl WhatsAppBridge {
             })),
             ..Default::default()
         };
-        client
-            .send_message(target, msg)
-            .await
-            .map_err(|e| anyhow::anyhow!("send image failed: {e}"))?;
+        self.send_direct_message(target, msg, "send image failed").await?;
         Ok(())
     }
 
@@ -859,6 +905,7 @@ impl WhatsAppBridge {
         seconds: Option<u32>,
     ) -> Result<()> {
         let target = parse_jid(jid)?;
+        let _ = self.start_recording(jid).await;
         let client = get_client_handle(&self.client_handle).context("not connected")?;
         let upload = client
             .upload(data, MediaType::Audio)
@@ -879,11 +926,9 @@ impl WhatsAppBridge {
             })),
             ..Default::default()
         };
-        client
-            .send_message(target, msg)
-            .await
-            .map_err(|e| anyhow::anyhow!("send audio failed: {e}"))?;
-        Ok(())
+        let result = self.send_direct_message(target, msg, "send audio failed").await;
+        let _ = self.stop_recording(jid).await;
+        result.map(|_| ())
     }
 
     /// Edit a previously sent message. Requires the message ID from send_message_with_id.
@@ -919,15 +964,11 @@ impl WhatsAppBridge {
     /// Send a text message and return the message ID (for editing/deleting).
     pub async fn send_message_with_id(&self, jid: &str, text: &str) -> Result<String> {
         let target = parse_jid(jid)?;
-        let client = get_client_handle(&self.client_handle).context("not connected")?;
         let msg = wa::Message {
             conversation: Some(text.to_string()),
             ..Default::default()
         };
-        client
-            .send_message(target, msg)
-            .await
-            .map_err(|e| anyhow::anyhow!("send failed: {e}"))
+        self.send_direct_message(target, msg, "send failed").await
     }
 
     /// Send a video file to a chat.
@@ -958,10 +999,7 @@ impl WhatsAppBridge {
             })),
             ..Default::default()
         };
-        client
-            .send_message(target, msg)
-            .await
-            .map_err(|e| anyhow::anyhow!("send video failed: {e}"))?;
+        self.send_direct_message(target, msg, "send video failed").await?;
         Ok(())
     }
 
@@ -993,10 +1031,7 @@ impl WhatsAppBridge {
             })),
             ..Default::default()
         };
-        client
-            .send_message(target, msg)
-            .await
-            .map_err(|e| anyhow::anyhow!("send document failed: {e}"))?;
+        self.send_direct_message(target, msg, "send document failed").await?;
         Ok(())
     }
 
@@ -1028,10 +1063,7 @@ impl WhatsAppBridge {
             })),
             ..Default::default()
         };
-        client
-            .send_message(target, msg)
-            .await
-            .map_err(|e| anyhow::anyhow!("send sticker failed: {e}"))?;
+        self.send_direct_message(target, msg, "send sticker failed").await?;
         Ok(())
     }
 
@@ -1046,7 +1078,6 @@ impl WhatsAppBridge {
         target_is_from_me: bool,
     ) -> Result<()> {
         let target = parse_jid(chat_jid)?;
-        let client = get_client_handle(&self.client_handle).context("not connected")?;
         // In group chats, participant must be set to the original sender's JID
         let participant = if chat_jid.contains("@g.us") && !target_is_from_me {
             match target_sender_jid {
@@ -1072,10 +1103,7 @@ impl WhatsAppBridge {
             }),
             ..Default::default()
         };
-        client
-            .send_message(target, msg)
-            .await
-            .map_err(|e| anyhow::anyhow!("send reaction failed: {e}"))?;
+        self.send_direct_message(target, msg, "send reaction failed").await?;
         Ok(())
     }
 
@@ -1100,7 +1128,6 @@ impl WhatsAppBridge {
         address: Option<&str>,
     ) -> Result<()> {
         let target = parse_jid(jid)?;
-        let client = get_client_handle(&self.client_handle).context("not connected")?;
         let msg = wa::Message {
             location_message: Some(Box::new(wa::message::LocationMessage {
                 degrees_latitude: Some(lat),
@@ -1111,10 +1138,7 @@ impl WhatsAppBridge {
             })),
             ..Default::default()
         };
-        client
-            .send_message(target, msg)
-            .await
-            .map_err(|e| anyhow::anyhow!("send location failed: {e}"))?;
+        self.send_direct_message(target, msg, "send location failed").await?;
         Ok(())
     }
 
@@ -1126,7 +1150,6 @@ impl WhatsAppBridge {
         vcard: &str,
     ) -> Result<()> {
         let target = parse_jid(jid)?;
-        let client = get_client_handle(&self.client_handle).context("not connected")?;
         let msg = wa::Message {
             contact_message: Some(Box::new(wa::message::ContactMessage {
                 display_name: Some(display_name.to_string()),
@@ -1135,10 +1158,7 @@ impl WhatsAppBridge {
             })),
             ..Default::default()
         };
-        client
-            .send_message(target, msg)
-            .await
-            .map_err(|e| anyhow::anyhow!("send contact failed: {e}"))?;
+        self.send_direct_message(target, msg, "send contact failed").await?;
         Ok(())
     }
 
@@ -1150,8 +1170,8 @@ impl WhatsAppBridge {
         options: &[String],
         selectable_count: u32,
     ) -> Result<String> {
+        let (question, options) = normalize_poll_spec(question, options, selectable_count)?;
         let target = parse_jid(jid)?;
-        let client = get_client_handle(&self.client_handle).context("not connected")?;
 
         let enc_key = crate::polls::generate_poll_key();
         let poll_options: Vec<wa::message::poll_creation_message::Option> = options
@@ -1165,7 +1185,7 @@ impl WhatsAppBridge {
         let msg = wa::Message {
             poll_creation_message: Some(Box::new(wa::message::PollCreationMessage {
                 enc_key: Some(enc_key.to_vec()),
-                name: Some(question.to_string()),
+                name: Some(question.clone()),
                 options: poll_options,
                 selectable_options_count: Some(selectable_count),
                 ..Default::default()
@@ -1173,13 +1193,10 @@ impl WhatsAppBridge {
             ..Default::default()
         };
 
-        let msg_id = client
-            .send_message(target, msg)
-            .await
-            .map_err(|e| anyhow::anyhow!("send poll failed: {e}"))?;
+        let msg_id = self.send_direct_message(target, msg, "send poll failed").await?;
 
         // Store enc_key for decrypting incoming votes
-        if let Err(e) = self.store.store_poll_key(jid, &msg_id, &enc_key, options).await {
+        if let Err(e) = self.store.store_poll_key(jid, &msg_id, &enc_key, &options).await {
             warn!(error = %e, "failed to store outbound poll enc_key");
         }
 
@@ -1226,10 +1243,7 @@ impl WhatsAppBridge {
             })),
             ..Default::default()
         };
-        client
-            .send_message(target, msg)
-            .await
-            .map_err(|e| anyhow::anyhow!("send view-once image failed: {e}"))?;
+        self.send_direct_message(target, msg, "send view-once image failed").await?;
         Ok(())
     }
 
@@ -1262,27 +1276,20 @@ impl WhatsAppBridge {
             })),
             ..Default::default()
         };
-        client
-            .send_message(target, msg)
-            .await
-            .map_err(|e| anyhow::anyhow!("send view-once video failed: {e}"))?;
+        self.send_direct_message(target, msg, "send view-once video failed").await?;
         Ok(())
     }
 
     /// Forward a cached message to another chat. The original "Forwarded" label will appear.
     pub async fn forward_message(&self, dst_jid: &str, msg_id: &str) -> Result<String> {
         let target = parse_jid(dst_jid)?;
-        let client = get_client_handle(&self.client_handle).context("not connected")?;
         let original = {
             let cache = self.msg_cache.lock();
             cache.get(msg_id).cloned()
         };
         let original = original.context("message not in cache (only recent messages are cached)")?;
         let forwarded = add_forward_context(*original);
-        client
-            .send_message(target, forwarded)
-            .await
-            .map_err(|e| anyhow::anyhow!("forward failed: {e}"))
+        self.send_direct_message(target, forwarded, "forward failed").await
     }
 
     /// Send a text message as a reply/quote to another message.
@@ -1294,7 +1301,9 @@ impl WhatsAppBridge {
         text: &str,
     ) -> Result<String> {
         let target = parse_jid(jid)?;
-        let client = get_client_handle(&self.client_handle).context("not connected")?;
+        if let Err(e) = self.flush_read_receipts(&target.to_string()).await {
+            warn!(error = %e, chat = %target, "failed to queue read-receipt flush before reply");
+        }
         let context_info = wa::ContextInfo {
             stanza_id: Some(reply_to_id.to_string()),
             participant: Some(reply_to_sender.to_string()),
@@ -1308,10 +1317,7 @@ impl WhatsAppBridge {
             })),
             ..Default::default()
         };
-        client
-            .send_message(target, msg)
-            .await
-            .map_err(|e| anyhow::anyhow!("send reply failed: {e}"))
+        self.send_direct_message(target, msg, "send reply failed").await
     }
 }
 
@@ -1331,6 +1337,7 @@ async fn run_bridge(
     rr_tx: mpsc::Sender<ReadReceiptCmd>,
     msg_cache: MsgCache,
     metrics: Arc<BridgeMetrics>,
+    send_pacer: Arc<SendPacer>,
 ) -> Result<()> {
     info!("WhatsApp bridge starting");
 
@@ -1473,6 +1480,7 @@ async fn run_bridge(
             &rr_tx,
             &metrics,
             &msg_cache,
+            &send_pacer,
         )
         .await;
 
@@ -1551,6 +1559,7 @@ async fn run_bot_session(
     rr_tx: &mpsc::Sender<ReadReceiptCmd>,
     metrics: &Arc<BridgeMetrics>,
     msg_cache: &MsgCache,
+    send_pacer: &Arc<SendPacer>,
 ) -> Result<SessionAction> {
     // Clear stale handle from previous session
     set_client_handle(client_handle, None);
@@ -1647,7 +1656,7 @@ async fn run_bot_session(
                 }
             }
         }
-        _ = handle_outbound(outbound_rx, &client_handle, cancel, config.min_send_interval_ms, store, config.max_outbound_retries, metrics) => {
+        _ = handle_outbound(outbound_rx, &client_handle, cancel, store, config.max_outbound_retries, metrics, send_pacer) => {
             if cancel.is_cancelled() || stop_reconnect.load(Ordering::Relaxed) {
                 Ok(SessionAction::Stop)
             } else {
@@ -1848,7 +1857,7 @@ async fn handle_event(
             }
 
             // Try to extract content (with media size guard + download semaphore)
-            let result = extract_content(&msg, &client, dl_semaphore, store).await;
+            let result = extract_content(&msg, &client, dl_semaphore, store, Some(&sender_raw)).await;
 
             match result {
                 ExtractResult::Content(content) => {
@@ -2142,8 +2151,14 @@ fn extract_flags(msg: &wa::Message) -> MessageFlags {
 const MAX_EXTRACT_DEPTH: u8 = 3;
 
 /// Try to extract structured content from an inbound message.
-async fn extract_content(msg: &wa::Message, client: &Arc<Client>, dl_semaphore: &Semaphore, store: &Store) -> ExtractResult {
-    extract_content_inner(msg, client, dl_semaphore, 0, store).await
+async fn extract_content(
+    msg: &wa::Message,
+    client: &Arc<Client>,
+    dl_semaphore: &Semaphore,
+    store: &Store,
+    sender_jid: Option<&str>,
+) -> ExtractResult {
+    extract_content_inner(msg, client, dl_semaphore, 0, store, sender_jid).await
 }
 
 /// Inner recursive extractor with depth limit.
@@ -2153,6 +2168,7 @@ async fn extract_content_inner(
     dl_semaphore: &Semaphore,
     depth: u8,
     store: &Store,
+    sender_jid: Option<&str>,
 ) -> ExtractResult {
     if depth > MAX_EXTRACT_DEPTH {
         warn!(depth, "extract_content recursion limit reached, skipping");
@@ -2193,14 +2209,14 @@ async fn extract_content_inner(
     }
 
     // --- Video (includes PTV/video notes) ---
-    if let Some(ref vid) = msg.video_message {
+    if let Some(vid) = msg.video_message.as_deref().or(msg.ptv_message.as_deref()) {
         if let Some(len) = vid.file_length {
             if len > MAX_MEDIA_BYTES { warn!(size = len, "video exceeds size limit, skipping"); return ExtractResult::Unhandled; }
         }
         let caption = vid.caption.clone();
         let mime = vid.mimetype.clone().unwrap_or_else(|| "video/mp4".to_string());
         let _permit = dl_semaphore.acquire().await.expect("semaphore closed");
-        match client.download(vid.as_ref() as &dyn Downloadable).await {
+        match client.download(vid as &dyn Downloadable).await {
             Ok(data) => {
                 if data.len() as u64 > MAX_MEDIA_BYTES { warn!(size = data.len(), "downloaded video exceeds size limit"); return ExtractResult::Unhandled; }
                 return ExtractResult::Content(InboundContent::Video { data, mime, caption });
@@ -2441,10 +2457,7 @@ async fn extract_content_inner(
 
                 // Look up stored enc_key
                 if let Ok(Some((enc_key, option_names))) = store.get_poll_key(&chat_jid, &poll_id).await {
-                    // Build voter JID — for poll updates the sender is the voter
-                    // We don't have sender here; the caller must determine it.
-                    // Use a placeholder that handle_event will fill.
-                    let voter_jid = poll_key.participant.clone().unwrap_or_default();
+                    let voter_jid = select_poll_voter_jid(sender_jid, poll_key.participant.as_deref());
 
                     match crate::polls::decrypt_poll_vote(&enc_key, &poll_id, &voter_jid, &ct, &iv) {
                         Ok(selected_hashes) => {
@@ -2476,19 +2489,24 @@ async fn extract_content_inner(
     // --- Ephemeral wrapper (unwrap and recurse) ---
     if let Some(ref eph) = msg.ephemeral_message {
         if let Some(ref inner) = eph.message {
-            return Box::pin(extract_content_inner(inner, client, dl_semaphore, depth + 1, store)).await;
+            return Box::pin(extract_content_inner(inner, client, dl_semaphore, depth + 1, store, sender_jid)).await;
         }
     }
 
     // --- View-once wrapper (unwrap and recurse) ---
     if let Some(ref vo) = msg.view_once_message {
         if let Some(ref inner) = vo.message {
-            return Box::pin(extract_content_inner(inner, client, dl_semaphore, depth + 1, store)).await;
+            return Box::pin(extract_content_inner(inner, client, dl_semaphore, depth + 1, store, sender_jid)).await;
         }
     }
     if let Some(ref vo2) = msg.view_once_message_v2 {
         if let Some(ref inner) = vo2.message {
-            return Box::pin(extract_content_inner(inner, client, dl_semaphore, depth + 1, store)).await;
+            return Box::pin(extract_content_inner(inner, client, dl_semaphore, depth + 1, store, sender_jid)).await;
+        }
+    }
+    if let Some(ref vo2_ext) = msg.view_once_message_v2_extension {
+        if let Some(ref inner) = vo2_ext.message {
+            return Box::pin(extract_content_inner(inner, client, dl_semaphore, depth + 1, store, sender_jid)).await;
         }
     }
 
@@ -2526,13 +2544,12 @@ async fn handle_outbound(
     outbound_rx: &mut mpsc::Receiver<WhatsAppOutbound>,
     client_handle: &Arc<ParkingMutex<Option<Arc<Client>>>>,
     cancel: &CancellationToken,
-    min_send_interval_ms: u64,
     store: &Store,
     max_retries: i32,
     metrics: &Arc<BridgeMetrics>,
+    send_pacer: &Arc<SendPacer>,
 ) {
     let mut outbound_closed = false;
-    let mut last_send = tokio::time::Instant::now() - Duration::from_secs(60);
 
     loop {
         if cancel.is_cancelled() {
@@ -2608,15 +2625,8 @@ async fn handle_outbound(
             }
         };
 
-        // Anti-ban pacing: enforce minimum interval + random jitter between sends
-        let jitter_ms = (min_send_interval_ms / 4).max(1);
-        let actual_interval = Duration::from_millis(
-            min_send_interval_ms + (row.id as u64 ^ last_send.elapsed().as_millis() as u64) % jitter_ms,
-        );
-        let elapsed = last_send.elapsed();
-        if elapsed < actual_interval {
-            tokio::time::sleep(actual_interval - elapsed).await;
-        }
+        // Serialize queued sends with the same pacing gate used by direct sends.
+        send_pacer.wait_turn().await;
 
         let msg = wa::Message {
             conversation: Some(row.payload.clone()),
@@ -2625,7 +2635,6 @@ async fn handle_outbound(
 
         match client.send_message(jid, msg).await {
             Ok(_msg_id) => {
-                last_send = tokio::time::Instant::now();
                 metrics.record_sent();
                 let _ = store.mark_outbound_sent(row.id).await;
             }
@@ -2683,6 +2692,42 @@ fn parse_jid(s: &str) -> Result<Jid> {
         Jid::from_str(&format!("{normalized}@{server}"))
             .map_err(|e| anyhow::anyhow!("bad JID from phone: {e}"))
     }
+}
+
+pub(crate) fn normalize_poll_spec(
+    question: &str,
+    options: &[String],
+    selectable_count: u32,
+) -> Result<(String, Vec<String>)> {
+    let question = question.trim().to_string();
+    if question.is_empty() {
+        anyhow::bail!("poll question must not be empty");
+    }
+
+    let options: Vec<String> = options
+        .iter()
+        .map(|o| o.trim().to_string())
+        .filter(|o| !o.is_empty())
+        .collect();
+    if options.len() < 2 {
+        anyhow::bail!("poll must include at least 2 non-empty options");
+    }
+    if selectable_count == 0 || selectable_count as usize > options.len() {
+        anyhow::bail!(
+            "selectable_count must be between 1 and {}",
+            options.len()
+        );
+    }
+
+    Ok((question, options))
+}
+
+fn select_poll_voter_jid(sender_jid: Option<&str>, poll_participant: Option<&str>) -> String {
+    sender_jid
+        .filter(|s| !s.is_empty())
+        .or_else(|| poll_participant.filter(|s| !s.is_empty()))
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// Returns true for JIDs that should be silently dropped (status broadcasts,
@@ -2856,6 +2901,46 @@ mod tests {
     #[test]
     fn test_parse_jid_empty_rejects() {
         assert!(parse_jid("+++").is_err());
+    }
+
+    #[test]
+    fn test_normalize_poll_spec_rejects_empty_question() {
+        let err = normalize_poll_spec("   ", &["Yes".into(), "No".into()], 1).unwrap_err();
+        assert!(err.to_string().contains("question"));
+    }
+
+    #[test]
+    fn test_normalize_poll_spec_rejects_too_few_options() {
+        let err = normalize_poll_spec("Lunch?", &["Pizza".into()], 1).unwrap_err();
+        assert!(err.to_string().contains("at least 2"));
+    }
+
+    #[test]
+    fn test_normalize_poll_spec_rejects_bad_selectable_count() {
+        let err =
+            normalize_poll_spec("Lunch?", &["Pizza".into(), "Tacos".into()], 3).unwrap_err();
+        assert!(err.to_string().contains("selectable_count"));
+    }
+
+    #[test]
+    fn test_normalize_poll_spec_trims_and_filters_options() {
+        let (question, options) = normalize_poll_spec(
+            " Lunch? ",
+            &[" Pizza ".into(), "".into(), " Tacos ".into()],
+            1,
+        )
+        .unwrap();
+        assert_eq!(question, "Lunch?");
+        assert_eq!(options, vec!["Pizza", "Tacos"]);
+    }
+
+    #[test]
+    fn test_select_poll_voter_jid_prefers_event_sender() {
+        let voter = select_poll_voter_jid(
+            Some("5511999999999@s.whatsapp.net"),
+            Some("fallback@s.whatsapp.net"),
+        );
+        assert_eq!(voter, "5511999999999@s.whatsapp.net");
     }
 
     #[test]

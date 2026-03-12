@@ -5,3 +5,5 @@
 .claude/
 .worktrees/
 .cargo/config.toml
+.DS_Store
+review-pack/

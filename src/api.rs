@@ -3,6 +3,7 @@
 //! Replaces the old health-only TCP server with a full API.
 //! All endpoints return JSON. Media endpoints accept local file paths.
 
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -83,6 +84,33 @@ fn json_err(status: u16, msg: &str) -> Vec<u8> {
 
 fn parse_body<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Vec<u8>> {
     serde_json::from_slice(body).map_err(|e| json_err(400, &format!("invalid JSON: {e}")))
+}
+
+fn bool_env_var(name: &str) -> bool {
+    matches!(
+        std::env::var(name).ok().as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES")
+    )
+}
+
+fn api_bind_host() -> String {
+    std::env::var("WHATSRUST_BIND").unwrap_or_else(|_| "127.0.0.1".to_string())
+}
+
+fn is_loopback_bind(bind: &str) -> bool {
+    bind.eq_ignore_ascii_case("localhost")
+        || bind
+            .parse::<IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
+fn cli_connect_host(bind: &str) -> String {
+    match bind {
+        "0.0.0.0" => "127.0.0.1".to_string(),
+        "::" => "::1".to_string(),
+        _ => bind.to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -354,12 +382,19 @@ struct ReactReq {
 
 async fn handle_react(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
     let req: ReactReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
+    let from_me = req.from_me.unwrap_or(true);
+    if req.emoji.is_empty() {
+        return json_err(400, "emoji must not be empty");
+    }
+    if req.jid.contains("@g.us") && !from_me && req.sender_jid.as_deref().is_none() {
+        return json_err(400, "sender_jid is required for group reactions when from_me=false");
+    }
     match bridge.send_reaction(
         &req.jid,
         &req.id,
         req.sender_jid.as_deref(),
         &req.emoji,
-        req.from_me.unwrap_or(true),
+        from_me,
     ).await {
         Ok(()) => json_ok_simple(),
         Err(e) => json_err(500, &e.to_string()),
@@ -525,7 +560,15 @@ struct PollReq {
 
 async fn handle_poll(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
     let req: PollReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
-    match bridge.send_poll(&req.jid, &req.question, &req.options, req.selectable_count).await {
+    let (question, options) = match crate::bridge::normalize_poll_spec(
+        &req.question,
+        &req.options,
+        req.selectable_count,
+    ) {
+        Ok(spec) => spec,
+        Err(e) => return json_err(400, &e.to_string()),
+    };
+    match bridge.send_poll(&req.jid, &question, &options, req.selectable_count).await {
         Ok(id) => json_ok_id(&id),
         Err(e) => json_err(500, &e.to_string()),
     }
@@ -537,7 +580,14 @@ async fn handle_poll(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
 
 /// Start the API server. Blocks until cancelled.
 pub async fn serve(bridge: Arc<WhatsAppBridge>, port: u16, cancel: CancellationToken) {
-    let bind = std::env::var("WHATSRUST_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let bind = api_bind_host();
+    if !is_loopback_bind(&bind) && !bool_env_var("WHATSRUST_ALLOW_REMOTE") {
+        error!(
+            bind = %bind,
+            "refusing non-loopback API bind without WHATSRUST_ALLOW_REMOTE=1"
+        );
+        return;
+    }
     let listener = match TcpListener::bind((&*bind, port)).await {
         Ok(l) => {
             info!(bind = %bind, port = port, "API server listening");
@@ -577,9 +627,10 @@ pub async fn serve(bridge: Arc<WhatsAppBridge>, port: u16, cancel: CancellationT
 
 /// Send a GET request to the running daemon and return (status, body_bytes).
 pub async fn cli_get(port: u16, path: &str) -> anyhow::Result<(u16, Vec<u8>)> {
-    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await
-        .map_err(|e| anyhow::anyhow!("cannot connect to whatsrust daemon on port {port}: {e}\nIs the daemon running? Start it with: WHATSRUST_PORT={port} whatsrust"))?;
-    let req = format!("GET {path} HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n");
+    let host = cli_connect_host(&api_bind_host());
+    let mut stream = tokio::net::TcpStream::connect((&*host, port)).await
+        .map_err(|e| anyhow::anyhow!("cannot connect to whatsrust daemon on {host}:{port}: {e}\nIs the daemon running? Start it with: WHATSRUST_PORT={port} WHATSRUST_BIND={host} whatsrust"))?;
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
     stream.write_all(req.as_bytes()).await?;
     stream.shutdown().await?;
 
@@ -592,10 +643,11 @@ pub async fn cli_get(port: u16, path: &str) -> anyhow::Result<(u16, Vec<u8>)> {
 
 /// Send a POST request with JSON body to the running daemon.
 pub async fn cli_post(port: u16, path: &str, body: &str) -> anyhow::Result<(u16, Vec<u8>)> {
-    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await
-        .map_err(|e| anyhow::anyhow!("cannot connect to whatsrust daemon on port {port}: {e}\nIs the daemon running? Start it with: WHATSRUST_PORT={port} whatsrust"))?;
+    let host = cli_connect_host(&api_bind_host());
+    let mut stream = tokio::net::TcpStream::connect((&*host, port)).await
+        .map_err(|e| anyhow::anyhow!("cannot connect to whatsrust daemon on {host}:{port}: {e}\nIs the daemon running? Start it with: WHATSRUST_PORT={port} WHATSRUST_BIND={host} whatsrust"))?;
     let req = format!(
-        "POST {path} HTTP/1.1\r\nHost: localhost:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(req.as_bytes()).await?;
@@ -621,4 +673,30 @@ fn parse_cli_response(raw: &[u8]) -> anyhow::Result<(u16, Vec<u8>)> {
         .unwrap_or(0);
     let body = raw[header_end + 4..].to_vec();
     Ok((status, body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_loopback_bind_accepts_local_hosts() {
+        assert!(is_loopback_bind("127.0.0.1"));
+        assert!(is_loopback_bind("::1"));
+        assert!(is_loopback_bind("localhost"));
+    }
+
+    #[test]
+    fn test_is_loopback_bind_rejects_remote_hosts() {
+        assert!(!is_loopback_bind("0.0.0.0"));
+        assert!(!is_loopback_bind("192.168.1.10"));
+        assert!(!is_loopback_bind("api.internal"));
+    }
+
+    #[test]
+    fn test_cli_connect_host_rewrites_wildcards() {
+        assert_eq!(cli_connect_host("0.0.0.0"), "127.0.0.1");
+        assert_eq!(cli_connect_host("::"), "::1");
+        assert_eq!(cli_connect_host("192.168.1.10"), "192.168.1.10");
+    }
 }

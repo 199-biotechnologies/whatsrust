@@ -669,7 +669,7 @@ async fn main() -> Result<()> {
                                 eprintln!("usage: group-add <group-jid> <phone> [phone...]");
                             } else {
                                 let jid = parts[1];
-                                let phones: Vec<&str> = parts[2..].to_vec();
+                                let phones: Vec<&str> = parts[2].split_whitespace().collect();
                                 match bridge_for_repl.add_participants(jid, &phones).await {
                                     Ok(results) => {
                                         for (p, status) in &results {
@@ -685,7 +685,7 @@ async fn main() -> Result<()> {
                                 eprintln!("usage: group-remove <group-jid> <phone> [phone...]");
                             } else {
                                 let jid = parts[1];
-                                let phones: Vec<&str> = parts[2..].to_vec();
+                                let phones: Vec<&str> = parts[2].split_whitespace().collect();
                                 match bridge_for_repl.remove_participants(jid, &phones).await {
                                     Ok(results) => {
                                         for (p, status) in &results {
@@ -701,7 +701,7 @@ async fn main() -> Result<()> {
                                 eprintln!("usage: group-promote <group-jid> <phone> [phone...]");
                             } else {
                                 let jid = parts[1];
-                                let phones: Vec<&str> = parts[2..].to_vec();
+                                let phones: Vec<&str> = parts[2].split_whitespace().collect();
                                 match bridge_for_repl.promote_participants(jid, &phones).await {
                                     Ok(()) => println!("promoted"),
                                     Err(e) => eprintln!("error: {e}"),
@@ -713,7 +713,7 @@ async fn main() -> Result<()> {
                                 eprintln!("usage: group-demote <group-jid> <phone> [phone...]");
                             } else {
                                 let jid = parts[1];
-                                let phones: Vec<&str> = parts[2..].to_vec();
+                                let phones: Vec<&str> = parts[2].split_whitespace().collect();
                                 match bridge_for_repl.demote_participants(jid, &phones).await {
                                     Ok(()) => println!("demoted"),
                                     Err(e) => eprintln!("error: {e}"),
@@ -735,7 +735,7 @@ async fn main() -> Result<()> {
                                 eprintln!("usage: group-create <name> <phone> [phone...]");
                             } else {
                                 let name = parts[1];
-                                let phones: Vec<&str> = parts[2..].to_vec();
+                                let phones: Vec<&str> = parts[2].split_whitespace().collect();
                                 match bridge_for_repl.create_group(name, &phones).await {
                                     Ok(gid) => println!("created group: {gid}"),
                                     Err(e) => eprintln!("error: {e}"),
@@ -888,8 +888,16 @@ async fn cli_main(args: &[String]) -> Result<()> {
             Ok(())
         }
         "react" => {
-            require_args(args, 4, "react <jid> <msg_id> <emoji>")?;
-            let body = json!({"jid": args[1], "id": args[2], "emoji": args[3]}).to_string();
+            require_args(args, 4, "react <jid> <msg_id> <emoji> [from_me] [sender_jid]")?;
+            let (from_me, sender_jid) = parse_cli_react_args(args)?;
+            let body = json!({
+                "jid": args[1],
+                "id": args[2],
+                "emoji": args[3],
+                "from_me": from_me,
+                "sender_jid": sender_jid,
+            })
+            .to_string();
             let (status, resp) = api::cli_post(port, "/api/react", &body).await?;
             print_json_result(status, &resp)?;
             Ok(())
@@ -991,6 +999,28 @@ fn require_args(args: &[String], min: usize, usage: &str) -> Result<()> {
     Ok(())
 }
 
+fn parse_boolish(value: &str) -> Option<bool> {
+    match value {
+        "true" | "1" | "yes" => Some(true),
+        "false" | "0" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_cli_react_args(args: &[String]) -> Result<(bool, Option<String>)> {
+    if args.len() > 6 {
+        anyhow::bail!("usage: whatsrust react <jid> <msg_id> <emoji> [from_me] [sender_jid]");
+    }
+
+    match args.get(4) {
+        None => Ok((true, None)),
+        Some(extra) => match parse_boolish(extra) {
+            Some(from_me) => Ok((from_me, args.get(5).cloned())),
+            None => Ok((false, Some(extra.clone()))),
+        },
+    }
+}
+
 /// Print JSON response and return error if `ok` field is false.
 fn print_json_result(status: u16, body: &[u8]) -> Result<()> {
     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
@@ -1023,7 +1053,7 @@ fn print_cli_help() {
     println!("  whatsrust send <jid> <text>            Send text message");
     println!("  whatsrust reply <jid> <id> <sender> <text>  Reply to a message");
     println!("  whatsrust edit <jid> <id> <text>       Edit a sent message");
-    println!("  whatsrust react <jid> <id> <emoji>     React to a message");
+    println!("  whatsrust react <jid> <id> <emoji> [from_me] [sender_jid]  React to a message");
     println!("  whatsrust image <jid> <path> [caption] Send image");
     println!("  whatsrust video <jid> <path> [caption] Send video");
     println!("  whatsrust audio <jid> <path>           Send voice note");
@@ -1037,8 +1067,56 @@ fn print_cli_help() {
     println!("ENVIRONMENT:");
     println!("  WHATSRUST_PORT   API port (default: 7270, fallback: HEALTH_PORT)");
     println!("  WHATSRUST_BIND   API bind address (default: 127.0.0.1)");
+    println!("  WHATSRUST_ALLOW_REMOTE=1  Permit non-loopback API binds");
     println!();
     println!("JID FORMAT:");
     println!("  Phone number: 15551234567 or 15551234567@s.whatsapp.net");
     println!("  Group: 120363012345678901@g.us");
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_cli_react_args_defaults() {
+        let args = vec![
+            "react".to_string(),
+            "chat".to_string(),
+            "msg".to_string(),
+            "👍".to_string(),
+        ];
+        let (from_me, sender_jid) = parse_cli_react_args(&args).unwrap();
+        assert!(from_me);
+        assert!(sender_jid.is_none());
+    }
+
+    #[test]
+    fn test_parse_cli_react_args_explicit_sender_implies_not_from_me() {
+        let args = vec![
+            "react".to_string(),
+            "chat".to_string(),
+            "msg".to_string(),
+            "👍".to_string(),
+            "alice@s.whatsapp.net".to_string(),
+        ];
+        let (from_me, sender_jid) = parse_cli_react_args(&args).unwrap();
+        assert!(!from_me);
+        assert_eq!(sender_jid.as_deref(), Some("alice@s.whatsapp.net"));
+    }
+
+    #[test]
+    fn test_parse_cli_react_args_bool_and_sender() {
+        let args = vec![
+            "react".to_string(),
+            "chat".to_string(),
+            "msg".to_string(),
+            "👍".to_string(),
+            "false".to_string(),
+            "alice@s.whatsapp.net".to_string(),
+        ];
+        let (from_me, sender_jid) = parse_cli_react_args(&args).unwrap();
+        assert!(!from_me);
+        assert_eq!(sender_jid.as_deref(), Some("alice@s.whatsapp.net"));
+    }
 }

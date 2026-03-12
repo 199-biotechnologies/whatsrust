@@ -57,6 +57,9 @@ pub fn decrypt_poll_vote(
     ciphertext: &[u8],
     iv: &[u8],
 ) -> anyhow::Result<Vec<Vec<u8>>> {
+    if iv.len() != 12 {
+        anyhow::bail!("invalid poll vote IV length: expected 12 bytes, got {}", iv.len());
+    }
     let key = derive_key(enc_key);
     let cipher = Aes256Gcm::new_from_slice(&key)?;
     let nonce = Nonce::from_slice(iv);
@@ -148,5 +151,13 @@ mod tests {
         let (ct, iv) = encrypt_poll_vote(&enc_key, poll_id, voter_jid, &selected).unwrap();
         let result = decrypt_poll_vote(&wrong_key, poll_id, voter_jid, &ct, &iv);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_invalid_iv_length_returns_error() {
+        let enc_key = generate_poll_key();
+        let result = decrypt_poll_vote(&enc_key, "poll", "voter@s.whatsapp.net", b"", &[0u8; 8]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("IV length"));
     }
 }
