@@ -362,22 +362,21 @@ async fn main() -> Result<()> {
                             }
                         }
                         "react" => {
-                            // react <jid> <msg_id> <emoji> [from_me] [sender_jid]
+                            // react <jid> <msg_id> <emoji> [from_me|sender_jid] [sender_jid]
                             let react_parts: Vec<&str> = line.splitn(6, ' ').collect();
                             if react_parts.len() < 4 {
-                                println!("usage: react <jid> <msg_id> <emoji> [from_me=true] [sender_jid]");
+                                println!("usage: react <jid> <msg_id> <emoji> [from_me|sender_jid] [sender_jid]");
                                 continue;
                             }
-                            let from_me = react_parts
-                                .get(4)
-                                .map(|v| *v != "false" && *v != "0")
-                                .unwrap_or(true);
-                            let sender_jid = react_parts.get(5).copied();
+                            let (from_me, sender_jid) = parse_react_target(
+                                react_parts.get(4).copied(),
+                                react_parts.get(5).copied(),
+                            );
                             match bridge_for_repl
                                 .send_reaction(
                                     react_parts[1],
                                     react_parts[2],
-                                    sender_jid,
+                                    sender_jid.as_deref(),
                                     react_parts[3],
                                     from_me,
                                 )
@@ -388,19 +387,18 @@ async fn main() -> Result<()> {
                             }
                         }
                         "unreact" => {
-                            // unreact <jid> <msg_id> [from_me] [sender_jid]
+                            // unreact <jid> <msg_id> [from_me|sender_jid] [sender_jid]
                             let react_parts: Vec<&str> = line.splitn(5, ' ').collect();
                             if react_parts.len() < 3 {
-                                println!("usage: unreact <jid> <msg_id> [from_me=true] [sender_jid]");
+                                println!("usage: unreact <jid> <msg_id> [from_me|sender_jid] [sender_jid]");
                                 continue;
                             }
-                            let from_me = react_parts
-                                .get(3)
-                                .map(|v| *v != "false" && *v != "0")
-                                .unwrap_or(true);
-                            let sender_jid = react_parts.get(4).copied();
+                            let (from_me, sender_jid) = parse_react_target(
+                                react_parts.get(3).copied(),
+                                react_parts.get(4).copied(),
+                            );
                             match bridge_for_repl
-                                .remove_reaction(react_parts[1], react_parts[2], sender_jid, from_me)
+                                .remove_reaction(react_parts[1], react_parts[2], sender_jid.as_deref(), from_me)
                                 .await
                             {
                                 Ok(()) => println!(">> reaction removed (from_me={})", from_me),
@@ -1052,6 +1050,19 @@ fn require_args(args: &[String], min: usize, usage: &str) -> Result<()> {
     Ok(())
 }
 
+/// Parse optional [from_me|sender_jid] [sender_jid] into (from_me, sender_jid).
+/// If the first optional arg is a sender JID (not a boolean), infers from_me=false.
+/// Used by both REPL and CLI reaction commands.
+fn parse_react_target(first_opt: Option<&str>, second_opt: Option<&str>) -> (bool, Option<String>) {
+    match first_opt {
+        None => (true, None),
+        Some(v) => match parse_boolish(v) {
+            Some(from_me) => (from_me, second_opt.map(|s| s.to_string())),
+            None => (false, Some(v.to_string())), // sender JID implies from_me=false
+        },
+    }
+}
+
 fn parse_boolish(value: &str) -> Option<bool> {
     match value {
         "true" | "1" | "yes" => Some(true),
@@ -1062,30 +1073,22 @@ fn parse_boolish(value: &str) -> Option<bool> {
 
 fn parse_cli_react_args(args: &[String]) -> Result<(bool, Option<String>)> {
     if args.len() > 6 {
-        anyhow::bail!("usage: whatsrust react <jid> <msg_id> <emoji> [from_me] [sender_jid]");
+        anyhow::bail!("usage: whatsrust react <jid> <msg_id> <emoji> [from_me|sender_jid] [sender_jid]");
     }
-
-    match args.get(4) {
-        None => Ok((true, None)),
-        Some(extra) => match parse_boolish(extra) {
-            Some(from_me) => Ok((from_me, args.get(5).cloned())),
-            None => Ok((false, Some(extra.clone()))),
-        },
-    }
+    Ok(parse_react_target(
+        args.get(4).map(|s| s.as_str()),
+        args.get(5).map(|s| s.as_str()),
+    ))
 }
 
 fn parse_cli_react_args_without_emoji(args: &[String]) -> Result<(bool, Option<String>)> {
     if args.len() > 5 {
-        anyhow::bail!("usage: whatsrust unreact <jid> <msg_id> [from_me] [sender_jid]");
+        anyhow::bail!("usage: whatsrust unreact <jid> <msg_id> [from_me|sender_jid] [sender_jid]");
     }
-
-    match args.get(3) {
-        None => Ok((true, None)),
-        Some(extra) => match parse_boolish(extra) {
-            Some(from_me) => Ok((from_me, args.get(4).cloned())),
-            None => Ok((false, Some(extra.clone()))),
-        },
-    }
+    Ok(parse_react_target(
+        args.get(3).map(|s| s.as_str()),
+        args.get(4).map(|s| s.as_str()),
+    ))
 }
 
 /// Print JSON response and return error if `ok` field is false.
