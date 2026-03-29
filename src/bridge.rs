@@ -64,6 +64,9 @@ pub enum BridgeState {
 enum SessionAction {
     Retry,
     Stop,
+    /// Another client replaced our session. The reconnect loop should
+    /// allow a few retries (session may survive) but stop if it loops.
+    StreamReplaced,
 }
 
 /// Atomic counters for bridge health metrics — no locks, no DB reads.
@@ -143,10 +146,6 @@ struct SendPacer {
 }
 
 impl SendPacer {
-    fn new(min_send_interval_ms: u64) -> Self {
-        Self::with_burst(min_send_interval_ms, 5)
-    }
-
     fn with_burst(refill_interval_ms: u64, burst: u32) -> Self {
         Self {
             burst,
@@ -1457,6 +1456,11 @@ async fn run_bridge(
     }
 
     let mut backoff = Duration::from_secs(1);
+    // Track rapid StreamReplaced events to detect replacement loops.
+    // If we get 3 replacements within 5 minutes, stop reconnecting.
+    const MAX_REPLACEMENTS: u32 = 3;
+    const REPLACEMENT_WINDOW: Duration = Duration::from_secs(300);
+    let mut replacement_times: Vec<std::time::Instant> = Vec::new();
 
     loop {
         if cancel.is_cancelled() {
@@ -1497,6 +1501,28 @@ async fn run_bridge(
             Ok(SessionAction::Stop) => {
                 info!("bot session requested stop; not reconnecting");
                 break;
+            }
+            Ok(SessionAction::StreamReplaced) => {
+                // Track replacement frequency — stop if looping
+                let now = std::time::Instant::now();
+                replacement_times.retain(|t| now.duration_since(*t) < REPLACEMENT_WINDOW);
+                replacement_times.push(now);
+                if replacement_times.len() as u32 >= MAX_REPLACEMENTS {
+                    error!(
+                        count = replacement_times.len(),
+                        window_secs = REPLACEMENT_WINDOW.as_secs(),
+                        "StreamReplaced loop detected — stopping. Check for duplicate bridge processes or competing WhatsApp Web/Desktop sessions."
+                    );
+                    break;
+                }
+                warn!(
+                    count = replacement_times.len(),
+                    max = MAX_REPLACEMENTS,
+                    "stream replaced — will retry ({} of {} before giving up)",
+                    replacement_times.len(), MAX_REPLACEMENTS
+                );
+                // Use a longer backoff for replacements (10s min)
+                backoff = std::cmp::max(Duration::from_secs(10), backoff);
             }
             Ok(SessionAction::Retry) => {
                 info!("bot session ended; reconnecting");
@@ -1571,6 +1597,7 @@ async fn run_bot_session(
     // Clear stale handle from previous session
     set_client_handle(client_handle, None);
     let stop_reconnect = Arc::new(AtomicBool::new(false));
+    let stream_replaced = Arc::new(AtomicBool::new(false));
 
     // Clone store for LID resolution in event handler
     let store_for_events = store.clone();
@@ -1580,6 +1607,7 @@ async fn run_bot_session(
     let itx = inbound_tx.clone();
     let stx = Arc::new(state_tx.clone());
     let sr = stop_reconnect.clone();
+    let sr_replaced = stream_replaced.clone();
     let auto_mark_read = config.auto_mark_read;
     let allowed_numbers = config.allowed_numbers.clone();
     let dedup_for_events = dedup.clone();
@@ -1607,6 +1635,7 @@ async fn run_bot_session(
             let qtx = qtx.clone();
             let store = store_for_events.clone();
             let sr = sr.clone();
+            let srr = sr_replaced.clone();
             let allowed = allowed_numbers.clone();
             let dedup = dedup_for_events.clone();
             let bid = bridge_id.clone();
@@ -1619,7 +1648,7 @@ async fn run_bot_session(
             let spres = sub_pres_for_events.clone();
             let etx = event_tx_for_events.clone();
             async move {
-                handle_event(event, client, &ch, &itx, &stx, &qtx, &store, &sr, auto_mark_read, &allowed, &dedup, &bid, &dl_sem, &rr, &ptx, &pql, &met, &mc, &spres, &etx)
+                handle_event(event, client, &ch, &itx, &stx, &qtx, &store, &sr, &srr, auto_mark_read, &allowed, &dedup, &bid, &dl_sem, &rr, &ptx, &pql, &met, &mc, &spres, &etx)
                     .await;
             }
         });
@@ -1656,7 +1685,9 @@ async fn run_bot_session(
         result = bot_task => {
             match result {
                 Ok(()) => {
-                    if stop_reconnect.load(Ordering::Relaxed) {
+                    if stream_replaced.load(Ordering::Relaxed) {
+                        Ok(SessionAction::StreamReplaced)
+                    } else if stop_reconnect.load(Ordering::Relaxed) {
                         Ok(SessionAction::Stop)
                     } else {
                         Ok(SessionAction::Retry)
@@ -1747,6 +1778,7 @@ async fn handle_event(
     qr_tx: &Arc<watch::Sender<Option<String>>>,
     store: &Store,
     stop_reconnect: &Arc<AtomicBool>,
+    stream_replaced: &Arc<AtomicBool>,
     auto_mark_read: bool,
     allowed_numbers: &[String],
     dedup: &Arc<AtomicDedupCache>,
@@ -1990,10 +2022,11 @@ async fn handle_event(
             let _ = state_tx.send(BridgeState::Disconnected);
         }
         Event::StreamReplaced(_) => {
-            error!("StreamReplaced: another client connected using this same linked device session — stopping to avoid replacement loop. Check for duplicate bridge processes (ps aux | grep whatsrust) or a competing WhatsApp Web/Desktop session.");
+            warn!("StreamReplaced: another client took over this linked device session. Will attempt to reconnect — if this repeats, check for duplicate bridge processes or competing WhatsApp Web/Desktop sessions.");
             set_client_handle(client_handle, None);
             let _ = rr_tx.send(ReadReceiptCmd::SetClient(None)).await;
-            stop_reconnect.store(true, Ordering::Relaxed);
+            // Signal replaced (not a hard stop) — reconnect loop decides whether to retry.
+            stream_replaced.store(true, Ordering::Relaxed);
             request_disconnect(client.clone());
             metrics.record_disconnect();
             let _ = state_tx.send(BridgeState::Disconnected);
