@@ -3140,8 +3140,10 @@ fn should_ignore_jid(jid: &str) -> bool {
     jid == "status@broadcast"
         || jid.ends_with("@broadcast")
         || jid.ends_with("@newsletter")
-        || jid.ends_with("@lid")
         || jid == "server@s.whatsapp.net"
+    // NOTE: @lid JIDs are NOT filtered. After re-pairing, WhatsApp routes
+    // direct chat messages through LID-format JIDs. The sender is resolved
+    // to a phone number via resolve_sender() + lid_pn_mapping table.
 }
 
 fn message_kind(msg: &wa::Message) -> &'static str {
@@ -3432,12 +3434,12 @@ mod tests {
         assert!(should_ignore_jid("status@broadcast"));
         assert!(should_ignore_jid("120363xxxxx@newsletter"));
         assert!(should_ignore_jid("something@broadcast"));
-        assert!(should_ignore_jid("abcdef@lid"));
         assert!(should_ignore_jid("server@s.whatsapp.net"));
         // These should NOT be ignored
         assert!(!should_ignore_jid("15551234567@s.whatsapp.net"));
         assert!(!should_ignore_jid("120363xxxxx@g.us"));
         assert!(!should_ignore_jid("15551234567@c.us"));
+        assert!(!should_ignore_jid("abcdef@lid")); // LID JIDs are valid after re-pairing
     }
 
     #[tokio::test]
