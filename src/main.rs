@@ -12,6 +12,7 @@ mod api;
 mod bridge;
 mod dedup;
 mod instance_lock;
+mod outbound;
 mod polls;
 pub mod qr;
 mod read_receipts;

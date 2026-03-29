@@ -159,11 +159,17 @@ CREATE TABLE IF NOT EXISTS tc_tokens (
     sender_timestamp INTEGER
 );
 
--- Persistent outbound message queue (crash-safe, replaces in-memory VecDeque)
+-- Persistent outbound job queue (crash-safe, typed operations)
 CREATE TABLE IF NOT EXISTS outbound_queue (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     jid TEXT NOT NULL,
-    payload TEXT NOT NULL,
+    payload TEXT NOT NULL DEFAULT '',
+    op_kind TEXT NOT NULL DEFAULT 'text',
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    payload_blob BLOB,
+    wa_message_id TEXT,
+    delivery_status TEXT,
+    last_error TEXT,
     status TEXT NOT NULL DEFAULT 'queued',
     retries INTEGER NOT NULL DEFAULT 0,
     retry_after INTEGER NOT NULL DEFAULT 0,
@@ -184,10 +190,11 @@ CREATE TABLE IF NOT EXISTS poll_keys (
 -- Indexes for non-PK lookups
 CREATE INDEX IF NOT EXISTS idx_lid_pn_phone ON lid_pn_mapping(phone_number);
 CREATE INDEX IF NOT EXISTS idx_tc_tokens_ts ON tc_tokens(token_timestamp);
-CREATE INDEX IF NOT EXISTS idx_outbound_status ON outbound_queue(status, id);
+CREATE INDEX IF NOT EXISTS idx_outbound_status ON outbound_queue(status, retry_after, id);
+CREATE INDEX IF NOT EXISTS idx_outbound_wa_id ON outbound_queue(wa_message_id);
 ";
 
-const CURRENT_SCHEMA_VERSION: i64 = 4;
+const CURRENT_SCHEMA_VERSION: i64 = 5;
 
 #[cfg(unix)]
 fn secure_backup_permissions(path: &Path) -> Result<()> {
@@ -463,6 +470,103 @@ impl Store {
     }
 
     // -----------------------------------------------------------------------
+    // Typed outbound job queue (v5+)
+    // -----------------------------------------------------------------------
+
+    /// Enqueue a typed outbound job. Returns the row ID (job_id).
+    pub async fn enqueue_job(
+        &self,
+        jid: &str,
+        op_kind: &str,
+        payload_json: &str,
+        payload_blob: Option<Vec<u8>>,
+    ) -> Result<i64> {
+        let j = jid.to_owned();
+        let ok = op_kind.to_owned();
+        let pj = payload_json.to_owned();
+        let ts = now_secs();
+        self.run(move |c| {
+            c.execute(
+                "INSERT INTO outbound_queue (jid, payload, op_kind, payload_json, payload_blob, status, retries, created_at, updated_at)
+                 VALUES (?1, '', ?2, ?3, ?4, 'queued', 0, ?5, ?5)",
+                params![j, ok, pj, payload_blob, ts],
+            )
+            .map_err(db_err)?;
+            Ok(c.last_insert_rowid())
+        })
+        .await
+    }
+
+    /// Atomically claim the next queued job for processing. Returns the full job row.
+    pub async fn claim_next_job(&self) -> Result<Option<crate::outbound::OutboundJobRow>> {
+        let ts = now_secs();
+        self.run(move |c| {
+            let tx = c.unchecked_transaction().map_err(db_err)?;
+            let row = tx
+                .query_row(
+                    "SELECT id, jid, op_kind, payload_json, payload_blob, retries
+                     FROM outbound_queue
+                     WHERE status = 'queued' AND retry_after <= ?1
+                     ORDER BY id LIMIT 1",
+                    params![ts],
+                    |row| {
+                        Ok(crate::outbound::OutboundJobRow {
+                            id: row.get(0)?,
+                            jid: row.get(1)?,
+                            op_kind: row.get(2)?,
+                            payload_json: row.get(3)?,
+                            payload_blob: row.get(4)?,
+                            retries: row.get(5)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(db_err)?;
+            if let Some(ref r) = row {
+                tx.execute(
+                    "UPDATE outbound_queue SET status = 'inflight', updated_at = ?1 WHERE id = ?2",
+                    params![ts, r.id],
+                )
+                .map_err(db_err)?;
+            }
+            tx.commit().map_err(db_err)?;
+            Ok(row)
+        })
+        .await
+    }
+
+    /// Record the WhatsApp message ID after successful send.
+    pub async fn set_job_wa_message_id(&self, id: i64, wa_id: &str) -> Result<()> {
+        let wa = wa_id.to_owned();
+        let ts = now_secs();
+        self.run(move |c| {
+            c.execute(
+                "UPDATE outbound_queue SET wa_message_id = ?1, updated_at = ?2 WHERE id = ?3",
+                params![wa, ts, id],
+            )
+            .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Update delivery status for a job identified by its WhatsApp message ID.
+    pub async fn update_delivery_status(&self, wa_message_id: &str, status: &str) -> Result<()> {
+        let wa = wa_message_id.to_owned();
+        let st = status.to_owned();
+        let ts = now_secs();
+        self.run(move |c| {
+            c.execute(
+                "UPDATE outbound_queue SET delivery_status = ?1, updated_at = ?2 WHERE wa_message_id = ?3",
+                params![st, ts, wa],
+            )
+            .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    // -----------------------------------------------------------------------
     // Database pruning — prevent unbounded growth
     // -----------------------------------------------------------------------
 
@@ -652,6 +756,47 @@ fn run_schema_migrations(conn: &Connection, from_version: i64) -> Result<()> {
                     created_at INTEGER NOT NULL,
                     PRIMARY KEY (chat_jid, poll_id)
                 );"
+            ).map_err(db_err)?;
+        }
+
+        if from_version < 5 {
+            // v4→v5: typed outbound job queue — add columns for op_kind, structured
+            // payload, WA message ID tracking, and delivery status.
+            let add_col = |col: &str, def: &str| -> std::result::Result<(), StoreError> {
+                // Check if column exists first (fresh DBs already have it).
+                let exists: bool = conn
+                    .prepare(&format!(
+                        "SELECT COUNT(*) FROM pragma_table_info('outbound_queue') WHERE name='{col}'"
+                    ))
+                    .and_then(|mut s| s.query_row([], |r| r.get::<_, i64>(0)))
+                    .unwrap_or(0)
+                    > 0;
+                if !exists {
+                    conn.execute_batch(&format!(
+                        "ALTER TABLE outbound_queue ADD COLUMN {col} {def};"
+                    ))
+                    .map_err(db_err)?;
+                }
+                Ok(())
+            };
+            add_col("op_kind", "TEXT NOT NULL DEFAULT 'text'")?;
+            add_col("payload_json", "TEXT NOT NULL DEFAULT '{}'")?;
+            add_col("payload_blob", "BLOB")?;
+            add_col("wa_message_id", "TEXT")?;
+            add_col("delivery_status", "TEXT")?;
+            add_col("last_error", "TEXT")?;
+
+            // Migrate existing text rows: copy payload into payload_json
+            conn.execute_batch(
+                "UPDATE outbound_queue SET payload_json = json_object('text', payload)
+                 WHERE op_kind = 'text' AND payload_json = '{}'
+                 AND payload != '';"
+            ).map_err(db_err)?;
+
+            // Add better index for the typed queue
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_outbound_retry ON outbound_queue(status, retry_after, id);
+                 CREATE INDEX IF NOT EXISTS idx_outbound_wa_id ON outbound_queue(wa_message_id);"
             ).map_err(db_err)?;
         }
 
