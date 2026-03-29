@@ -438,19 +438,22 @@ async fn handle_group_info(bridge: &WhatsAppBridge, req: &HttpRequest) -> Vec<u8
 struct SendReq {
     jid: String,
     text: String,
+    #[serde(default)]
+    mentions: Vec<String>,
 }
 
 async fn handle_send(bridge: &WhatsAppBridge, body: &[u8], sync: bool) -> Vec<u8> {
     let req: SendReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
     if sync {
-        // Backward-compat: wait for send, return both job_id and WA message id
-        match bridge.send_message_with_id(&req.jid, &req.text).await {
+        match bridge.send_message_with_id_mentioned(&req.jid, &req.text, &req.mentions).await {
             Ok(id) => json_response(200, &serde_json::json!({"ok": true, "id": id}).to_string()),
             Err(e) => bridge_err(e),
         }
     } else {
-        // Async: enqueue and return job_id immediately
-        let payload = match serde_json::to_string(&crate::outbound::TextPayload { text: req.text }) {
+        let payload = match serde_json::to_string(&crate::outbound::TextPayload {
+            text: req.text,
+            mentions: req.mentions,
+        }) {
             Ok(p) => p,
             Err(e) => return json_err(500, &e.to_string()),
         };
@@ -467,11 +470,13 @@ struct ReplyReq {
     id: String,
     sender: String,
     text: String,
+    #[serde(default)]
+    mentions: Vec<String>,
 }
 
 async fn handle_reply(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
     let req: ReplyReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
-    match bridge.send_reply(&req.jid, &req.id, &req.sender, &req.text).await {
+    match bridge.send_reply_mentioned(&req.jid, &req.id, &req.sender, &req.text, &req.mentions).await {
         Ok(id) => json_ok_id(&id),
         Err(e) => bridge_err(e),
     }

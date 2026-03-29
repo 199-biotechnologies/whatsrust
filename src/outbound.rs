@@ -79,6 +79,9 @@ impl OutboundOpKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TextPayload {
     pub text: String,
+    /// JIDs to @mention (e.g. ["user@s.whatsapp.net"]). Empty = no mentions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<String>,
 }
 
 /// Payload for reply ops.
@@ -87,6 +90,9 @@ pub struct ReplyPayload {
     pub text: String,
     pub reply_to_id: String,
     pub reply_to_sender: String,
+    /// JIDs to @mention in the reply.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<String>,
 }
 
 /// Payload for media ops (image, video, audio, document, sticker, view-once).
@@ -196,9 +202,21 @@ pub async fn execute_job(
     match kind {
         OutboundOpKind::Text => {
             let p: TextPayload = serde_json::from_str(&row.payload_json)?;
-            let msg = wa::Message {
-                conversation: Some(p.text),
-                ..Default::default()
+            let msg = if p.mentions.is_empty() {
+                wa::Message { conversation: Some(p.text), ..Default::default() }
+            } else {
+                // Mentions require extended_text_message with context_info
+                wa::Message {
+                    extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+                        text: Some(p.text),
+                        context_info: Some(Box::new(wa::ContextInfo {
+                            mentioned_jid: p.mentions,
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }
             };
             let id = client.send_message(target.clone(), msg).await
                 .map_err(|e| anyhow::anyhow!("send text: {e}"))?;
@@ -210,6 +228,7 @@ pub async fn execute_job(
             let context_info = wa::ContextInfo {
                 stanza_id: Some(p.reply_to_id),
                 participant: Some(p.reply_to_sender),
+                mentioned_jid: p.mentions,
                 ..Default::default()
             };
             let msg = wa::Message {
@@ -497,9 +516,32 @@ mod tests {
 
     #[test]
     fn test_text_payload_serde() {
-        let p = TextPayload { text: "hello".to_string() };
+        let p = TextPayload { text: "hello".to_string(), mentions: vec![] };
         let json = serde_json::to_string(&p).unwrap();
+        assert!(!json.contains("mentions")); // empty vec skipped
         let p2: TextPayload = serde_json::from_str(&json).unwrap();
         assert_eq!(p2.text, "hello");
+        assert!(p2.mentions.is_empty());
+    }
+
+    #[test]
+    fn test_text_payload_with_mentions_serde() {
+        let p = TextPayload {
+            text: "Hey @user".to_string(),
+            mentions: vec!["user@s.whatsapp.net".to_string()],
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(json.contains("mentions"));
+        let p2: TextPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(p2.mentions, vec!["user@s.whatsapp.net"]);
+    }
+
+    #[test]
+    fn test_text_payload_backward_compat_no_mentions() {
+        // Old payloads without mentions field should deserialize with empty vec
+        let json = r#"{"text":"hello"}"#;
+        let p: TextPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(p.text, "hello");
+        assert!(p.mentions.is_empty());
     }
 }

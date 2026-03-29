@@ -664,7 +664,15 @@ impl WhatsAppBridge {
 
     /// Enqueue a text message for durable delivery via the outbound job queue.
     pub async fn send_message(&self, jid: &str, text: &str) -> Result<()> {
-        let payload = serde_json::to_string(&crate::outbound::TextPayload { text: text.to_string() })?;
+        self.send_message_mentioned(jid, text, &[]).await
+    }
+
+    /// Send a text message with @mentions. Empty mentions slice = no mentions.
+    pub async fn send_message_mentioned(&self, jid: &str, text: &str, mentions: &[String]) -> Result<()> {
+        let payload = serde_json::to_string(&crate::outbound::TextPayload {
+            text: text.to_string(),
+            mentions: mentions.to_vec(),
+        })?;
         self.store
             .enqueue_job(jid, crate::outbound::OutboundOpKind::Text.as_str(), &payload, None)
             .await?;
@@ -1086,7 +1094,15 @@ impl WhatsAppBridge {
     /// Compatibility wrapper: enqueues a durable job, waits for the Sent event,
     /// and returns the WhatsApp message ID.
     pub async fn send_message_with_id(&self, jid: &str, text: &str) -> Result<String> {
-        let payload = serde_json::to_string(&crate::outbound::TextPayload { text: text.to_string() })?;
+        self.send_message_with_id_mentioned(jid, text, &[]).await
+    }
+
+    /// Send a text message with @mentions and return the WA message ID.
+    pub async fn send_message_with_id_mentioned(&self, jid: &str, text: &str, mentions: &[String]) -> Result<String> {
+        let payload = serde_json::to_string(&crate::outbound::TextPayload {
+            text: text.to_string(),
+            mentions: mentions.to_vec(),
+        })?;
         self.enqueue_and_wait(jid, crate::outbound::OutboundOpKind::Text, &payload, None).await
     }
 
@@ -1306,6 +1322,18 @@ impl WhatsAppBridge {
         reply_to_sender: &str,
         text: &str,
     ) -> Result<String> {
+        self.send_reply_mentioned(jid, reply_to_id, reply_to_sender, text, &[]).await
+    }
+
+    /// Send a reply with @mentions.
+    pub async fn send_reply_mentioned(
+        &self,
+        jid: &str,
+        reply_to_id: &str,
+        reply_to_sender: &str,
+        text: &str,
+        mentions: &[String],
+    ) -> Result<String> {
         let target = parse_jid(jid)?;
         match self.flush_read_receipts(&target.to_string()).await {
             Ok(false) => debug!(chat = %target, "read-receipt flush skipped (no client)"),
@@ -1316,6 +1344,7 @@ impl WhatsAppBridge {
             text: text.to_string(),
             reply_to_id: reply_to_id.to_string(),
             reply_to_sender: reply_to_sender.to_string(),
+            mentions: mentions.to_vec(),
         })?;
         self.enqueue_and_wait(jid, crate::outbound::OutboundOpKind::Reply, &payload, None).await
     }
