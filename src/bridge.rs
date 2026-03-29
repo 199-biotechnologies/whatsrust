@@ -551,6 +551,8 @@ pub struct WhatsAppBridge {
     send_pacer: Arc<SendPacer>,
     /// JIDs with active presence subscriptions — replayed on reconnect.
     subscribed_presence: Arc<DashSet<String>>,
+    /// Broadcast event bus for inbound messages, outbound status, and receipts.
+    event_tx: tokio::sync::broadcast::Sender<Arc<crate::bridge_events::BridgeEvent>>,
 }
 
 impl WhatsAppBridge {
@@ -570,6 +572,7 @@ impl WhatsAppBridge {
         let msg_cache: MsgCache = Arc::new(ParkingMutex::new(BoundedMsgCache::new(MSG_CACHE_CAP)));
         let send_pacer = Arc::new(SendPacer::new(config.min_send_interval_ms));
         let subscribed_presence: Arc<DashSet<String>> = Arc::new(DashSet::new());
+        let (event_tx, _event_rx) = crate::bridge_events::new_event_bus();
 
         // Open store early so bridge methods can access it (e.g. poll key storage)
         let store = Store::new(&config.db_path).expect("failed to open database for bridge");
@@ -602,6 +605,7 @@ impl WhatsAppBridge {
             metrics,
             send_pacer,
             subscribed_presence,
+            event_tx,
         }
     }
 
@@ -884,6 +888,18 @@ impl WhatsAppBridge {
     #[allow(dead_code)] // Used by agent integrations, not the REPL
     pub fn subscribe_qr(&self) -> watch::Receiver<Option<String>> {
         self.qr_rx.clone()
+    }
+
+    /// Subscribe to the bridge event bus (inbound messages, outbound status, receipts).
+    /// Each subscriber gets its own broadcast receiver. Slow receivers that fall
+    /// behind will get `Lagged` and should reconnect.
+    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<Arc<crate::bridge_events::BridgeEvent>> {
+        self.event_tx.subscribe()
+    }
+
+    /// Get a reference to the event bus sender (for internal use by API server).
+    pub fn event_sender(&self) -> &tokio::sync::broadcast::Sender<Arc<crate::bridge_events::BridgeEvent>> {
+        &self.event_tx
     }
 
     /// Check if the bridge has an active WhatsApp connection.

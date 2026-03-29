@@ -10,6 +10,7 @@
 
 mod api;
 mod bridge;
+mod bridge_events;
 mod dedup;
 mod instance_lock;
 mod outbound;

@@ -1,5 +1,6 @@
 pub mod api;
 pub mod bridge;
+pub mod bridge_events;
 pub mod dedup;
 pub mod instance_lock;
 pub mod outbound;
