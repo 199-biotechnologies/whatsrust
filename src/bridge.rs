@@ -762,10 +762,8 @@ impl WhatsAppBridge {
     }
 
     /// Flush all pending read receipts for a chat (call before replying).
-    pub async fn flush_read_receipts(&self, chat_jid: &str) -> Result<()> {
-        if get_client_handle(&self.client_handle).is_none() {
-            anyhow::bail!("not connected");
-        }
+    /// Returns Ok(true) if receipts were sent, Ok(false) if no client was available.
+    pub async fn flush_read_receipts(&self, chat_jid: &str) -> Result<bool> {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         self.rr_tx
             .send(ReadReceiptCmd::FlushChat {
@@ -1330,8 +1328,10 @@ impl WhatsAppBridge {
         text: &str,
     ) -> Result<String> {
         let target = parse_jid(jid)?;
-        if let Err(e) = self.flush_read_receipts(&target.to_string()).await {
-            warn!(error = %e, chat = %target, "failed to queue read-receipt flush before reply");
+        match self.flush_read_receipts(&target.to_string()).await {
+            Ok(false) => debug!(chat = %target, "read-receipt flush skipped (no client)"),
+            Err(e) => warn!(error = %e, chat = %target, "read-receipt flush failed before reply"),
+            Ok(true) => {}
         }
         let context_info = wa::ContextInfo {
             stanza_id: Some(reply_to_id.to_string()),

@@ -17,9 +17,10 @@ pub enum ReadReceiptCmd {
         message_id: String,
     },
     /// Force-flush all pending receipts for a chat (call before replying).
+    /// Ack is true if receipts were actually sent, false if no client was available.
     FlushChat {
         chat_jid: String,
-        ack: oneshot::Sender<()>,
+        ack: oneshot::Sender<bool>,
     },
     /// Update the client handle (on reconnect).
     SetClient(Option<Arc<Client>>),
@@ -110,8 +111,11 @@ async fn run_scheduler(
                             for ((chat_jid, participant), msg_ids) in flushed {
                                 send_receipt(c, &chat_jid, participant.as_deref(), msg_ids).await;
                             }
+                            let _ = ack.send(true);
+                        } else {
+                            // No client — leave receipts pending, tell caller flush didn't happen
+                            let _ = ack.send(false);
                         }
-                        let _ = ack.send(());
                     }
                     Some(ReadReceiptCmd::SetClient(c)) => {
                         client = c;
