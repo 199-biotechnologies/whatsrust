@@ -61,6 +61,7 @@ fn http_response(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
         404 => "Not Found",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
+        504 => "Gateway Timeout",
         _ => "Unknown",
     };
     let header = format!(
@@ -104,6 +105,7 @@ fn json_err(status: u16, msg: &str) -> Vec<u8> {
         403 => "forbidden",
         404 => "not_found",
         503 => "unavailable",
+        504 => "timeout",
         _ => "internal_error",
     };
     json_response(status, &json!({"ok": false, "code": code, "error": msg}).to_string())
@@ -763,9 +765,9 @@ fn mime_for_doc(path: &std::path::Path) -> &'static str {
 
 async fn handle_history(bridge: &WhatsAppBridge, req: &HttpRequest) -> Vec<u8> {
     let jid = req.query_get("jid");
-    let limit: i64 = req.query_get("limit").and_then(|v| v.parse().ok()).unwrap_or(50);
+    let limit: i64 = req.query_get("limit").and_then(|v| v.parse().ok()).unwrap_or(50).max(1).min(200);
     let before: Option<i64> = req.query_get("before").and_then(|v| v.parse().ok());
-    match bridge.store().search_inbound(jid, None, limit.min(200), before).await {
+    match bridge.store().search_inbound(jid, None, limit, before).await {
         Ok(rows) => {
             let count = rows.len();
             json_ok(json!({"messages": rows, "count": count}))
@@ -780,8 +782,8 @@ async fn handle_search(bridge: &WhatsAppBridge, req: &HttpRequest) -> Vec<u8> {
         _ => return json_err(400, "query parameter 'q' is required"),
     };
     let jid = req.query_get("jid");
-    let limit: i64 = req.query_get("limit").and_then(|v| v.parse().ok()).unwrap_or(20);
-    match bridge.store().search_inbound(jid, Some(q), limit.min(200), None).await {
+    let limit: i64 = req.query_get("limit").and_then(|v| v.parse().ok()).unwrap_or(20).max(1).min(200);
+    match bridge.store().search_inbound(jid, Some(q), limit, None).await {
         Ok(rows) => {
             let count = rows.len();
             json_ok(json!({"messages": rows, "count": count}))
