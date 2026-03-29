@@ -17,7 +17,7 @@ pub mod qr;
 mod read_receipts;
 mod storage;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,6 +30,8 @@ use tracing::{error, info, warn};
 
 use bridge::{BridgeConfig, WhatsAppBridge};
 
+const MAX_LOCAL_MEDIA_READ_BYTES: u64 = 50 * 1024 * 1024;
+
 /// Read the API port from env, with fallback chain.
 fn get_port() -> u16 {
     std::env::var("WHATSRUST_PORT")
@@ -37,6 +39,22 @@ fn get_port() -> u16 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(7270)
+}
+
+fn read_local_media_file(path: &Path) -> Result<Vec<u8>> {
+    let meta = std::fs::metadata(path)?;
+    if !meta.is_file() {
+        anyhow::bail!("path is not a regular file: {}", path.display());
+    }
+    if meta.len() > MAX_LOCAL_MEDIA_READ_BYTES {
+        anyhow::bail!(
+            "file exceeds size limit ({} bytes > {} bytes): {}",
+            meta.len(),
+            MAX_LOCAL_MEDIA_READ_BYTES,
+            path.display()
+        );
+    }
+    Ok(std::fs::read(path)?)
 }
 
 #[tokio::main]
@@ -164,6 +182,7 @@ async fn main() -> Result<()> {
         println!("  reply <jid> <id> <sender> <msg>— reply quoting a message");
         println!("  edit <jid> <id> <new text>     — edit a sent message");
         println!("  react <jid> <id> <emoji> [from_me] [sender_jid] — react to a message");
+        println!("  unreact <jid> <id> [from_me] [sender_jid] — remove a reaction");
         println!("  image <jid> <path>             — send an image file");
         println!("  audio <jid> <path>             — send audio as voice note");
         println!("  video <jid> <path>             — send a video file");
@@ -225,7 +244,7 @@ async fn main() -> Result<()> {
                                 continue;
                             }
                             let path = std::path::Path::new(parts[2]);
-                            match std::fs::read(path) {
+                            match read_local_media_file(path) {
                                 Ok(data) => {
                                     let mime = match path.extension().and_then(|e| e.to_str()) {
                                         Some("png") => "image/png",
@@ -250,7 +269,7 @@ async fn main() -> Result<()> {
                                 continue;
                             }
                             let path = std::path::Path::new(parts[2]);
-                            match std::fs::read(path) {
+                            match read_local_media_file(path) {
                                 Ok(data) => {
                                     let mime = match path.extension().and_then(|e| e.to_str()) {
                                         Some("ogg") | Some("opus") => "audio/ogg; codecs=opus",
@@ -275,7 +294,7 @@ async fn main() -> Result<()> {
                                 continue;
                             }
                             let path = std::path::Path::new(parts[2]);
-                            match std::fs::read(path) {
+                            match read_local_media_file(path) {
                                 Ok(data) => {
                                     let mime = match path.extension().and_then(|e| e.to_str()) {
                                         Some("webm") => "video/webm",
@@ -304,7 +323,7 @@ async fn main() -> Result<()> {
                                 .file_name()
                                 .and_then(|n| n.to_str())
                                 .unwrap_or("file");
-                            match std::fs::read(path) {
+                            match read_local_media_file(path) {
                                 Ok(data) => {
                                     let mime = match path.extension().and_then(|e| e.to_str()) {
                                         Some("pdf") => "application/pdf",
@@ -368,13 +387,33 @@ async fn main() -> Result<()> {
                                 Err(e) => println!("!! react failed: {e}"),
                             }
                         }
+                        "unreact" => {
+                            // unreact <jid> <msg_id> [from_me] [sender_jid]
+                            let react_parts: Vec<&str> = line.splitn(5, ' ').collect();
+                            if react_parts.len() < 3 {
+                                println!("usage: unreact <jid> <msg_id> [from_me=true] [sender_jid]");
+                                continue;
+                            }
+                            let from_me = react_parts
+                                .get(3)
+                                .map(|v| *v != "false" && *v != "0")
+                                .unwrap_or(true);
+                            let sender_jid = react_parts.get(4).copied();
+                            match bridge_for_repl
+                                .remove_reaction(react_parts[1], react_parts[2], sender_jid, from_me)
+                                .await
+                            {
+                                Ok(()) => println!(">> reaction removed (from_me={})", from_me),
+                                Err(e) => println!("!! unreact failed: {e}"),
+                            }
+                        }
                         "sticker" | "stk" => {
                             if parts.len() < 3 {
                                 println!("usage: sticker <jid> <path>");
                                 continue;
                             }
                             let path = std::path::Path::new(parts[2]);
-                            match std::fs::read(path) {
+                            match read_local_media_file(path) {
                                 Ok(data) => {
                                     match bridge_for_repl
                                         .send_sticker(parts[1], data, "image/webp", false)
@@ -394,7 +433,7 @@ async fn main() -> Result<()> {
                                 continue;
                             }
                             let path = std::path::Path::new(vo_parts[2]);
-                            match std::fs::read(path) {
+                            match read_local_media_file(path) {
                                 Ok(data) => {
                                     let mime = match path.extension().and_then(|e| e.to_str()) {
                                         Some("png") => "image/png",
@@ -421,7 +460,7 @@ async fn main() -> Result<()> {
                                 continue;
                             }
                             let path = std::path::Path::new(vo_parts[2]);
-                            match std::fs::read(path) {
+                            match read_local_media_file(path) {
                                 Ok(data) => {
                                     let mime = match path.extension().and_then(|e| e.to_str()) {
                                         Some("webm") => "video/webm",
@@ -902,6 +941,20 @@ async fn cli_main(args: &[String]) -> Result<()> {
             print_json_result(status, &resp)?;
             Ok(())
         }
+        "unreact" => {
+            require_args(args, 3, "unreact <jid> <msg_id> [from_me] [sender_jid]")?;
+            let (from_me, sender_jid) = parse_cli_react_args_without_emoji(args)?;
+            let body = json!({
+                "jid": args[1],
+                "id": args[2],
+                "from_me": from_me,
+                "sender_jid": sender_jid,
+            })
+            .to_string();
+            let (status, resp) = api::cli_post(port, "/api/unreact", &body).await?;
+            print_json_result(status, &resp)?;
+            Ok(())
+        }
         "image" => {
             require_args(args, 3, "image <jid> <path> [caption]")?;
             let caption = if args.len() > 3 { Some(args[3..].join(" ")) } else { None };
@@ -1021,6 +1074,20 @@ fn parse_cli_react_args(args: &[String]) -> Result<(bool, Option<String>)> {
     }
 }
 
+fn parse_cli_react_args_without_emoji(args: &[String]) -> Result<(bool, Option<String>)> {
+    if args.len() > 5 {
+        anyhow::bail!("usage: whatsrust unreact <jid> <msg_id> [from_me] [sender_jid]");
+    }
+
+    match args.get(3) {
+        None => Ok((true, None)),
+        Some(extra) => match parse_boolish(extra) {
+            Some(from_me) => Ok((from_me, args.get(4).cloned())),
+            None => Ok((false, Some(extra.clone()))),
+        },
+    }
+}
+
 /// Print JSON response and return error if `ok` field is false.
 fn print_json_result(status: u16, body: &[u8]) -> Result<()> {
     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
@@ -1054,6 +1121,7 @@ fn print_cli_help() {
     println!("  whatsrust reply <jid> <id> <sender> <text>  Reply to a message");
     println!("  whatsrust edit <jid> <id> <text>       Edit a sent message");
     println!("  whatsrust react <jid> <id> <emoji> [from_me] [sender_jid]  React to a message");
+    println!("  whatsrust unreact <jid> <id> [from_me] [sender_jid]  Remove a reaction");
     println!("  whatsrust image <jid> <path> [caption] Send image");
     println!("  whatsrust video <jid> <path> [caption] Send video");
     println!("  whatsrust audio <jid> <path>           Send voice note");
@@ -1068,6 +1136,7 @@ fn print_cli_help() {
     println!("  WHATSRUST_PORT   API port (default: 7270, fallback: HEALTH_PORT)");
     println!("  WHATSRUST_BIND   API bind address (default: 127.0.0.1)");
     println!("  WHATSRUST_ALLOW_REMOTE=1  Permit non-loopback API binds");
+    println!("  WHATSRUST_API_TOKEN  Optional API bearer token; required for remote binds");
     println!();
     println!("JID FORMAT:");
     println!("  Phone number: 15551234567 or 15551234567@s.whatsapp.net");
@@ -1116,6 +1185,19 @@ mod cli_tests {
             "alice@s.whatsapp.net".to_string(),
         ];
         let (from_me, sender_jid) = parse_cli_react_args(&args).unwrap();
+        assert!(!from_me);
+        assert_eq!(sender_jid.as_deref(), Some("alice@s.whatsapp.net"));
+    }
+
+    #[test]
+    fn test_parse_cli_react_args_without_emoji_sender_implies_not_from_me() {
+        let args = vec![
+            "unreact".to_string(),
+            "chat".to_string(),
+            "msg".to_string(),
+            "alice@s.whatsapp.net".to_string(),
+        ];
+        let (from_me, sender_jid) = parse_cli_react_args_without_emoji(&args).unwrap();
         assert!(!from_me);
         assert_eq!(sender_jid.as_deref(), Some("alice@s.whatsapp.net"));
     }

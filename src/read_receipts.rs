@@ -3,7 +3,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 
 use whatsapp_rust::Client;
@@ -17,7 +17,10 @@ pub enum ReadReceiptCmd {
         message_id: String,
     },
     /// Force-flush all pending receipts for a chat (call before replying).
-    FlushChat(String),
+    FlushChat {
+        chat_jid: String,
+        ack: oneshot::Sender<()>,
+    },
     /// Update the client handle (on reconnect).
     SetClient(Option<Arc<Client>>),
     /// Shutdown.
@@ -30,7 +33,7 @@ impl std::fmt::Debug for ReadReceiptCmd {
             Self::Seen { chat_jid, message_id, .. } => {
                 f.debug_struct("Seen").field("chat", chat_jid).field("msg", message_id).finish()
             }
-            Self::FlushChat(c) => write!(f, "FlushChat({c})"),
+            Self::FlushChat { chat_jid, .. } => write!(f, "FlushChat({chat_jid})"),
             Self::SetClient(c) => write!(f, "SetClient({})", if c.is_some() { "Some" } else { "None" }),
             Self::Stop => write!(f, "Stop"),
         }
@@ -101,14 +104,14 @@ async fn run_scheduler(
                     Some(ReadReceiptCmd::Seen { chat_jid, participant_jid, message_id }) => {
                         pending.insert(chat_jid, participant_jid, message_id);
                     }
-                    Some(ReadReceiptCmd::FlushChat(chat)) => {
+                    Some(ReadReceiptCmd::FlushChat { chat_jid, ack }) => {
                         if let Some(ref c) = client {
-                            let flushed = pending.drain_chat(&chat);
+                            let flushed = pending.drain_chat(&chat_jid);
                             for ((chat_jid, participant), msg_ids) in flushed {
                                 send_receipt(c, &chat_jid, participant.as_deref(), msg_ids).await;
                             }
                         }
-                        // If no client, leave receipts pending — they'll flush on next tick after reconnect
+                        let _ = ack.send(());
                     }
                     Some(ReadReceiptCmd::SetClient(c)) => {
                         client = c;

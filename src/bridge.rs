@@ -763,10 +763,20 @@ impl WhatsAppBridge {
 
     /// Flush all pending read receipts for a chat (call before replying).
     pub async fn flush_read_receipts(&self, chat_jid: &str) -> Result<()> {
+        if get_client_handle(&self.client_handle).is_none() {
+            anyhow::bail!("not connected");
+        }
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         self.rr_tx
-            .send(ReadReceiptCmd::FlushChat(chat_jid.to_string()))
+            .send(ReadReceiptCmd::FlushChat {
+                chat_jid: chat_jid.to_string(),
+                ack: ack_tx,
+            })
             .await
-            .map_err(|e| anyhow::anyhow!("receipt scheduler closed: {e}"))
+            .map_err(|e| anyhow::anyhow!("receipt scheduler closed: {e}"))?;
+        ack_rx
+            .await
+            .map_err(|e| anyhow::anyhow!("receipt flush ack failed: {e}"))
     }
 
     pub async fn wait_stopped(&self, timeout: Duration) -> bool {
@@ -905,30 +915,37 @@ impl WhatsAppBridge {
         seconds: Option<u32>,
     ) -> Result<()> {
         let target = parse_jid(jid)?;
-        let _ = self.start_recording(jid).await;
         let client = get_client_handle(&self.client_handle).context("not connected")?;
+        let _ = client.chatstate().send_recording(&target).await;
         let upload = client
             .upload(data, MediaType::Audio)
             .await
-            .context("audio upload failed")?;
-        let msg = wa::Message {
-            audio_message: Some(Box::new(wa::message::AudioMessage {
-                mimetype: Some(mime.to_string()),
-                ptt: Some(true),
-                seconds,
-                url: Some(upload.url),
-                direct_path: Some(upload.direct_path),
-                media_key: Some(upload.media_key),
-                file_enc_sha256: Some(upload.file_enc_sha256),
-                file_sha256: Some(upload.file_sha256),
-                file_length: Some(upload.file_length),
-                ..Default::default()
-            })),
-            ..Default::default()
+            .context("audio upload failed");
+        let result = match upload {
+            Ok(upload) => {
+                let msg = wa::Message {
+                    audio_message: Some(Box::new(wa::message::AudioMessage {
+                        mimetype: Some(mime.to_string()),
+                        ptt: Some(true),
+                        seconds,
+                        url: Some(upload.url),
+                        direct_path: Some(upload.direct_path),
+                        media_key: Some(upload.media_key),
+                        file_enc_sha256: Some(upload.file_enc_sha256),
+                        file_sha256: Some(upload.file_sha256),
+                        file_length: Some(upload.file_length),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                };
+                self.send_direct_message(target.clone(), msg, "send audio failed")
+                    .await
+                    .map(|_| ())
+            }
+            Err(e) => Err(e),
         };
-        let result = self.send_direct_message(target, msg, "send audio failed").await;
-        let _ = self.stop_recording(jid).await;
-        result.map(|_| ())
+        let _ = client.chatstate().send_paused(&target).await;
+        result
     }
 
     /// Edit a previously sent message. Requires the message ID from send_message_with_id.
@@ -939,10 +956,12 @@ impl WhatsAppBridge {
             conversation: Some(new_text.to_string()),
             ..Default::default()
         };
+        self.send_pacer.wait_turn().await;
         client
             .edit_message(target, message_id.to_string(), new_content)
             .await
             .map_err(|e| anyhow::anyhow!("edit failed: {e}"))?;
+        self.metrics.record_sent();
         Ok(())
     }
 
@@ -950,6 +969,7 @@ impl WhatsAppBridge {
     pub async fn revoke_message(&self, jid: &str, message_id: &str) -> Result<()> {
         let target = parse_jid(jid)?;
         let client = get_client_handle(&self.client_handle).context("not connected")?;
+        self.send_pacer.wait_turn().await;
         client
             .revoke_message(
                 target,
@@ -958,6 +978,7 @@ impl WhatsAppBridge {
             )
             .await
             .map_err(|e| anyhow::anyhow!("revoke failed: {e}"))?;
+        self.metrics.record_sent();
         Ok(())
     }
 
@@ -1078,8 +1099,9 @@ impl WhatsAppBridge {
         target_is_from_me: bool,
     ) -> Result<()> {
         let target = parse_jid(chat_jid)?;
+        let target_str = target.to_string();
         // In group chats, participant must be set to the original sender's JID
-        let participant = if chat_jid.contains("@g.us") && !target_is_from_me {
+        let participant = if is_group_jid_str(&target_str) && !target_is_from_me {
             match target_sender_jid {
                 Some(s) => Some(s.to_string()),
                 None => return Err(anyhow::anyhow!(
@@ -1172,6 +1194,7 @@ impl WhatsAppBridge {
     ) -> Result<String> {
         let (question, options) = normalize_poll_spec(question, options, selectable_count)?;
         let target = parse_jid(jid)?;
+        let target_key = canonical_chat_key(&target);
 
         let enc_key = crate::polls::generate_poll_key();
         let poll_options: Vec<wa::message::poll_creation_message::Option> = options
@@ -1196,7 +1219,11 @@ impl WhatsAppBridge {
         let msg_id = self.send_direct_message(target, msg, "send poll failed").await?;
 
         // Store enc_key for decrypting incoming votes
-        if let Err(e) = self.store.store_poll_key(jid, &msg_id, &enc_key, &options).await {
+        if let Err(e) = self
+            .store
+            .store_poll_key(&target_key, &msg_id, &enc_key, &options)
+            .await
+        {
             warn!(error = %e, "failed to store outbound poll enc_key");
         }
 
@@ -1691,8 +1718,10 @@ async fn run_bot_session(
                             conversation: Some(row.payload.clone()),
                             ..Default::default()
                         };
+                        send_pacer.wait_turn().await;
                         match client.send_message(jid, msg).await {
                             Ok(_) => {
+                                metrics.record_sent();
                                 let _ = store.mark_outbound_sent(row.id).await;
                                 sent += 1;
                             }
@@ -2692,6 +2721,14 @@ fn parse_jid(s: &str) -> Result<Jid> {
         Jid::from_str(&format!("{normalized}@{server}"))
             .map_err(|e| anyhow::anyhow!("bad JID from phone: {e}"))
     }
+}
+
+fn canonical_chat_key(jid: &Jid) -> String {
+    jid.to_string()
+}
+
+fn is_group_jid_str(jid: &str) -> bool {
+    jid.ends_with("@g.us")
 }
 
 pub(crate) fn normalize_poll_spec(

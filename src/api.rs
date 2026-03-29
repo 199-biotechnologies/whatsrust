@@ -26,6 +26,7 @@ struct HttpRequest {
     method: String,
     path: String,
     query: Vec<(String, String)>,
+    headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
 
@@ -33,11 +34,19 @@ impl HttpRequest {
     fn query_get(&self, key: &str) -> Option<&str> {
         self.query.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
     }
+
+    fn header_get(&self, key: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(key))
+            .map(|(_, v)| v.as_str())
+    }
 }
 
 fn http_response(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
     let status_text = match status {
         200 => "OK",
+        401 => "Unauthorized",
         400 => "Bad Request",
         404 => "Not Found",
         500 => "Internal Server Error",
@@ -113,6 +122,23 @@ fn cli_connect_host(bind: &str) -> String {
     }
 }
 
+fn configured_api_token() -> Option<String> {
+    std::env::var("WHATSRUST_API_TOKEN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn request_has_api_token(req: &HttpRequest, expected_token: &str) -> bool {
+    req.header_get("x-api-token") == Some(expected_token)
+        || req
+            .header_get("authorization")
+            .and_then(|value| value.strip_prefix("Bearer "))
+            == Some(expected_token)
+}
+
+const MAX_MEDIA_READ_BYTES: u64 = 50 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // Request parsing
 // ---------------------------------------------------------------------------
@@ -163,12 +189,16 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<HttpRequest>
         (raw_path, Vec::new())
     };
 
-    // Parse Content-Length (case-insensitive)
+    // Parse headers
     let mut content_length = 0usize;
+    let mut headers = Vec::new();
     for line in lines {
-        let lower = line.to_ascii_lowercase();
-        if let Some(val) = lower.strip_prefix("content-length:") {
-            content_length = val.trim().parse().unwrap_or(0);
+        if let Some((name, value)) = line.split_once(':') {
+            let value = value.trim().to_string();
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = value.parse().unwrap_or(0);
+            }
+            headers.push((name.to_string(), value));
         }
     }
 
@@ -199,7 +229,13 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<HttpRequest>
         Vec::new()
     };
 
-    Some(HttpRequest { method, path, query, body })
+    Some(HttpRequest {
+        method,
+        path,
+        query,
+        headers,
+        body,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -221,6 +257,7 @@ async fn handle_request(bridge: &WhatsAppBridge, req: &HttpRequest) -> Vec<u8> {
         ("POST", "/api/reply") => handle_reply(bridge, &req.body).await,
         ("POST", "/api/edit") => handle_edit(bridge, &req.body).await,
         ("POST", "/api/react") => handle_react(bridge, &req.body).await,
+        ("POST", "/api/unreact") => handle_unreact(bridge, &req.body).await,
         ("POST", "/api/image") => handle_image(bridge, &req.body).await,
         ("POST", "/api/video") => handle_video(bridge, &req.body).await,
         ("POST", "/api/audio") => handle_audio(bridge, &req.body).await,
@@ -380,14 +417,19 @@ struct ReactReq {
     sender_jid: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct ReactionTargetReq {
+    jid: String,
+    id: String,
+    from_me: Option<bool>,
+    sender_jid: Option<String>,
+}
+
 async fn handle_react(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
     let req: ReactReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
     let from_me = req.from_me.unwrap_or(true);
     if req.emoji.is_empty() {
         return json_err(400, "emoji must not be empty");
-    }
-    if req.jid.contains("@g.us") && !from_me && req.sender_jid.as_deref().is_none() {
-        return json_err(400, "sender_jid is required for group reactions when from_me=false");
     }
     match bridge.send_reaction(
         &req.jid,
@@ -395,6 +437,19 @@ async fn handle_react(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
         req.sender_jid.as_deref(),
         &req.emoji,
         from_me,
+    ).await {
+        Ok(()) => json_ok_simple(),
+        Err(e) => json_err(500, &e.to_string()),
+    }
+}
+
+async fn handle_unreact(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+    let req: ReactionTargetReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
+    match bridge.remove_reaction(
+        &req.jid,
+        &req.id,
+        req.sender_jid.as_deref(),
+        req.from_me.unwrap_or(true),
     ).await {
         Ok(()) => json_ok_simple(),
         Err(e) => json_err(500, &e.to_string()),
@@ -411,7 +466,24 @@ struct MediaReq {
 }
 
 async fn read_file_for_media(path: &str) -> Result<Vec<u8>, Vec<u8>> {
-    tokio::fs::read(path).await
+    let meta = tokio::fs::metadata(path)
+        .await
+        .map_err(|e| json_err(400, &format!("cannot stat file {path}: {e}")))?;
+    if !meta.is_file() {
+        return Err(json_err(400, &format!("path is not a regular file: {path}")));
+    }
+    if meta.len() > MAX_MEDIA_READ_BYTES {
+        return Err(json_err(
+            400,
+            &format!(
+                "file exceeds size limit ({} bytes > {} bytes): {path}",
+                meta.len(),
+                MAX_MEDIA_READ_BYTES
+            ),
+        ));
+    }
+    tokio::fs::read(path)
+        .await
         .map_err(|e| json_err(400, &format!("cannot read file {path}: {e}")))
 }
 
@@ -588,6 +660,14 @@ pub async fn serve(bridge: Arc<WhatsAppBridge>, port: u16, cancel: CancellationT
         );
         return;
     }
+    let api_token = configured_api_token();
+    if !is_loopback_bind(&bind) && api_token.is_none() {
+        error!(
+            bind = %bind,
+            "refusing non-loopback API bind without WHATSRUST_API_TOKEN"
+        );
+        return;
+    }
     let listener = match TcpListener::bind((&*bind, port)).await {
         Ok(l) => {
             info!(bind = %bind, port = port, "API server listening");
@@ -604,6 +684,7 @@ pub async fn serve(bridge: Arc<WhatsAppBridge>, port: u16, cancel: CancellationT
             result = listener.accept() => {
                 let Ok((mut stream, _)) = result else { continue };
                 let bridge = bridge.clone();
+                let api_token = api_token.clone();
                 tokio::spawn(async move {
                     let req = match read_request(&mut stream).await {
                         Some(r) => r,
@@ -612,6 +693,12 @@ pub async fn serve(bridge: Arc<WhatsAppBridge>, port: u16, cancel: CancellationT
                             return;
                         }
                     };
+                    if let Some(expected_token) = api_token.as_deref() {
+                        if !request_has_api_token(&req, expected_token) {
+                            let _ = stream.write_all(&json_err(401, "unauthorized")).await;
+                            return;
+                        }
+                    }
                     let response = handle_request(&bridge, &req).await;
                     let _ = stream.write_all(&response).await;
                 });
@@ -628,9 +715,14 @@ pub async fn serve(bridge: Arc<WhatsAppBridge>, port: u16, cancel: CancellationT
 /// Send a GET request to the running daemon and return (status, body_bytes).
 pub async fn cli_get(port: u16, path: &str) -> anyhow::Result<(u16, Vec<u8>)> {
     let host = cli_connect_host(&api_bind_host());
+    let auth_header = configured_api_token()
+        .map(|token| format!("Authorization: Bearer {token}\r\n"))
+        .unwrap_or_default();
     let mut stream = tokio::net::TcpStream::connect((&*host, port)).await
         .map_err(|e| anyhow::anyhow!("cannot connect to whatsrust daemon on {host}:{port}: {e}\nIs the daemon running? Start it with: WHATSRUST_PORT={port} WHATSRUST_BIND={host} whatsrust"))?;
-    let req = format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\n{auth_header}Connection: close\r\n\r\n"
+    );
     stream.write_all(req.as_bytes()).await?;
     stream.shutdown().await?;
 
@@ -644,10 +736,13 @@ pub async fn cli_get(port: u16, path: &str) -> anyhow::Result<(u16, Vec<u8>)> {
 /// Send a POST request with JSON body to the running daemon.
 pub async fn cli_post(port: u16, path: &str, body: &str) -> anyhow::Result<(u16, Vec<u8>)> {
     let host = cli_connect_host(&api_bind_host());
+    let auth_header = configured_api_token()
+        .map(|token| format!("Authorization: Bearer {token}\r\n"))
+        .unwrap_or_default();
     let mut stream = tokio::net::TcpStream::connect((&*host, port)).await
         .map_err(|e| anyhow::anyhow!("cannot connect to whatsrust daemon on {host}:{port}: {e}\nIs the daemon running? Start it with: WHATSRUST_PORT={port} WHATSRUST_BIND={host} whatsrust"))?;
     let req = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{auth_header}Connection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(req.as_bytes()).await?;
@@ -698,5 +793,20 @@ mod tests {
         assert_eq!(cli_connect_host("0.0.0.0"), "127.0.0.1");
         assert_eq!(cli_connect_host("::"), "::1");
         assert_eq!(cli_connect_host("192.168.1.10"), "192.168.1.10");
+    }
+
+    #[test]
+    fn test_request_has_api_token_accepts_bearer_and_header() {
+        let req = HttpRequest {
+            method: "GET".into(),
+            path: "/".into(),
+            query: Vec::new(),
+            headers: vec![
+                ("Authorization".into(), "Bearer secret".into()),
+                ("X-API-Token".into(), "secret".into()),
+            ],
+            body: Vec::new(),
+        };
+        assert!(request_has_api_token(&req, "secret"));
     }
 }
