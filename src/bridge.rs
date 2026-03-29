@@ -490,8 +490,46 @@ impl Default for BridgeConfig {
 // WhatsAppBridge — public handle for the consumer
 // ---------------------------------------------------------------------------
 
-/// Cached raw messages for forward_message lookup.
-type MsgCache = Arc<ParkingMutex<HashMap<String, Box<wa::Message>>>>;
+/// Simple bounded LRU cache for forward_message lookup.
+/// Evicts the oldest entry on insert at capacity (not clear-all).
+struct BoundedMsgCache {
+    map: HashMap<String, Box<wa::Message>>,
+    order: std::collections::VecDeque<String>,
+    capacity: usize,
+}
+
+impl BoundedMsgCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            map: HashMap::with_capacity(capacity),
+            order: std::collections::VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    fn insert(&mut self, id: String, msg: Box<wa::Message>) {
+        if self.map.contains_key(&id) {
+            // Already cached — update in place, don't grow order
+            self.map.insert(id, msg);
+            return;
+        }
+        while self.map.len() >= self.capacity {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            } else {
+                break;
+            }
+        }
+        self.order.push_back(id.clone());
+        self.map.insert(id, msg);
+    }
+
+    fn get(&self, id: &str) -> Option<&Box<wa::Message>> {
+        self.map.get(id)
+    }
+}
+
+type MsgCache = Arc<ParkingMutex<BoundedMsgCache>>;
 
 pub struct WhatsAppBridge {
     #[allow(dead_code)] // Used by bot integrations via the outbound channel
@@ -522,7 +560,7 @@ impl WhatsAppBridge {
         let client_handle: Arc<ParkingMutex<Option<Arc<Client>>>> =
             Arc::new(ParkingMutex::new(None));
         let rr_tx = spawn_scheduler(None, 200);
-        let msg_cache: MsgCache = Arc::new(ParkingMutex::new(HashMap::new()));
+        let msg_cache: MsgCache = Arc::new(ParkingMutex::new(BoundedMsgCache::new(MSG_CACHE_CAP)));
         let send_pacer = Arc::new(SendPacer::new(config.min_send_interval_ms));
 
         // Open store early so bridge methods can access it (e.g. poll key storage)
@@ -1882,12 +1920,9 @@ async fn handle_event(
                 flags.is_view_once = true;
             }
 
-            // Cache the raw message for forward_message lookup
+            // Cache the raw message for forward_message lookup (LRU eviction)
             {
                 let mut cache = msg_cache.lock();
-                if cache.len() >= MSG_CACHE_CAP {
-                    cache.clear();
-                }
                 cache.insert(info.id.clone(), Box::new((*msg).clone()));
             }
 
