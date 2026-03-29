@@ -2003,13 +2003,13 @@ async fn handle_event(
             // Skip noise JIDs: status broadcasts, newsletter channels, server messages
             let chat_str = info.source.chat.to_string();
             if should_ignore_jid(&chat_str) {
-                debug!(chat = %chat_str, "ignoring message from filtered JID");
+                info!(chat = %chat_str, "ignoring message from filtered JID");
                 return;
             }
 
             // Atomic dedup: try_admit returns true if this caller won the race.
             if !dedup.try_admit(&info.id) {
-                debug!(id = %info.id, "duplicate message, skipping");
+                info!(id = %info.id, "duplicate message, skipping");
                 return;
             }
 
@@ -2022,7 +2022,7 @@ async fn handle_event(
                 && !allowed_numbers.iter().any(|n| n == &sender)
             {
                 dedup.mark_done(&info.id);
-                debug!(sender = %sender, "message from non-allowed sender, skipping");
+                info!(sender = %sender, raw = %sender_raw, "message from non-allowed sender, skipping");
                 return;
             }
 
@@ -2771,8 +2771,21 @@ async fn extract_content_inner(
                 let ct = vote_enc.enc_payload.clone().unwrap_or_default();
                 let iv = vote_enc.enc_iv.clone().unwrap_or_default();
 
-                // Look up stored enc_key
-                if let Ok(Some((enc_key, option_names))) = store.get_poll_key(&chat_jid, &poll_id).await {
+                // Look up stored enc_key — try exact match first, then try
+                // resolved PN/LID alternate form (handles re-pairing JID changes)
+                let poll_key_result = match store.get_poll_key(&chat_jid, &poll_id).await {
+                    Ok(Some(key)) => Some(key),
+                    _ => {
+                        // Try alternate JID form: resolve LID→PN or PN→LID
+                        let alt = resolve_alternate_chat_jid(&chat_jid, store).await;
+                        if let Some(ref alt_jid) = alt {
+                            store.get_poll_key(alt_jid, &poll_id).await.ok().flatten()
+                        } else {
+                            None
+                        }
+                    }
+                };
+                if let Some((enc_key, option_names)) = poll_key_result {
                     let voter_jid = select_poll_voter_jid(sender_jid, poll_key.participant.as_deref());
 
                     match crate::polls::decrypt_poll_vote(&enc_key, &poll_id, &voter_jid, &ct, &iv) {
@@ -2848,23 +2861,48 @@ async fn extract_content_inner(
 // LID-to-phone sender resolution
 // ---------------------------------------------------------------------------
 
+/// Try to find the alternate form of a chat JID (PN→LID or LID→PN).
+/// Used for poll key lookups that may have been stored under a different JID format.
+async fn resolve_alternate_chat_jid(chat_jid: &str, store: &Store) -> Option<String> {
+    let (user_part, server) = chat_jid.split_once('@')?;
+    let bare_user = user_part.split(':').next().unwrap_or(user_part);
+
+    if server == "lid" {
+        // LID → try to find PN
+        if let Ok(Some(entry)) = store.get_lid_mapping(bare_user).await {
+            return Some(format!("{}@s.whatsapp.net", entry.phone_number));
+        }
+    } else if server == "s.whatsapp.net" {
+        // PN → try to find LID
+        if let Ok(Some(entry)) = store.get_pn_mapping(bare_user).await {
+            return Some(format!("{}@lid", entry.lid));
+        }
+    }
+    None
+}
+
 /// Resolve a sender JID to a phone number using the LID mapping table.
 /// Falls back to the raw JID string if no mapping exists.
+///
+/// Handles device-qualified LIDs like `100000000000001.1:75@lid` by stripping
+/// the device suffix (`:75`) before lookup, since lid_pn_mapping stores bare LIDs.
 async fn resolve_sender(sender_raw: &str, store: &Store) -> String {
     // Extract the user part (before @)
     let user_part = sender_raw
         .split('@')
         .next()
-        .unwrap_or(sender_raw)
-        .to_string();
+        .unwrap_or(sender_raw);
 
-    // Try LID → phone lookup
-    if let Ok(Some(entry)) = store.get_lid_mapping(&user_part).await {
+    // Strip device suffix (:N) for LID lookup — lid_pn_mapping uses bare LIDs
+    let bare_lid = user_part.split(':').next().unwrap_or(user_part);
+
+    // Try LID → phone lookup (bare LID without device suffix)
+    if let Ok(Some(entry)) = store.get_lid_mapping(bare_lid).await {
         return entry.phone_number;
     }
 
-    // Already a phone number or no mapping — return as-is
-    user_part
+    // Already a phone number or no mapping — return user part as-is
+    user_part.to_string()
 }
 
 // ---------------------------------------------------------------------------
