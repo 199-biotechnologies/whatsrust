@@ -262,6 +262,13 @@ pub enum InboundContent {
         poll_id: String,
         selected_options: Vec<String>,
     },
+    /// Delivery receipt for outbound messages (sent/delivered/read/played).
+    DeliveryReceipt {
+        message_ids: Vec<String>,
+        status: crate::bridge_events::DeliveryStatus,
+        chat_jid: String,
+        sender: String,
+    },
 }
 
 impl InboundContent {
@@ -282,6 +289,7 @@ impl InboundContent {
             Self::Revoke { .. } => "revoke",
             Self::PollCreated { .. } => "poll",
             Self::PollVote { .. } => "poll-vote",
+            Self::DeliveryReceipt { .. } => "delivery-receipt",
         }
     }
 
@@ -340,6 +348,9 @@ impl InboundContent {
             }
             Self::PollVote { poll_id, selected_options } => {
                 format!("[vote on {poll_id}: {}]", selected_options.join(", "))
+            }
+            Self::DeliveryReceipt { message_ids, status, .. } => {
+                format!("[receipt: {status:?} for {} message(s)]", message_ids.len())
             }
         }
     }
@@ -1624,6 +1635,7 @@ async fn run_bot_session(
     let metrics_for_events = metrics.clone();
     let msg_cache_for_events = msg_cache.clone();
     let sub_pres_for_events = subscribed_presence.clone();
+    let event_tx_for_events = event_tx.clone();
     // Track previous QR terminal height for in-place overwrite on refresh
     let prev_qr_lines = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
@@ -1649,8 +1661,9 @@ async fn run_bot_session(
             let met = metrics_for_events.clone();
             let mc = msg_cache_for_events.clone();
             let spres = sub_pres_for_events.clone();
+            let etx = event_tx_for_events.clone();
             async move {
-                handle_event(event, client, &ch, &itx, &stx, &qtx, &store, &sr, auto_mark_read, &allowed, &dedup, &bid, &dl_sem, &rr, &ptx, &pql, &met, &mc, &spres)
+                handle_event(event, client, &ch, &itx, &stx, &qtx, &store, &sr, auto_mark_read, &allowed, &dedup, &bid, &dl_sem, &rr, &ptx, &pql, &met, &mc, &spres, &etx)
                     .await;
             }
         });
@@ -1789,6 +1802,7 @@ async fn handle_event(
     metrics: &Arc<BridgeMetrics>,
     msg_cache: &MsgCache,
     subscribed_presence: &Arc<DashSet<String>>,
+    event_tx: &tokio::sync::broadcast::Sender<Arc<crate::bridge_events::BridgeEvent>>,
 ) {
     match event {
         Event::PairingQrCode { code, .. } => {
@@ -2065,13 +2079,92 @@ async fn handle_event(
             );
         }
         Event::Receipt(receipt) => {
+            use wacore::types::presence::ReceiptType;
+            use crate::bridge_events::DeliveryStatus;
+
+            // Filter HistorySync receipts — not useful for live status
+            if matches!(receipt.r#type, ReceiptType::HistorySync) {
+                debug!("ignoring HistorySync receipt");
+                return;
+            }
+
+            let status = match receipt.r#type {
+                ReceiptType::Delivered => DeliveryStatus::Delivered,
+                ReceiptType::Read | ReceiptType::ReadSelf => DeliveryStatus::Read,
+                ReceiptType::Played | ReceiptType::PlayedSelf => DeliveryStatus::Played,
+                ReceiptType::Sender => DeliveryStatus::Sent,
+                ReceiptType::ServerError => DeliveryStatus::Failed,
+                _ => DeliveryStatus::Unknown,
+            };
+
+            let chat_jid = receipt.source.chat.to_string();
+            let sender = receipt.source.sender.to_string();
+            let msg_ids: Vec<String> = receipt.message_ids.iter().map(|id| id.to_string()).collect();
+
             info!(
                 receipt_type = ?receipt.r#type,
-                message_ids = ?receipt.message_ids,
-                chat = %receipt.source.chat,
-                sender = %receipt.source.sender,
-                "receipt"
+                status = ?status,
+                message_count = msg_ids.len(),
+                chat = %chat_jid,
+                sender = %sender,
+                "delivery receipt"
             );
+
+            // Update delivery status for queued jobs by WA message ID
+            let status_str = serde_json::to_value(&status)
+                .ok()
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                .unwrap_or_else(|| format!("{status:?}").to_lowercase());
+            for wa_id in &msg_ids {
+                if let Err(e) = store.update_delivery_status(wa_id, &status_str).await {
+                    debug!(error = %e, wa_id = %wa_id, "no job row for delivery status update (not an error for non-bot messages)");
+                }
+            }
+
+            // Map to OutboundJobState for event bus updates on matching jobs
+            let job_state = match status {
+                DeliveryStatus::Delivered => Some(crate::bridge_events::OutboundJobState::Delivered),
+                DeliveryStatus::Read => Some(crate::bridge_events::OutboundJobState::Read),
+                DeliveryStatus::Played => Some(crate::bridge_events::OutboundJobState::Played),
+                _ => None,
+            };
+            if let Some(state) = job_state {
+                for wa_id in &msg_ids {
+                    // Emit status event (job_id 0 since we only have wa_message_id here)
+                    let _ = event_tx.send(Arc::new(crate::bridge_events::BridgeEvent::OutboundStatus(
+                        crate::bridge_events::OutboundStatusEvent {
+                            job_id: 0,
+                            state,
+                            wa_message_id: Some(wa_id.clone()),
+                            error: None,
+                        },
+                    )));
+                }
+            }
+
+            // Create synthetic inbound message for consumers
+            let inbound = WhatsAppInbound {
+                bridge_id: bridge_id.to_string(),
+                jid: chat_jid.clone(),
+                id: msg_ids.first().cloned().unwrap_or_default(),
+                sender: sender.clone(),
+                sender_raw: sender.clone(),
+                timestamp: receipt.timestamp.timestamp(),
+                content: InboundContent::DeliveryReceipt {
+                    message_ids: msg_ids,
+                    status,
+                    chat_jid,
+                    sender,
+                },
+                reply_to: None,
+                is_from_me: true, // receipts are always about our own outbound messages
+                flags: MessageFlags::default(),
+            };
+            let inbound_arc = Arc::new(inbound.clone());
+            let _ = event_tx.send(Arc::new(crate::bridge_events::BridgeEvent::Inbound(inbound_arc)));
+            if inbound_tx.send(inbound).await.is_err() {
+                warn!("inbound channel closed — receipt dropped");
+            }
         }
         Event::DeviceListUpdate(update) => {
             info!(
