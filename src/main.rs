@@ -1090,6 +1090,69 @@ async fn cli_main(args: &[String]) -> Result<()> {
             print_json_result(status, &resp)?;
             Ok(())
         }
+        "group-create" => {
+            require_args(args, 3, "group-create <name> <participant1> [participant2] ...")?;
+            let body = json!({"name": args[1], "participants": &args[2..]}).to_string();
+            let (status, resp) = api::cli_post(port, "/api/group-create", &body).await?;
+            print_json_result(status, &resp)?;
+            Ok(())
+        }
+        "group-subject" | "group-rename" => {
+            require_args(args, 3, "group-subject <jid> <subject>")?;
+            let body = json!({"jid": args[1], "subject": args[2..].join(" ")}).to_string();
+            let (status, resp) = api::cli_post(port, "/api/group-subject", &body).await?;
+            print_json_result(status, &resp)?;
+            Ok(())
+        }
+        "group-desc" | "group-description" => {
+            require_args(args, 2, "group-desc <jid> [description]")?;
+            let desc = if args.len() > 2 { Some(args[2..].join(" ")) } else { None };
+            let body = json!({"jid": args[1], "description": desc}).to_string();
+            let (status, resp) = api::cli_post(port, "/api/group-description", &body).await?;
+            print_json_result(status, &resp)?;
+            Ok(())
+        }
+        "group-leave" => {
+            require_args(args, 2, "group-leave <jid>")?;
+            let body = json!({"jid": args[1]}).to_string();
+            let (status, resp) = api::cli_post(port, "/api/group-leave", &body).await?;
+            print_json_result(status, &resp)?;
+            Ok(())
+        }
+        "group-invite" | "group-invite-link" => {
+            require_args(args, 2, "group-invite <jid>")?;
+            let (status, resp) = api::cli_get(port, &format!("/api/group-invite-link?jid={}", args[1])).await?;
+            print_json_result(status, &resp)?;
+            Ok(())
+        }
+        "group-add" => {
+            require_args(args, 3, "group-add <jid> <participant1> [participant2] ...")?;
+            let body = json!({"jid": args[1], "participants": &args[2..]}).to_string();
+            let (status, resp) = api::cli_post(port, "/api/group-add", &body).await?;
+            print_json_result(status, &resp)?;
+            Ok(())
+        }
+        "group-remove" => {
+            require_args(args, 3, "group-remove <jid> <participant1> [participant2] ...")?;
+            let body = json!({"jid": args[1], "participants": &args[2..]}).to_string();
+            let (status, resp) = api::cli_post(port, "/api/group-remove", &body).await?;
+            print_json_result(status, &resp)?;
+            Ok(())
+        }
+        "group-promote" => {
+            require_args(args, 3, "group-promote <jid> <participant1> [participant2] ...")?;
+            let body = json!({"jid": args[1], "participants": &args[2..]}).to_string();
+            let (status, resp) = api::cli_post(port, "/api/group-promote", &body).await?;
+            print_json_result(status, &resp)?;
+            Ok(())
+        }
+        "group-demote" => {
+            require_args(args, 3, "group-demote <jid> <participant1> [participant2] ...")?;
+            let body = json!({"jid": args[1], "participants": &args[2..]}).to_string();
+            let (status, resp) = api::cli_post(port, "/api/group-demote", &body).await?;
+            print_json_result(status, &resp)?;
+            Ok(())
+        }
         _ => {
             eprintln!("unknown command: {cmd}");
             print_cli_help();
@@ -1195,6 +1258,15 @@ fn print_cli_help() {
     println!("  whatsrust typing <jid>                 Send typing indicator");
     println!("  whatsrust stop-typing <jid>            Clear typing indicator");
     println!("  whatsrust subscribe <jid>              Subscribe to presence updates");
+    println!("  whatsrust group-create <name> <jid>... Create group with participants");
+    println!("  whatsrust group-subject <jid> <subj>   Set group subject/name");
+    println!("  whatsrust group-desc <jid> [desc]      Set/clear group description");
+    println!("  whatsrust group-leave <jid>            Leave a group");
+    println!("  whatsrust group-invite <jid>           Get group invite link");
+    println!("  whatsrust group-add <jid> <jid>...     Add participants to group");
+    println!("  whatsrust group-remove <jid> <jid>...  Remove participants from group");
+    println!("  whatsrust group-promote <jid> <jid>... Promote participants to admin");
+    println!("  whatsrust group-demote <jid> <jid>...  Demote admins to regular");
     println!();
     println!("ENVIRONMENT:");
     println!("  WHATSRUST_PORT   API port (default: 7270, fallback: HEALTH_PORT)");

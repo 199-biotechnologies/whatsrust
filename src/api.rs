@@ -296,6 +296,17 @@ async fn handle_request(bridge: &WhatsAppBridge, req: &HttpRequest, is_loopback:
         ("POST", "/api/stop-typing") => handle_jid_action(bridge, &req.body, JidAction::StopTyping).await,
         ("POST", "/api/subscribe-presence") => handle_jid_action(bridge, &req.body, JidAction::SubscribePresence).await,
 
+        // Group management
+        ("POST", "/api/group-create") => handle_group_create(bridge, &req.body).await,
+        ("POST", "/api/group-subject") => handle_group_subject(bridge, &req.body).await,
+        ("POST", "/api/group-description") => handle_group_description(bridge, &req.body).await,
+        ("POST", "/api/group-leave") => handle_jid_action(bridge, &req.body, JidAction::GroupLeave).await,
+        ("GET", "/api/group-invite-link") => handle_group_invite_link(bridge, req).await,
+        ("POST", "/api/group-add") => handle_group_participants(bridge, &req.body, ParticipantAction::Add).await,
+        ("POST", "/api/group-remove") => handle_group_participants(bridge, &req.body, ParticipantAction::Remove).await,
+        ("POST", "/api/group-promote") => handle_group_participants(bridge, &req.body, ParticipantAction::Promote).await,
+        ("POST", "/api/group-demote") => handle_group_participants(bridge, &req.body, ParticipantAction::Demote).await,
+
         _ => json_err(404, "not found"),
     }
 }
@@ -500,7 +511,7 @@ async fn handle_revoke(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
 
 // --- Simple JID-only actions (typing, presence) ---
 
-enum JidAction { StartTyping, StopTyping, SubscribePresence }
+enum JidAction { StartTyping, StopTyping, SubscribePresence, GroupLeave }
 
 #[derive(Deserialize)]
 struct JidReq {
@@ -513,10 +524,98 @@ async fn handle_jid_action(bridge: &WhatsAppBridge, body: &[u8], action: JidActi
         JidAction::StartTyping => bridge.start_typing(&req.jid).await,
         JidAction::StopTyping => bridge.stop_typing(&req.jid).await,
         JidAction::SubscribePresence => bridge.subscribe_presence(&req.jid).await,
+        JidAction::GroupLeave => bridge.leave_group(&req.jid).await,
     };
     match result {
         Ok(()) => json_ok_simple(),
         Err(e) => json_err(500, &e.to_string()),
+    }
+}
+
+// --- Group management ---
+
+#[derive(Deserialize)]
+struct GroupCreateReq {
+    name: String,
+    participants: Vec<String>,
+}
+
+async fn handle_group_create(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+    let req: GroupCreateReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
+    let parts: Vec<&str> = req.participants.iter().map(|s| s.as_str()).collect();
+    match bridge.create_group(&req.name, &parts).await {
+        Ok(gid) => json_ok(json!({"group_jid": gid})),
+        Err(e) => json_err(500, &e.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct GroupSubjectReq {
+    jid: String,
+    subject: String,
+}
+
+async fn handle_group_subject(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+    let req: GroupSubjectReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
+    match bridge.set_group_subject(&req.jid, &req.subject).await {
+        Ok(()) => json_ok_simple(),
+        Err(e) => json_err(500, &e.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct GroupDescriptionReq {
+    jid: String,
+    description: Option<String>,
+}
+
+async fn handle_group_description(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+    let req: GroupDescriptionReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
+    match bridge.set_group_description(&req.jid, req.description.as_deref()).await {
+        Ok(()) => json_ok_simple(),
+        Err(e) => json_err(500, &e.to_string()),
+    }
+}
+
+async fn handle_group_invite_link(bridge: &WhatsAppBridge, req: &HttpRequest) -> Vec<u8> {
+    let jid = match req.query_get("jid") {
+        Some(j) => j,
+        None => return json_err(400, "missing jid query parameter"),
+    };
+    match bridge.get_group_invite_link(jid).await {
+        Ok(link) => json_ok(json!({"link": link})),
+        Err(e) => json_err(500, &e.to_string()),
+    }
+}
+
+enum ParticipantAction { Add, Remove, Promote, Demote }
+
+#[derive(Deserialize)]
+struct GroupParticipantsReq {
+    jid: String,
+    participants: Vec<String>,
+}
+
+async fn handle_group_participants(bridge: &WhatsAppBridge, body: &[u8], action: ParticipantAction) -> Vec<u8> {
+    let req: GroupParticipantsReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
+    let parts: Vec<&str> = req.participants.iter().map(|s| s.as_str()).collect();
+    match action {
+        ParticipantAction::Add => match bridge.add_participants(&req.jid, &parts).await {
+            Ok(_results) => json_ok_simple(),
+            Err(e) => json_err(500, &e.to_string()),
+        },
+        ParticipantAction::Remove => match bridge.remove_participants(&req.jid, &parts).await {
+            Ok(_results) => json_ok_simple(),
+            Err(e) => json_err(500, &e.to_string()),
+        },
+        ParticipantAction::Promote => match bridge.promote_participants(&req.jid, &parts).await {
+            Ok(()) => json_ok_simple(),
+            Err(e) => json_err(500, &e.to_string()),
+        },
+        ParticipantAction::Demote => match bridge.demote_participants(&req.jid, &parts).await {
+            Ok(()) => json_ok_simple(),
+            Err(e) => json_err(500, &e.to_string()),
+        },
     }
 }
 
