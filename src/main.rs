@@ -31,6 +31,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use bridge::{BridgeConfig, WhatsAppBridge};
+use whatsrust::mcp;
 
 const MAX_LOCAL_MEDIA_READ_BYTES: u64 = 50 * 1024 * 1024;
 
@@ -1198,6 +1199,11 @@ async fn cli_main(args: &[String]) -> Result<()> {
             api::cli_stream_sse(port).await?;
             Ok(())
         }
+        "mcp" => {
+            // MCP server mode — JSON-RPC over stdin/stdout, proxies to HTTP daemon
+            mcp::run_mcp_server(port);
+            Ok(())
+        }
         "history" => {
             require_args(args, 2, "history <jid> [limit]")?;
             let limit = args.get(2).and_then(|v| v.parse::<i64>().ok()).unwrap_or(20);
@@ -1330,6 +1336,7 @@ fn print_cli_help() {
     println!("  whatsrust group-promote <jid> <jid>... Promote participants to admin");
     println!("  whatsrust group-demote <jid> <jid>...  Demote admins to regular");
     println!("  whatsrust events                       Stream SSE events (inbound + status)");
+    println!("  whatsrust mcp                          MCP server (JSON-RPC over stdio)");
     println!("  whatsrust history <jid> [limit]        Recent messages for a chat");
     println!("  whatsrust search <query> [jid]         Search message history");
     println!();

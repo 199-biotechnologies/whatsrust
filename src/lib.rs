@@ -3,6 +3,7 @@ pub mod bridge;
 pub mod bridge_events;
 pub mod dedup;
 pub mod instance_lock;
+pub mod mcp;
 pub mod outbound;
 pub mod polls;
 pub mod qr;
