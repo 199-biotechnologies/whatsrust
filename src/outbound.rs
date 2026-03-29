@@ -163,6 +163,321 @@ pub struct OutboundJobRow {
     pub retries: i32,
 }
 
+/// Outcome of executing an outbound job.
+pub struct ExecOutcome {
+    /// WhatsApp message ID (from send_message, edit_message, or revoke_message).
+    pub wa_message_id: Option<String>,
+    /// Additional side effects (e.g. poll key storage).
+    pub poll_key: Option<PollKeyInfo>,
+}
+
+/// Poll key + options to store after send for vote decryption.
+pub struct PollKeyInfo {
+    pub enc_key: Vec<u8>,
+    pub options: Vec<String>,
+}
+
+/// Build and send a wa::Message from a job row. Returns the WA message ID if applicable.
+///
+/// Media ops upload bytes to WhatsApp servers before sending. Edit/revoke use
+/// specialised client methods. All other ops build a `wa::Message` and call
+/// `client.send_message()`.
+pub async fn execute_job(
+    row: &OutboundJobRow,
+    target: &wacore_binary::jid::Jid,
+    client: &std::sync::Arc<whatsapp_rust::Client>,
+) -> anyhow::Result<ExecOutcome> {
+    use whatsapp_rust::download::MediaType;
+    use waproto::whatsapp as wa;
+
+    let kind = OutboundOpKind::from_str(&row.op_kind)
+        .ok_or_else(|| anyhow::anyhow!("unknown op_kind: {}", row.op_kind))?;
+
+    match kind {
+        OutboundOpKind::Text => {
+            let p: TextPayload = serde_json::from_str(&row.payload_json)?;
+            let msg = wa::Message {
+                conversation: Some(p.text),
+                ..Default::default()
+            };
+            let id = client.send_message(target.clone(), msg).await
+                .map_err(|e| anyhow::anyhow!("send text: {e}"))?;
+            Ok(ExecOutcome { wa_message_id: Some(id), poll_key: None })
+        }
+
+        OutboundOpKind::Reply => {
+            let p: ReplyPayload = serde_json::from_str(&row.payload_json)?;
+            let context_info = wa::ContextInfo {
+                stanza_id: Some(p.reply_to_id),
+                participant: Some(p.reply_to_sender),
+                ..Default::default()
+            };
+            let msg = wa::Message {
+                extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+                    text: Some(p.text),
+                    context_info: Some(Box::new(context_info)),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            let id = client.send_message(target.clone(), msg).await
+                .map_err(|e| anyhow::anyhow!("send reply: {e}"))?;
+            Ok(ExecOutcome { wa_message_id: Some(id), poll_key: None })
+        }
+
+        OutboundOpKind::Image | OutboundOpKind::ViewOnceImage => {
+            let p: MediaPayload = serde_json::from_str(&row.payload_json)?;
+            let data = row.payload_blob.clone()
+                .ok_or_else(|| anyhow::anyhow!("image op missing payload_blob"))?;
+            let upload = client.upload(data, MediaType::Image).await
+                .map_err(|e| anyhow::anyhow!("image upload: {e}"))?;
+            let msg = wa::Message {
+                image_message: Some(Box::new(wa::message::ImageMessage {
+                    mimetype: Some(p.mime),
+                    caption: p.caption,
+                    url: Some(upload.url),
+                    direct_path: Some(upload.direct_path),
+                    media_key: Some(upload.media_key),
+                    file_enc_sha256: Some(upload.file_enc_sha256),
+                    file_sha256: Some(upload.file_sha256),
+                    file_length: Some(upload.file_length),
+                    view_once: if kind == OutboundOpKind::ViewOnceImage { Some(true) } else { None },
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            let id = client.send_message(target.clone(), msg).await
+                .map_err(|e| anyhow::anyhow!("send image: {e}"))?;
+            Ok(ExecOutcome { wa_message_id: Some(id), poll_key: None })
+        }
+
+        OutboundOpKind::Video | OutboundOpKind::ViewOnceVideo => {
+            let p: MediaPayload = serde_json::from_str(&row.payload_json)?;
+            let data = row.payload_blob.clone()
+                .ok_or_else(|| anyhow::anyhow!("video op missing payload_blob"))?;
+            let upload = client.upload(data, MediaType::Video).await
+                .map_err(|e| anyhow::anyhow!("video upload: {e}"))?;
+            let msg = wa::Message {
+                video_message: Some(Box::new(wa::message::VideoMessage {
+                    mimetype: Some(p.mime),
+                    caption: p.caption,
+                    url: Some(upload.url),
+                    direct_path: Some(upload.direct_path),
+                    media_key: Some(upload.media_key),
+                    file_enc_sha256: Some(upload.file_enc_sha256),
+                    file_sha256: Some(upload.file_sha256),
+                    file_length: Some(upload.file_length),
+                    view_once: if kind == OutboundOpKind::ViewOnceVideo { Some(true) } else { None },
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            let id = client.send_message(target.clone(), msg).await
+                .map_err(|e| anyhow::anyhow!("send video: {e}"))?;
+            Ok(ExecOutcome { wa_message_id: Some(id), poll_key: None })
+        }
+
+        OutboundOpKind::Audio => {
+            let p: MediaPayload = serde_json::from_str(&row.payload_json)?;
+            let data = row.payload_blob.clone()
+                .ok_or_else(|| anyhow::anyhow!("audio op missing payload_blob"))?;
+            let _ = client.chatstate().send_recording(target).await;
+            let upload = client.upload(data, MediaType::Audio).await
+                .map_err(|e| anyhow::anyhow!("audio upload: {e}"))?;
+            let msg = wa::Message {
+                audio_message: Some(Box::new(wa::message::AudioMessage {
+                    mimetype: Some(p.mime),
+                    ptt: Some(true),
+                    seconds: p.seconds,
+                    url: Some(upload.url),
+                    direct_path: Some(upload.direct_path),
+                    media_key: Some(upload.media_key),
+                    file_enc_sha256: Some(upload.file_enc_sha256),
+                    file_sha256: Some(upload.file_sha256),
+                    file_length: Some(upload.file_length),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            let result = client.send_message(target.clone(), msg).await
+                .map_err(|e| anyhow::anyhow!("send audio: {e}"));
+            let _ = client.chatstate().send_paused(target).await;
+            let id = result?;
+            Ok(ExecOutcome { wa_message_id: Some(id), poll_key: None })
+        }
+
+        OutboundOpKind::Document => {
+            let p: MediaPayload = serde_json::from_str(&row.payload_json)?;
+            let data = row.payload_blob.clone()
+                .ok_or_else(|| anyhow::anyhow!("document op missing payload_blob"))?;
+            let upload = client.upload(data, MediaType::Document).await
+                .map_err(|e| anyhow::anyhow!("document upload: {e}"))?;
+            let msg = wa::Message {
+                document_message: Some(Box::new(wa::message::DocumentMessage {
+                    mimetype: Some(p.mime),
+                    file_name: p.filename,
+                    url: Some(upload.url),
+                    direct_path: Some(upload.direct_path),
+                    media_key: Some(upload.media_key),
+                    file_enc_sha256: Some(upload.file_enc_sha256),
+                    file_sha256: Some(upload.file_sha256),
+                    file_length: Some(upload.file_length),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            let id = client.send_message(target.clone(), msg).await
+                .map_err(|e| anyhow::anyhow!("send document: {e}"))?;
+            Ok(ExecOutcome { wa_message_id: Some(id), poll_key: None })
+        }
+
+        OutboundOpKind::Sticker => {
+            let p: MediaPayload = serde_json::from_str(&row.payload_json)?;
+            let data = row.payload_blob.clone()
+                .ok_or_else(|| anyhow::anyhow!("sticker op missing payload_blob"))?;
+            let upload = client.upload(data, MediaType::Sticker).await
+                .map_err(|e| anyhow::anyhow!("sticker upload: {e}"))?;
+            // Sticker animated flag: use seconds field as a boolean (0 = static, >0 = animated)
+            let is_animated = p.seconds.unwrap_or(0) > 0;
+            let msg = wa::Message {
+                sticker_message: Some(Box::new(wa::message::StickerMessage {
+                    mimetype: Some(p.mime),
+                    is_animated: Some(is_animated),
+                    url: Some(upload.url),
+                    direct_path: Some(upload.direct_path),
+                    media_key: Some(upload.media_key),
+                    file_enc_sha256: Some(upload.file_enc_sha256),
+                    file_sha256: Some(upload.file_sha256),
+                    file_length: Some(upload.file_length),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            let id = client.send_message(target.clone(), msg).await
+                .map_err(|e| anyhow::anyhow!("send sticker: {e}"))?;
+            Ok(ExecOutcome { wa_message_id: Some(id), poll_key: None })
+        }
+
+        OutboundOpKind::Location => {
+            let p: LocationPayload = serde_json::from_str(&row.payload_json)?;
+            let msg = wa::Message {
+                location_message: Some(Box::new(wa::message::LocationMessage {
+                    degrees_latitude: Some(p.lat),
+                    degrees_longitude: Some(p.lon),
+                    name: p.name,
+                    address: p.address,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            let id = client.send_message(target.clone(), msg).await
+                .map_err(|e| anyhow::anyhow!("send location: {e}"))?;
+            Ok(ExecOutcome { wa_message_id: Some(id), poll_key: None })
+        }
+
+        OutboundOpKind::Contact => {
+            let p: ContactPayload = serde_json::from_str(&row.payload_json)?;
+            let msg = wa::Message {
+                contact_message: Some(Box::new(wa::message::ContactMessage {
+                    display_name: Some(p.display_name),
+                    vcard: Some(p.vcard),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            let id = client.send_message(target.clone(), msg).await
+                .map_err(|e| anyhow::anyhow!("send contact: {e}"))?;
+            Ok(ExecOutcome { wa_message_id: Some(id), poll_key: None })
+        }
+
+        OutboundOpKind::Reaction | OutboundOpKind::Unreact => {
+            let p: ReactionPayload = serde_json::from_str(&row.payload_json)?;
+            let emoji = if kind == OutboundOpKind::Unreact { String::new() } else { p.emoji };
+            let target_str = target.to_string();
+            let participant = if target_str.contains("@g.us") && !p.target_is_from_me {
+                p.target_sender_jid
+            } else {
+                None
+            };
+            let msg = wa::Message {
+                reaction_message: Some(wa::message::ReactionMessage {
+                    key: Some(wa::MessageKey {
+                        remote_jid: Some(target.to_string()),
+                        id: Some(p.target_message_id),
+                        from_me: Some(p.target_is_from_me),
+                        participant,
+                    }),
+                    text: Some(emoji),
+                    sender_timestamp_ms: Some(chrono::Utc::now().timestamp_millis()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let id = client.send_message(target.clone(), msg).await
+                .map_err(|e| anyhow::anyhow!("send reaction: {e}"))?;
+            Ok(ExecOutcome { wa_message_id: Some(id), poll_key: None })
+        }
+
+        OutboundOpKind::Edit => {
+            let p: EditPayload = serde_json::from_str(&row.payload_json)?;
+            let new_content = wa::Message {
+                conversation: Some(p.new_text),
+                ..Default::default()
+            };
+            client.edit_message(target.clone(), p.message_id, new_content).await
+                .map_err(|e| anyhow::anyhow!("edit: {e}"))?;
+            Ok(ExecOutcome { wa_message_id: None, poll_key: None })
+        }
+
+        OutboundOpKind::Revoke => {
+            let p: RevokePayload = serde_json::from_str(&row.payload_json)?;
+            client.revoke_message(target.clone(), p.message_id, whatsapp_rust::RevokeType::Sender).await
+                .map_err(|e| anyhow::anyhow!("revoke: {e}"))?;
+            Ok(ExecOutcome { wa_message_id: None, poll_key: None })
+        }
+
+        OutboundOpKind::Poll => {
+            let p: PollPayload = serde_json::from_str(&row.payload_json)?;
+            let enc_key = crate::polls::generate_poll_key();
+            let poll_options: Vec<wa::message::poll_creation_message::Option> = p
+                .options
+                .iter()
+                .map(|name| wa::message::poll_creation_message::Option {
+                    option_name: Some(name.clone()),
+                    option_hash: None,
+                })
+                .collect();
+            let msg = wa::Message {
+                poll_creation_message: Some(Box::new(wa::message::PollCreationMessage {
+                    enc_key: Some(enc_key.to_vec()),
+                    name: Some(p.question),
+                    options: poll_options,
+                    selectable_options_count: Some(p.selectable_count),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            let id = client.send_message(target.clone(), msg).await
+                .map_err(|e| anyhow::anyhow!("send poll: {e}"))?;
+            Ok(ExecOutcome {
+                wa_message_id: Some(id),
+                poll_key: Some(PollKeyInfo { enc_key: enc_key.to_vec(), options: p.options }),
+            })
+        }
+
+        OutboundOpKind::Forward => {
+            let proto_bytes = row.payload_blob.clone()
+                .ok_or_else(|| anyhow::anyhow!("forward op missing payload_blob (protobuf)"))?;
+            let original: wa::Message = prost::Message::decode(proto_bytes.as_slice())
+                .map_err(|e| anyhow::anyhow!("forward: decode protobuf: {e}"))?;
+            let forwarded = crate::bridge::add_forward_context(original);
+            let id = client.send_message(target.clone(), forwarded).await
+                .map_err(|e| anyhow::anyhow!("forward: {e}"))?;
+            Ok(ExecOutcome { wa_message_id: Some(id), poll_key: None })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

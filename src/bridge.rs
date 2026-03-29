@@ -32,7 +32,7 @@ use whatsapp_rust::bot::Bot;
 use whatsapp_rust::types::events::Event;
 use whatsapp_rust::Client;
 use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
-use whatsapp_rust::download::{Downloadable, MediaType};
+use whatsapp_rust::download::Downloadable;
 use whatsapp_rust::pair_code::PairCodeOptions;
 use whatsapp_rust_ureq_http_client::UreqHttpClient;
 
@@ -414,12 +414,6 @@ impl MessageRef {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct WhatsAppOutbound {
-    pub jid: String,
-    pub text: String,
-}
-
 /// Presence events surfaced to the consumer (typing, recording indicators).
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Fields consumed by bot integrations, not the REPL
@@ -537,8 +531,8 @@ impl BoundedMsgCache {
 type MsgCache = Arc<ParkingMutex<BoundedMsgCache>>;
 
 pub struct WhatsAppBridge {
-    #[allow(dead_code)] // Used by bot integrations via the outbound channel
-    outbound_tx: mpsc::Sender<WhatsAppOutbound>,
+    /// Wakes the outbound worker after a new job is enqueued.
+    outbound_notify: Arc<tokio::sync::Notify>,
     state_rx: watch::Receiver<BridgeState>,
     #[allow(dead_code)] // Used by agent integrations via subscribe_qr()
     qr_rx: watch::Receiver<Option<String>>,
@@ -548,6 +542,7 @@ pub struct WhatsAppBridge {
     msg_cache: MsgCache,
     store: Store,
     metrics: Arc<BridgeMetrics>,
+    #[allow(dead_code)] // Kept alive for the outbound worker (SendPacer is shared via Arc)
     send_pacer: Arc<SendPacer>,
     /// JIDs with active presence subscriptions — replayed on reconnect.
     subscribed_presence: Arc<DashSet<String>>,
@@ -565,7 +560,7 @@ impl WhatsAppBridge {
     ) -> Self {
         let (state_tx, state_rx) = watch::channel(BridgeState::Disconnected);
         let (qr_tx, qr_rx) = watch::channel::<Option<String>>(None);
-        let (outbound_tx, outbound_rx) = mpsc::channel::<WhatsAppOutbound>(256);
+        let outbound_notify = Arc::new(tokio::sync::Notify::new());
         let client_handle: Arc<ParkingMutex<Option<Arc<Client>>>> =
             Arc::new(ParkingMutex::new(None));
         let rr_tx = spawn_scheduler(None, 200);
@@ -585,16 +580,18 @@ impl WhatsAppBridge {
         let met = metrics.clone();
         let sp = send_pacer.clone();
         let sub_pres = subscribed_presence.clone();
+        let on = outbound_notify.clone();
+        let et = event_tx.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                run_bridge(config, inbound_tx, outbound_rx, state_tx, qr_tx, cancel_clone, ch, rr, mc, met, sp, sub_pres).await
+                run_bridge(config, inbound_tx, state_tx, qr_tx, cancel_clone, ch, rr, mc, met, sp, sub_pres, on, et).await
             {
                 error!(error = %e, "WhatsApp bridge exited with error");
             }
         });
 
         Self {
-            outbound_tx,
+            outbound_notify,
             state_rx,
             qr_rx,
             cancel,
@@ -609,15 +606,14 @@ impl WhatsAppBridge {
         }
     }
 
-    #[allow(dead_code)] // Used by bot integrations via the outbound channel
+    /// Enqueue a text message for durable delivery via the outbound job queue.
     pub async fn send_message(&self, jid: &str, text: &str) -> Result<()> {
-        self.outbound_tx
-            .send(WhatsAppOutbound {
-                jid: jid.to_string(),
-                text: text.to_string(),
-            })
-            .await
-            .context("outbound channel closed")
+        let payload = serde_json::to_string(&crate::outbound::TextPayload { text: text.to_string() })?;
+        self.store
+            .enqueue_job(jid, crate::outbound::OutboundOpKind::Text.as_str(), &payload, None)
+            .await?;
+        self.outbound_notify.notify_one();
+        Ok(())
     }
 
     pub fn state(&self) -> BridgeState {
@@ -920,22 +916,20 @@ impl WhatsAppBridge {
         self.state() == BridgeState::Connected && get_client_handle(&self.client_handle).is_some()
     }
 
-    async fn send_direct_message(
+    // ----- Private helper: enqueue a job and wake the outbound worker -----
+    async fn enqueue_op(
         &self,
-        target: Jid,
-        msg: wa::Message,
-        action: &'static str,
-    ) -> Result<String> {
-        // Pace BEFORE acquiring client handle — avoids using stale handles after
-        // reconnect during the pacing sleep.
-        self.send_pacer.wait_turn().await;
-        let client = get_client_handle(&self.client_handle).context("not connected")?;
-        let msg_id = client
-            .send_message(target, msg)
-            .await
-            .map_err(|e| anyhow::anyhow!("{action}: {e}"))?;
-        self.metrics.record_sent();
-        Ok(msg_id)
+        jid: &str,
+        op_kind: crate::outbound::OutboundOpKind,
+        payload_json: &str,
+        payload_blob: Option<Vec<u8>>,
+    ) -> Result<i64> {
+        let job_id = self
+            .store
+            .enqueue_job(jid, op_kind.as_str(), payload_json, payload_blob)
+            .await?;
+        self.outbound_notify.notify_one();
+        Ok(job_id)
     }
 
     /// Send an image file to a chat.
@@ -946,27 +940,13 @@ impl WhatsAppBridge {
         mime: &str,
         caption: Option<&str>,
     ) -> Result<()> {
-        let target = parse_jid(jid)?;
-        let client = get_client_handle(&self.client_handle).context("not connected")?;
-        let upload = client
-            .upload(data, MediaType::Image)
-            .await
-            .context("image upload failed")?;
-        let msg = wa::Message {
-            image_message: Some(Box::new(wa::message::ImageMessage {
-                mimetype: Some(mime.to_string()),
-                caption: caption.map(|c| c.to_string()),
-                url: Some(upload.url),
-                direct_path: Some(upload.direct_path),
-                media_key: Some(upload.media_key),
-                file_enc_sha256: Some(upload.file_enc_sha256),
-                file_sha256: Some(upload.file_sha256),
-                file_length: Some(upload.file_length),
-                ..Default::default()
-            })),
-            ..Default::default()
-        };
-        self.send_direct_message(target, msg, "send image failed").await?;
+        let payload = serde_json::to_string(&crate::outbound::MediaPayload {
+            mime: mime.to_string(),
+            caption: caption.map(|c| c.to_string()),
+            filename: None,
+            seconds: None,
+        })?;
+        self.enqueue_op(jid, crate::outbound::OutboundOpKind::Image, &payload, Some(data)).await?;
         Ok(())
     }
 
@@ -978,82 +958,73 @@ impl WhatsAppBridge {
         mime: &str,
         seconds: Option<u32>,
     ) -> Result<()> {
-        let target = parse_jid(jid)?;
-        let client = get_client_handle(&self.client_handle).context("not connected")?;
-        let _ = client.chatstate().send_recording(&target).await;
-        let upload = client
-            .upload(data, MediaType::Audio)
-            .await
-            .context("audio upload failed");
-        let result = match upload {
-            Ok(upload) => {
-                let msg = wa::Message {
-                    audio_message: Some(Box::new(wa::message::AudioMessage {
-                        mimetype: Some(mime.to_string()),
-                        ptt: Some(true),
-                        seconds,
-                        url: Some(upload.url),
-                        direct_path: Some(upload.direct_path),
-                        media_key: Some(upload.media_key),
-                        file_enc_sha256: Some(upload.file_enc_sha256),
-                        file_sha256: Some(upload.file_sha256),
-                        file_length: Some(upload.file_length),
-                        ..Default::default()
-                    })),
-                    ..Default::default()
-                };
-                self.send_direct_message(target.clone(), msg, "send audio failed")
-                    .await
-                    .map(|_| ())
-            }
-            Err(e) => Err(e),
-        };
-        let _ = client.chatstate().send_paused(&target).await;
-        result
+        let payload = serde_json::to_string(&crate::outbound::MediaPayload {
+            mime: mime.to_string(),
+            caption: None,
+            filename: None,
+            seconds,
+        })?;
+        self.enqueue_op(jid, crate::outbound::OutboundOpKind::Audio, &payload, Some(data)).await?;
+        Ok(())
     }
 
     /// Edit a previously sent message. Requires the message ID from send_message_with_id.
     pub async fn edit_message(&self, jid: &str, message_id: &str, new_text: &str) -> Result<()> {
-        let target = parse_jid(jid)?;
-        let new_content = wa::Message {
-            conversation: Some(new_text.to_string()),
-            ..Default::default()
-        };
-        self.send_pacer.wait_turn().await;
-        let client = get_client_handle(&self.client_handle).context("not connected")?;
-        client
-            .edit_message(target, message_id.to_string(), new_content)
-            .await
-            .map_err(|e| anyhow::anyhow!("edit failed: {e}"))?;
-        self.metrics.record_sent();
+        let payload = serde_json::to_string(&crate::outbound::EditPayload {
+            message_id: message_id.to_string(),
+            new_text: new_text.to_string(),
+        })?;
+        self.enqueue_op(jid, crate::outbound::OutboundOpKind::Edit, &payload, None).await?;
         Ok(())
     }
 
     /// Revoke (delete for everyone) a previously sent message.
     pub async fn revoke_message(&self, jid: &str, message_id: &str) -> Result<()> {
-        let target = parse_jid(jid)?;
-        self.send_pacer.wait_turn().await;
-        let client = get_client_handle(&self.client_handle).context("not connected")?;
-        client
-            .revoke_message(
-                target,
-                message_id.to_string(),
-                whatsapp_rust::RevokeType::Sender,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("revoke failed: {e}"))?;
-        self.metrics.record_sent();
+        let payload = serde_json::to_string(&crate::outbound::RevokePayload {
+            message_id: message_id.to_string(),
+        })?;
+        self.enqueue_op(jid, crate::outbound::OutboundOpKind::Revoke, &payload, None).await?;
         Ok(())
     }
 
     /// Send a text message and return the message ID (for editing/deleting).
+    /// Compatibility wrapper: enqueues a durable job, waits for the Sent event,
+    /// and returns the WhatsApp message ID.
     pub async fn send_message_with_id(&self, jid: &str, text: &str) -> Result<String> {
-        let target = parse_jid(jid)?;
-        let msg = wa::Message {
-            conversation: Some(text.to_string()),
-            ..Default::default()
-        };
-        self.send_direct_message(target, msg, "send failed").await
+        let payload = serde_json::to_string(&crate::outbound::TextPayload { text: text.to_string() })?;
+        let job_id = self.enqueue_op(jid, crate::outbound::OutboundOpKind::Text, &payload, None).await?;
+
+        // Subscribe to event bus and wait for the matching Sent status
+        let mut rx = self.event_tx.subscribe();
+        let timeout = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                match rx.recv().await {
+                    Ok(evt) => {
+                        if let crate::bridge_events::BridgeEvent::OutboundStatus(ref s) = *evt {
+                            if s.job_id == job_id {
+                                match s.state {
+                                    crate::bridge_events::OutboundJobState::Sent => {
+                                        return Ok(s.wa_message_id.clone().unwrap_or_default());
+                                    }
+                                    crate::bridge_events::OutboundJobState::Failed => {
+                                        return Err(anyhow::anyhow!(
+                                            "send failed: {}",
+                                            s.error.as_deref().unwrap_or("unknown")
+                                        ));
+                                    }
+                                    _ => {} // Queued, Sending — keep waiting
+                                }
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return Err(anyhow::anyhow!("event bus closed"));
+                    }
+                }
+            }
+        });
+        timeout.await.context("send_message_with_id timed out (30s)")?
     }
 
     /// Send a video file to a chat.
@@ -1064,27 +1035,13 @@ impl WhatsAppBridge {
         mime: &str,
         caption: Option<&str>,
     ) -> Result<()> {
-        let target = parse_jid(jid)?;
-        let client = get_client_handle(&self.client_handle).context("not connected")?;
-        let upload = client
-            .upload(data, MediaType::Video)
-            .await
-            .context("video upload failed")?;
-        let msg = wa::Message {
-            video_message: Some(Box::new(wa::message::VideoMessage {
-                mimetype: Some(mime.to_string()),
-                caption: caption.map(|c| c.to_string()),
-                url: Some(upload.url),
-                direct_path: Some(upload.direct_path),
-                media_key: Some(upload.media_key),
-                file_enc_sha256: Some(upload.file_enc_sha256),
-                file_sha256: Some(upload.file_sha256),
-                file_length: Some(upload.file_length),
-                ..Default::default()
-            })),
-            ..Default::default()
-        };
-        self.send_direct_message(target, msg, "send video failed").await?;
+        let payload = serde_json::to_string(&crate::outbound::MediaPayload {
+            mime: mime.to_string(),
+            caption: caption.map(|c| c.to_string()),
+            filename: None,
+            seconds: None,
+        })?;
+        self.enqueue_op(jid, crate::outbound::OutboundOpKind::Video, &payload, Some(data)).await?;
         Ok(())
     }
 
@@ -1096,27 +1053,13 @@ impl WhatsAppBridge {
         mime: &str,
         filename: &str,
     ) -> Result<()> {
-        let target = parse_jid(jid)?;
-        let client = get_client_handle(&self.client_handle).context("not connected")?;
-        let upload = client
-            .upload(data, MediaType::Document)
-            .await
-            .context("document upload failed")?;
-        let msg = wa::Message {
-            document_message: Some(Box::new(wa::message::DocumentMessage {
-                mimetype: Some(mime.to_string()),
-                file_name: Some(filename.to_string()),
-                url: Some(upload.url),
-                direct_path: Some(upload.direct_path),
-                media_key: Some(upload.media_key),
-                file_enc_sha256: Some(upload.file_enc_sha256),
-                file_sha256: Some(upload.file_sha256),
-                file_length: Some(upload.file_length),
-                ..Default::default()
-            })),
-            ..Default::default()
-        };
-        self.send_direct_message(target, msg, "send document failed").await?;
+        let payload = serde_json::to_string(&crate::outbound::MediaPayload {
+            mime: mime.to_string(),
+            caption: None,
+            filename: Some(filename.to_string()),
+            seconds: None,
+        })?;
+        self.enqueue_op(jid, crate::outbound::OutboundOpKind::Document, &payload, Some(data)).await?;
         Ok(())
     }
 
@@ -1128,31 +1071,17 @@ impl WhatsAppBridge {
         mime: &str,
         is_animated: bool,
     ) -> Result<()> {
-        let target = parse_jid(jid)?;
-        let client = get_client_handle(&self.client_handle).context("not connected")?;
-        let upload = client
-            .upload(data, MediaType::Sticker)
-            .await
-            .context("sticker upload failed")?;
-        let msg = wa::Message {
-            sticker_message: Some(Box::new(wa::message::StickerMessage {
-                mimetype: Some(mime.to_string()),
-                is_animated: Some(is_animated),
-                url: Some(upload.url),
-                direct_path: Some(upload.direct_path),
-                media_key: Some(upload.media_key),
-                file_enc_sha256: Some(upload.file_enc_sha256),
-                file_sha256: Some(upload.file_sha256),
-                file_length: Some(upload.file_length),
-                ..Default::default()
-            })),
-            ..Default::default()
-        };
-        self.send_direct_message(target, msg, "send sticker failed").await?;
+        // Encode is_animated as seconds field (0=static, 1=animated)
+        let payload = serde_json::to_string(&crate::outbound::MediaPayload {
+            mime: mime.to_string(),
+            caption: None,
+            filename: None,
+            seconds: if is_animated { Some(1) } else { Some(0) },
+        })?;
+        self.enqueue_op(jid, crate::outbound::OutboundOpKind::Sticker, &payload, Some(data)).await?;
         Ok(())
     }
 
-    /// Send an emoji reaction to a message.
     /// Send an emoji reaction to a message.
     pub async fn send_reaction(
         &self,
@@ -1162,34 +1091,18 @@ impl WhatsAppBridge {
         emoji: &str,
         target_is_from_me: bool,
     ) -> Result<()> {
-        let target = parse_jid(chat_jid)?;
-        let target_str = target.to_string();
-        // In group chats, participant must be set to the original sender's JID
-        let participant = if is_group_jid_str(&target_str) && !target_is_from_me {
-            match target_sender_jid {
-                Some(s) => Some(s.to_string()),
-                None => return Err(anyhow::anyhow!(
-                    "target_sender_jid is required for group reactions when target is not from_me"
-                )),
-            }
+        let payload = serde_json::to_string(&crate::outbound::ReactionPayload {
+            target_message_id: target_message_id.to_string(),
+            emoji: emoji.to_string(),
+            target_sender_jid: target_sender_jid.map(|s| s.to_string()),
+            target_is_from_me,
+        })?;
+        let kind = if emoji.is_empty() {
+            crate::outbound::OutboundOpKind::Unreact
         } else {
-            None
+            crate::outbound::OutboundOpKind::Reaction
         };
-        let msg = wa::Message {
-            reaction_message: Some(wa::message::ReactionMessage {
-                key: Some(wa::MessageKey {
-                    remote_jid: Some(target.to_string()),
-                    id: Some(target_message_id.to_string()),
-                    from_me: Some(target_is_from_me),
-                    participant,
-                }),
-                text: Some(emoji.to_string()),
-                sender_timestamp_ms: Some(chrono::Utc::now().timestamp_millis()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        self.send_direct_message(target, msg, "send reaction failed").await?;
+        self.enqueue_op(chat_jid, kind, &payload, None).await?;
         Ok(())
     }
 
@@ -1213,18 +1126,13 @@ impl WhatsAppBridge {
         name: Option<&str>,
         address: Option<&str>,
     ) -> Result<()> {
-        let target = parse_jid(jid)?;
-        let msg = wa::Message {
-            location_message: Some(Box::new(wa::message::LocationMessage {
-                degrees_latitude: Some(lat),
-                degrees_longitude: Some(lon),
-                name: name.map(|n| n.to_string()),
-                address: address.map(|a| a.to_string()),
-                ..Default::default()
-            })),
-            ..Default::default()
-        };
-        self.send_direct_message(target, msg, "send location failed").await?;
+        let payload = serde_json::to_string(&crate::outbound::LocationPayload {
+            lat,
+            lon,
+            name: name.map(|n| n.to_string()),
+            address: address.map(|a| a.to_string()),
+        })?;
+        self.enqueue_op(jid, crate::outbound::OutboundOpKind::Location, &payload, None).await?;
         Ok(())
     }
 
@@ -1235,20 +1143,15 @@ impl WhatsAppBridge {
         display_name: &str,
         vcard: &str,
     ) -> Result<()> {
-        let target = parse_jid(jid)?;
-        let msg = wa::Message {
-            contact_message: Some(Box::new(wa::message::ContactMessage {
-                display_name: Some(display_name.to_string()),
-                vcard: Some(vcard.to_string()),
-                ..Default::default()
-            })),
-            ..Default::default()
-        };
-        self.send_direct_message(target, msg, "send contact failed").await?;
+        let payload = serde_json::to_string(&crate::outbound::ContactPayload {
+            display_name: display_name.to_string(),
+            vcard: vcard.to_string(),
+        })?;
+        self.enqueue_op(jid, crate::outbound::OutboundOpKind::Contact, &payload, None).await?;
         Ok(())
     }
 
-    /// Create and send a poll. Returns the message ID.
+    /// Create and send a poll. Returns the job ID (poll key is stored after send by the worker).
     pub async fn send_poll(
         &self,
         jid: &str,
@@ -1257,41 +1160,44 @@ impl WhatsAppBridge {
         selectable_count: u32,
     ) -> Result<String> {
         let (question, options) = normalize_poll_spec(question, options, selectable_count)?;
-        let target = parse_jid(jid)?;
-        let target_key = canonical_chat_key(&target);
+        let payload = serde_json::to_string(&crate::outbound::PollPayload {
+            question,
+            options,
+            selectable_count,
+        })?;
+        let job_id = self.enqueue_op(jid, crate::outbound::OutboundOpKind::Poll, &payload, None).await?;
 
-        let enc_key = crate::polls::generate_poll_key();
-        let poll_options: Vec<wa::message::poll_creation_message::Option> = options
-            .iter()
-            .map(|name| wa::message::poll_creation_message::Option {
-                option_name: Some(name.clone()),
-                option_hash: None,
-            })
-            .collect();
-
-        let msg = wa::Message {
-            poll_creation_message: Some(Box::new(wa::message::PollCreationMessage {
-                enc_key: Some(enc_key.to_vec()),
-                name: Some(question.clone()),
-                options: poll_options,
-                selectable_options_count: Some(selectable_count),
-                ..Default::default()
-            })),
-            ..Default::default()
-        };
-
-        let msg_id = self.send_direct_message(target, msg, "send poll failed").await?;
-
-        // Store enc_key for decrypting incoming votes
-        if let Err(e) = self
-            .store
-            .store_poll_key(&target_key, &msg_id, &enc_key, &options)
-            .await
-        {
-            warn!(error = %e, "failed to store outbound poll enc_key");
-        }
-
-        Ok(msg_id)
+        // Wait for the send to complete so we can return the WA message ID (needed for poll key storage)
+        let mut rx = self.event_tx.subscribe();
+        let timeout = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                match rx.recv().await {
+                    Ok(evt) => {
+                        if let crate::bridge_events::BridgeEvent::OutboundStatus(ref s) = *evt {
+                            if s.job_id == job_id {
+                                match s.state {
+                                    crate::bridge_events::OutboundJobState::Sent => {
+                                        return Ok(s.wa_message_id.clone().unwrap_or_default());
+                                    }
+                                    crate::bridge_events::OutboundJobState::Failed => {
+                                        return Err(anyhow::anyhow!(
+                                            "send poll failed: {}",
+                                            s.error.as_deref().unwrap_or("unknown")
+                                        ));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return Err(anyhow::anyhow!("event bus closed"));
+                    }
+                }
+            }
+        });
+        timeout.await.context("send_poll timed out (30s)")?
     }
 
     /// Subscribe to a contact's presence updates (online/offline notifications).
@@ -1316,28 +1222,13 @@ impl WhatsAppBridge {
         mime: &str,
         caption: Option<&str>,
     ) -> Result<()> {
-        let target = parse_jid(jid)?;
-        let client = get_client_handle(&self.client_handle).context("not connected")?;
-        let upload = client
-            .upload(data, MediaType::Image)
-            .await
-            .context("image upload failed")?;
-        let msg = wa::Message {
-            image_message: Some(Box::new(wa::message::ImageMessage {
-                mimetype: Some(mime.to_string()),
-                caption: caption.map(|c| c.to_string()),
-                url: Some(upload.url),
-                direct_path: Some(upload.direct_path),
-                media_key: Some(upload.media_key),
-                file_enc_sha256: Some(upload.file_enc_sha256),
-                file_sha256: Some(upload.file_sha256),
-                file_length: Some(upload.file_length),
-                view_once: Some(true),
-                ..Default::default()
-            })),
-            ..Default::default()
-        };
-        self.send_direct_message(target, msg, "send view-once image failed").await?;
+        let payload = serde_json::to_string(&crate::outbound::MediaPayload {
+            mime: mime.to_string(),
+            caption: caption.map(|c| c.to_string()),
+            filename: None,
+            seconds: None,
+        })?;
+        self.enqueue_op(jid, crate::outbound::OutboundOpKind::ViewOnceImage, &payload, Some(data)).await?;
         Ok(())
     }
 
@@ -1349,41 +1240,64 @@ impl WhatsAppBridge {
         mime: &str,
         caption: Option<&str>,
     ) -> Result<()> {
-        let target = parse_jid(jid)?;
-        let client = get_client_handle(&self.client_handle).context("not connected")?;
-        let upload = client
-            .upload(data, MediaType::Video)
-            .await
-            .context("video upload failed")?;
-        let msg = wa::Message {
-            video_message: Some(Box::new(wa::message::VideoMessage {
-                mimetype: Some(mime.to_string()),
-                caption: caption.map(|c| c.to_string()),
-                url: Some(upload.url),
-                direct_path: Some(upload.direct_path),
-                media_key: Some(upload.media_key),
-                file_enc_sha256: Some(upload.file_enc_sha256),
-                file_sha256: Some(upload.file_sha256),
-                file_length: Some(upload.file_length),
-                view_once: Some(true),
-                ..Default::default()
-            })),
-            ..Default::default()
-        };
-        self.send_direct_message(target, msg, "send view-once video failed").await?;
+        let payload = serde_json::to_string(&crate::outbound::MediaPayload {
+            mime: mime.to_string(),
+            caption: caption.map(|c| c.to_string()),
+            filename: None,
+            seconds: None,
+        })?;
+        self.enqueue_op(jid, crate::outbound::OutboundOpKind::ViewOnceVideo, &payload, Some(data)).await?;
         Ok(())
     }
 
     /// Forward a cached message to another chat. The original "Forwarded" label will appear.
+    /// Serializes the cached protobuf into payload_blob for crash-safe persistence.
     pub async fn forward_message(&self, dst_jid: &str, msg_id: &str) -> Result<String> {
-        let target = parse_jid(dst_jid)?;
         let original = {
             let cache = self.msg_cache.lock();
             cache.get(msg_id).cloned()
         };
         let original = original.context("message not in cache (only recent messages are cached)")?;
-        let forwarded = add_forward_context(*original);
-        self.send_direct_message(target, forwarded, "forward failed").await
+
+        // Serialize protobuf to bytes for durable storage
+        let proto_bytes = prost::Message::encode_to_vec(&*original);
+        let payload = serde_json::to_string(&crate::outbound::ForwardPayload {
+            original_msg_id: msg_id.to_string(),
+        })?;
+
+        let job_id = self.enqueue_op(dst_jid, crate::outbound::OutboundOpKind::Forward, &payload, Some(proto_bytes)).await?;
+
+        // Wait for send completion to return WA message ID
+        let mut rx = self.event_tx.subscribe();
+        let timeout = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                match rx.recv().await {
+                    Ok(evt) => {
+                        if let crate::bridge_events::BridgeEvent::OutboundStatus(ref s) = *evt {
+                            if s.job_id == job_id {
+                                match s.state {
+                                    crate::bridge_events::OutboundJobState::Sent => {
+                                        return Ok(s.wa_message_id.clone().unwrap_or_default());
+                                    }
+                                    crate::bridge_events::OutboundJobState::Failed => {
+                                        return Err(anyhow::anyhow!(
+                                            "forward failed: {}",
+                                            s.error.as_deref().unwrap_or("unknown")
+                                        ));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return Err(anyhow::anyhow!("event bus closed"));
+                    }
+                }
+            }
+        });
+        timeout.await.context("forward timed out (30s)")?
     }
 
     /// Send a text message as a reply/quote to another message.
@@ -1400,20 +1314,44 @@ impl WhatsAppBridge {
             Err(e) => warn!(error = %e, chat = %target, "read-receipt flush failed before reply"),
             Ok(true) => {}
         }
-        let context_info = wa::ContextInfo {
-            stanza_id: Some(reply_to_id.to_string()),
-            participant: Some(reply_to_sender.to_string()),
-            ..Default::default()
-        };
-        let msg = wa::Message {
-            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
-                text: Some(text.to_string()),
-                context_info: Some(Box::new(context_info)),
-                ..Default::default()
-            })),
-            ..Default::default()
-        };
-        self.send_direct_message(target, msg, "send reply failed").await
+        let payload = serde_json::to_string(&crate::outbound::ReplyPayload {
+            text: text.to_string(),
+            reply_to_id: reply_to_id.to_string(),
+            reply_to_sender: reply_to_sender.to_string(),
+        })?;
+        let job_id = self.enqueue_op(jid, crate::outbound::OutboundOpKind::Reply, &payload, None).await?;
+
+        // Wait for WA message ID
+        let mut rx = self.event_tx.subscribe();
+        let timeout = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                match rx.recv().await {
+                    Ok(evt) => {
+                        if let crate::bridge_events::BridgeEvent::OutboundStatus(ref s) = *evt {
+                            if s.job_id == job_id {
+                                match s.state {
+                                    crate::bridge_events::OutboundJobState::Sent => {
+                                        return Ok(s.wa_message_id.clone().unwrap_or_default());
+                                    }
+                                    crate::bridge_events::OutboundJobState::Failed => {
+                                        return Err(anyhow::anyhow!(
+                                            "send reply failed: {}",
+                                            s.error.as_deref().unwrap_or("unknown")
+                                        ));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return Err(anyhow::anyhow!("event bus closed"));
+                    }
+                }
+            }
+        });
+        timeout.await.context("send_reply timed out (30s)")?
     }
 }
 
@@ -1425,7 +1363,6 @@ impl WhatsAppBridge {
 async fn run_bridge(
     config: BridgeConfig,
     inbound_tx: mpsc::Sender<WhatsAppInbound>,
-    mut outbound_rx: mpsc::Receiver<WhatsAppOutbound>,
     state_tx: watch::Sender<BridgeState>,
     qr_tx: watch::Sender<Option<String>>,
     cancel: CancellationToken,
@@ -1435,6 +1372,8 @@ async fn run_bridge(
     metrics: Arc<BridgeMetrics>,
     send_pacer: Arc<SendPacer>,
     subscribed_presence: Arc<DashSet<String>>,
+    outbound_notify: Arc<tokio::sync::Notify>,
+    event_tx: tokio::sync::broadcast::Sender<Arc<crate::bridge_events::BridgeEvent>>,
 ) -> Result<()> {
     info!("WhatsApp bridge starting");
 
@@ -1568,7 +1507,6 @@ async fn run_bridge(
             &store,
             &config,
             &inbound_tx,
-            &mut outbound_rx,
             &state_tx,
             &qr_tx,
             &cancel,
@@ -1579,6 +1517,8 @@ async fn run_bridge(
             &msg_cache,
             &send_pacer,
             &subscribed_presence,
+            &outbound_notify,
+            &event_tx,
         )
         .await;
 
@@ -1648,7 +1588,6 @@ async fn run_bot_session(
     store: &Store,
     config: &BridgeConfig,
     inbound_tx: &mpsc::Sender<WhatsAppInbound>,
-    outbound_rx: &mut mpsc::Receiver<WhatsAppOutbound>,
     state_tx: &watch::Sender<BridgeState>,
     qr_tx: &watch::Sender<Option<String>>,
     cancel: &CancellationToken,
@@ -1659,6 +1598,8 @@ async fn run_bot_session(
     msg_cache: &MsgCache,
     send_pacer: &Arc<SendPacer>,
     subscribed_presence: &Arc<DashSet<String>>,
+    outbound_notify: &Arc<tokio::sync::Notify>,
+    event_tx: &tokio::sync::broadcast::Sender<Arc<crate::bridge_events::BridgeEvent>>,
 ) -> Result<SessionAction> {
     // Clear stale handle from previous session
     set_client_handle(client_handle, None);
@@ -1757,7 +1698,7 @@ async fn run_bot_session(
                 }
             }
         }
-        _ = handle_outbound(outbound_rx, &client_handle, cancel, store, config.max_outbound_retries, metrics, send_pacer) => {
+        _ = handle_outbound(&client_handle, cancel, store, config.max_outbound_retries, metrics, send_pacer, outbound_notify, event_tx) => {
             if cancel.is_cancelled() || stop_reconnect.load(Ordering::Relaxed) {
                 Ok(SessionAction::Stop)
             } else {
@@ -1768,19 +1709,11 @@ async fn run_bot_session(
             info!("bridge shutdown requested — draining in-flight operations");
             let drain_timeout = Duration::from_secs(config.drain_timeout_secs);
 
-            // Drain: persist any remaining channel messages to SQLite, then attempt to send inflight
+            // Drain: attempt to send queued jobs if we still have a connection
             let drain_result = tokio::time::timeout(drain_timeout, async {
-                // Persist remaining channel messages to SQLite queue
-                while let Ok(out) = outbound_rx.try_recv() {
-                    if let Err(e) = store.enqueue_outbound(&out.jid, &out.text).await {
-                        warn!(error = %e, "failed to persist outbound message during shutdown");
-                    }
-                }
-
-                // Try to send any inflight messages if we still have a connection
                 if let Some(client) = get_client_handle(&client_handle) {
                     let mut sent = 0u32;
-                    while let Ok(Some(row)) = store.claim_next_outbound().await {
+                    while let Ok(Some(row)) = store.claim_next_job().await {
                         let jid = match parse_jid(&row.jid) {
                             Ok(j) => j,
                             Err(_) => {
@@ -1788,16 +1721,15 @@ async fn run_bot_session(
                                 continue;
                             }
                         };
-                        let msg = wa::Message {
-                            conversation: Some(row.payload.clone()),
-                            ..Default::default()
-                        };
                         send_pacer.wait_turn().await;
-                        match client.send_message(jid, msg).await {
-                            Ok(_) => {
+                        match crate::outbound::execute_job(&row, &jid, &client).await {
+                            Ok(outcome) => {
                                 metrics.record_sent();
                                 if let Err(e) = store.mark_outbound_sent(row.id).await {
                                     error!(error = %e, row_id = row.id, "shutdown drain: failed to mark sent");
+                                }
+                                if let Some(wa_id) = &outcome.wa_message_id {
+                                    let _ = store.set_job_wa_message_id(row.id, wa_id).await;
                                 }
                                 sent += 1;
                             }
@@ -1811,7 +1743,7 @@ async fn run_bot_session(
                         }
                     }
                     if sent > 0 {
-                        info!(count = sent, "drained outbound messages during shutdown");
+                        info!(count = sent, "drained outbound jobs during shutdown");
                     }
 
                     client.disconnect().await;
@@ -2718,62 +2650,33 @@ async fn resolve_sender(sender_raw: &str, store: &Store) -> String {
 // ---------------------------------------------------------------------------
 
 async fn handle_outbound(
-    outbound_rx: &mut mpsc::Receiver<WhatsAppOutbound>,
     client_handle: &Arc<ParkingMutex<Option<Arc<Client>>>>,
     cancel: &CancellationToken,
     store: &Store,
     max_retries: i32,
     metrics: &Arc<BridgeMetrics>,
     send_pacer: &Arc<SendPacer>,
+    outbound_notify: &Arc<tokio::sync::Notify>,
+    event_tx: &tokio::sync::broadcast::Sender<Arc<crate::bridge_events::BridgeEvent>>,
 ) {
-    let mut outbound_closed = false;
-
     loop {
         if cancel.is_cancelled() {
             break;
         }
 
-        // Drain channel into SQLite queue (persist immediately for crash safety)
-        while !outbound_closed {
-            match outbound_rx.try_recv() {
-                Ok(out) => {
-                    if let Err(e) = store.enqueue_outbound(&out.jid, &out.text).await {
-                        error!(error = %e, jid = %out.jid, "failed to enqueue outbound message");
-                    }
-                }
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                    outbound_closed = true;
-                    break;
-                }
-            }
-        }
-
-        // Try to claim and send the next queued message
-        let row = match store.claim_next_outbound().await {
+        // Try to claim the next queued job
+        let row = match store.claim_next_job().await {
             Ok(Some(row)) => row,
             Ok(None) => {
-                // Queue empty — wait for new messages or cancellation
-                if outbound_closed {
-                    break;
-                }
+                // Queue empty — wait for notification or cancellation
                 tokio::select! {
                     _ = cancel.cancelled() => break,
-                    msg = outbound_rx.recv() => {
-                        match msg {
-                            Some(out) => {
-                                if let Err(e) = store.enqueue_outbound(&out.jid, &out.text).await {
-                                    error!(error = %e, "failed to enqueue outbound message");
-                                }
-                            }
-                            None => outbound_closed = true,
-                        }
-                    }
+                    _ = outbound_notify.notified() => {}
                 }
                 continue;
             }
             Err(e) => {
-                warn!(error = %e, "failed to claim outbound message from queue");
+                warn!(error = %e, "failed to claim outbound job from queue");
                 tokio::select! {
                     _ = tokio::time::sleep(OUTBOUND_RETRY_DELAY) => {}
                     _ = cancel.cancelled() => break,
@@ -2782,20 +2685,37 @@ async fn handle_outbound(
             }
         };
 
+        // Emit Sending status
+        let _ = event_tx.send(Arc::new(crate::bridge_events::BridgeEvent::OutboundStatus(
+            crate::bridge_events::OutboundStatusEvent {
+                job_id: row.id,
+                state: crate::bridge_events::OutboundJobState::Sending,
+                wa_message_id: None,
+                error: None,
+            },
+        )));
+
         let jid = match parse_jid(&row.jid) {
             Ok(j) => j,
             Err(e) => {
                 error!(error = %e, jid = %row.jid, "invalid outbound JID, marking failed");
-                let _ = store.mark_outbound_failed(row.id, 0).await; // immediate fail
+                let _ = store.mark_outbound_failed(row.id, 0).await;
+                let _ = event_tx.send(Arc::new(crate::bridge_events::BridgeEvent::OutboundStatus(
+                    crate::bridge_events::OutboundStatusEvent {
+                        job_id: row.id,
+                        state: crate::bridge_events::OutboundJobState::Failed,
+                        wa_message_id: None,
+                        error: Some(format!("invalid JID: {e}")),
+                    },
+                )));
                 continue;
             }
         };
 
-        // Pace BEFORE acquiring client handle — avoids using stale handles after
-        // reconnect during the pacing sleep.
+        // Pace BEFORE acquiring client handle
         send_pacer.wait_turn().await;
 
-        // Fetch client AFTER pacing — freshest handle possible.
+        // Fetch client AFTER pacing — freshest handle possible
         let Some(client) = get_client_handle(client_handle) else {
             // Requeue without incrementing retries (connection issue, not send failure)
             let _ = store.requeue_outbound(row.id).await;
@@ -2806,42 +2726,63 @@ async fn handle_outbound(
             continue;
         };
 
-        let msg = wa::Message {
-            conversation: Some(row.payload.clone()),
-            ..Default::default()
-        };
-
-        match client.send_message(jid, msg).await {
-            Ok(_msg_id) => {
+        match crate::outbound::execute_job(&row, &jid, &client).await {
+            Ok(outcome) => {
                 metrics.record_sent();
                 if let Err(e) = store.mark_outbound_sent(row.id).await {
-                    error!(error = %e, row_id = row.id, "failed to mark outbound as sent — may re-send on restart");
+                    error!(error = %e, row_id = row.id, "failed to mark job as sent");
                 }
+                if let Some(ref wa_id) = outcome.wa_message_id {
+                    let _ = store.set_job_wa_message_id(row.id, wa_id).await;
+                }
+
+                // Store poll enc_key if this was a poll send
+                if let Some(ref pk) = outcome.poll_key {
+                    let target_key = canonical_chat_key(&jid);
+                    let wa_id = outcome.wa_message_id.as_deref().unwrap_or("");
+                    if let Err(e) = store.store_poll_key(&target_key, wa_id, &pk.enc_key, &pk.options).await {
+                        warn!(error = %e, "failed to store poll enc_key from outbound worker");
+                    }
+                }
+
+                // Emit Sent status
+                let _ = event_tx.send(Arc::new(crate::bridge_events::BridgeEvent::OutboundStatus(
+                    crate::bridge_events::OutboundStatusEvent {
+                        job_id: row.id,
+                        state: crate::bridge_events::OutboundJobState::Sent,
+                        wa_message_id: outcome.wa_message_id,
+                        error: None,
+                    },
+                )));
             }
             Err(e) => {
+                let err_msg = format!("{e:#}");
                 if row.retries + 1 >= max_retries {
                     error!(
                         error = %e, jid = %row.jid, retries = row.retries + 1,
-                        "dropping outbound message after max retries"
+                        "dropping outbound job after max retries"
                     );
                 } else {
                     warn!(
                         error = %e, jid = %row.jid, retry = row.retries + 1,
-                        "failed to send outbound message; will retry"
+                        "failed to execute outbound job; will retry"
                     );
                 }
                 if let Err(db_e) = store.mark_outbound_failed(row.id, max_retries).await {
-                    error!(error = %db_e, row_id = row.id, "failed to mark outbound as failed — row stuck as inflight");
+                    error!(error = %db_e, row_id = row.id, "failed to mark job as failed");
                 }
-            }
-        }
 
-        if outbound_closed {
-            // Check if there are remaining queued messages
-            match store.outbound_queue_depth().await {
-                Ok(0) => break,
-                Ok(_) => continue,
-                Err(_) => break,
+                // Emit Failed status only if max retries exceeded
+                if row.retries + 1 >= max_retries {
+                    let _ = event_tx.send(Arc::new(crate::bridge_events::BridgeEvent::OutboundStatus(
+                        crate::bridge_events::OutboundStatusEvent {
+                            job_id: row.id,
+                            state: crate::bridge_events::OutboundJobState::Failed,
+                            wa_message_id: None,
+                            error: Some(err_msg),
+                        },
+                    )));
+                }
             }
         }
     }
@@ -2923,7 +2864,7 @@ fn select_poll_voter_jid(sender_jid: Option<&str>, poll_participant: Option<&str
 /// Mirrors Baileys' `shouldIgnoreJid` logic.
 /// Apply forwarding context to a message. Increments forwarding_score and sets is_forwarded.
 /// For plain `conversation` text (which has no context_info field), converts to extended_text_message.
-fn add_forward_context(mut msg: wa::Message) -> wa::Message {
+pub fn add_forward_context(mut msg: wa::Message) -> wa::Message {
     // Helper: create or update context_info on a boxed optional
     macro_rules! set_forward_ctx {
         ($field:expr) => {
