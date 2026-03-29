@@ -183,6 +183,7 @@ async fn main() -> Result<()> {
         println!("  edit <jid> <id> <new text>     — edit a sent message");
         println!("  react <jid> <id> <emoji> [from_me] [sender_jid] — react to a message");
         println!("  unreact <jid> <id> [from_me] [sender_jid] — remove a reaction");
+        println!("  revoke <jid> <id>              — delete a message for everyone");
         println!("  image <jid> <path>             — send an image file");
         println!("  audio <jid> <path>             — send audio as voice note");
         println!("  video <jid> <path>             — send a video file");
@@ -624,6 +625,16 @@ async fn main() -> Result<()> {
                                 Err(e) => println!("!! send failed: {e}"),
                             }
                         }
+                        "revoke" | "del" => {
+                            if parts.len() < 3 {
+                                println!("usage: revoke <jid> <msg_id>");
+                                continue;
+                            }
+                            match bridge_for_repl.revoke_message(parts[1], parts[2]).await {
+                                Ok(()) => println!(">> message revoked: {}", parts[2]),
+                                Err(e) => println!("!! revoke failed: {e}"),
+                            }
+                        }
                         "revoke-test" | "rt" => {
                             if parts.len() < 2 {
                                 println!("usage: revoke-test <jid>");
@@ -953,6 +964,13 @@ async fn cli_main(args: &[String]) -> Result<()> {
             print_json_result(status, &resp)?;
             Ok(())
         }
+        "revoke" => {
+            require_args(args, 3, "revoke <jid> <msg_id>")?;
+            let body = json!({"jid": args[1], "id": args[2]}).to_string();
+            let (status, resp) = api::cli_post(port, "/api/revoke", &body).await?;
+            print_json_result(status, &resp)?;
+            Ok(())
+        }
         "image" => {
             require_args(args, 3, "image <jid> <path> [caption]")?;
             let caption = if args.len() > 3 { Some(args[3..].join(" ")) } else { None };
@@ -1125,6 +1143,7 @@ fn print_cli_help() {
     println!("  whatsrust edit <jid> <id> <text>       Edit a sent message");
     println!("  whatsrust react <jid> <id> <emoji> [from_me] [sender_jid]  React to a message");
     println!("  whatsrust unreact <jid> <id> [from_me] [sender_jid]  Remove a reaction");
+    println!("  whatsrust revoke <jid> <id>            Delete message for everyone");
     println!("  whatsrust image <jid> <path> [caption] Send image");
     println!("  whatsrust video <jid> <path> [caption] Send video");
     println!("  whatsrust audio <jid> <path>           Send voice note");

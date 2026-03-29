@@ -280,6 +280,7 @@ async fn handle_request(bridge: &WhatsAppBridge, req: &HttpRequest, is_loopback:
         ("POST", "/api/edit") => handle_edit(bridge, &req.body).await,
         ("POST", "/api/react") => handle_react(bridge, &req.body).await,
         ("POST", "/api/unreact") => handle_unreact(bridge, &req.body).await,
+        ("POST", "/api/revoke") => handle_revoke(bridge, &req.body).await,
         ("POST", "/api/image") => handle_media_with_path(bridge, &req.body, is_loopback, MediaKind::Image).await,
         ("POST", "/api/video") => handle_media_with_path(bridge, &req.body, is_loopback, MediaKind::Video).await,
         ("POST", "/api/audio") => handle_media_with_path(bridge, &req.body, is_loopback, MediaKind::Audio).await,
@@ -473,6 +474,20 @@ async fn handle_unreact(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
         req.sender_jid.as_deref(),
         req.from_me.unwrap_or(true),
     ).await {
+        Ok(()) => json_ok_simple(),
+        Err(e) => json_err(500, &e.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct RevokeReq {
+    jid: String,
+    id: String,
+}
+
+async fn handle_revoke(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+    let req: RevokeReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
+    match bridge.revoke_message(&req.jid, &req.id).await {
         Ok(()) => json_ok_simple(),
         Err(e) => json_err(500, &e.to_string()),
     }
