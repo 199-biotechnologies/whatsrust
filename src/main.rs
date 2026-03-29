@@ -1155,6 +1155,11 @@ async fn cli_main(args: &[String]) -> Result<()> {
             print_json_result(status, &resp)?;
             Ok(())
         }
+        "events" => {
+            // Stream SSE events from the daemon to stdout
+            api::cli_stream_sse(port).await?;
+            Ok(())
+        }
         _ => {
             eprintln!("unknown command: {cmd}");
             print_cli_help();
@@ -1269,6 +1274,7 @@ fn print_cli_help() {
     println!("  whatsrust group-remove <jid> <jid>...  Remove participants from group");
     println!("  whatsrust group-promote <jid> <jid>... Promote participants to admin");
     println!("  whatsrust group-demote <jid> <jid>...  Demote admins to regular");
+    println!("  whatsrust events                       Stream SSE events (inbound + status)");
     println!();
     println!("ENVIRONMENT:");
     println!("  WHATSRUST_PORT   API port (default: 7270, fallback: HEALTH_PORT)");

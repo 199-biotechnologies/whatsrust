@@ -927,8 +927,9 @@ impl WhatsAppBridge {
         self.state() == BridgeState::Connected && get_client_handle(&self.client_handle).is_some()
     }
 
-    // ----- Private helper: enqueue a job and wake the outbound worker -----
-    async fn enqueue_op(
+    /// Enqueue an outbound job and wake the worker. Returns the job_id.
+    /// Public for use by the API server; most callers should use the typed send methods.
+    pub async fn enqueue_op(
         &self,
         jid: &str,
         op_kind: crate::outbound::OutboundOpKind,

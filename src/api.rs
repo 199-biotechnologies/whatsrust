@@ -17,8 +17,15 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-use crate::bridge::{BridgeState, WhatsAppBridge};
+use crate::bridge::{BridgeState, WhatsAppBridge, InboundContent};
 use crate::qr::QrRender;
+
+/// Maximum concurrent SSE connections (separate from request semaphore).
+const SSE_MAX_CONNECTIONS: usize = 8;
+/// Write timeout per SSE event — disconnect slow clients.
+const SSE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Heartbeat interval for SSE keepalive.
+const SSE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 // ---------------------------------------------------------------------------
 // HTTP helpers
@@ -275,7 +282,7 @@ async fn handle_request(bridge: &WhatsAppBridge, req: &HttpRequest, is_loopback:
         ("GET", "/api/group-info") => handle_group_info(bridge, req).await,
 
         // Messaging
-        ("POST", "/api/send") => handle_send(bridge, &req.body).await,
+        ("POST", "/api/send") => handle_send(bridge, &req.body, req.query_get("sync") == Some("true")).await,
         ("POST", "/api/reply") => handle_reply(bridge, &req.body).await,
         ("POST", "/api/edit") => handle_edit(bridge, &req.body).await,
         ("POST", "/api/react") => handle_react(bridge, &req.body).await,
@@ -408,11 +415,24 @@ struct SendReq {
     text: String,
 }
 
-async fn handle_send(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+async fn handle_send(bridge: &WhatsAppBridge, body: &[u8], sync: bool) -> Vec<u8> {
     let req: SendReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
-    match bridge.send_message_with_id(&req.jid, &req.text).await {
-        Ok(id) => json_ok_id(&id),
-        Err(e) => json_err(500, &e.to_string()),
+    if sync {
+        // Backward-compat: wait for send, return both job_id and WA message id
+        match bridge.send_message_with_id(&req.jid, &req.text).await {
+            Ok(id) => json_response(200, &serde_json::json!({"ok": true, "id": id}).to_string()),
+            Err(e) => json_err(500, &e.to_string()),
+        }
+    } else {
+        // Async: enqueue and return job_id immediately
+        let payload = match serde_json::to_string(&crate::outbound::TextPayload { text: req.text }) {
+            Ok(p) => p,
+            Err(e) => return json_err(500, &e.to_string()),
+        };
+        match bridge.enqueue_op(&req.jid, crate::outbound::OutboundOpKind::Text, &payload, None).await {
+            Ok(job_id) => json_response(200, &serde_json::json!({"ok": true, "job_id": job_id}).to_string()),
+            Err(e) => json_err(500, &e.to_string()),
+        }
     }
 }
 
@@ -787,6 +807,96 @@ async fn handle_poll(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
+// SSE event stream
+// ---------------------------------------------------------------------------
+
+/// Handle a long-lived SSE connection. Streams events until client disconnects,
+/// cancel is triggered, or write fails.
+async fn handle_sse(
+    bridge: &WhatsAppBridge,
+    stream: &mut tokio::net::TcpStream,
+    cancel: &CancellationToken,
+) {
+    use tokio::io::AsyncWriteExt;
+
+    // Send SSE response headers
+    let headers = "HTTP/1.1 200 OK\r\n\
+        Content-Type: text/event-stream\r\n\
+        Cache-Control: no-cache\r\n\
+        Connection: keep-alive\r\n\
+        X-Accel-Buffering: no\r\n\r\n";
+    if stream.write_all(headers.as_bytes()).await.is_err() {
+        return;
+    }
+
+    let mut rx = bridge.subscribe_events();
+    let mut heartbeat = tokio::time::interval(SSE_HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        let event_data = tokio::select! {
+            result = rx.recv() => {
+                match result {
+                    Ok(evt) => format_sse_event(&evt),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // Client too slow — send a comment and disconnect
+                        Some(format!(": lagged {n} events, reconnect\n\n"))
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            _ = heartbeat.tick() => {
+                Some("event: heartbeat\ndata: {}\n\n".to_string())
+            }
+            _ = cancel.cancelled() => break,
+        };
+
+        if let Some(data) = event_data {
+            let write_result = tokio::time::timeout(
+                SSE_WRITE_TIMEOUT,
+                stream.write_all(data.as_bytes()),
+            )
+            .await;
+            match write_result {
+                Ok(Ok(())) => {}
+                _ => break, // write error or timeout — client gone
+            }
+        }
+    }
+}
+
+/// Format a BridgeEvent as an SSE event string.
+fn format_sse_event(event: &crate::bridge_events::BridgeEvent) -> Option<String> {
+    match event {
+        crate::bridge_events::BridgeEvent::Inbound(inbound) => {
+            let data = serde_json::json!({
+                "jid": inbound.jid,
+                "id": inbound.id,
+                "sender": inbound.sender,
+                "timestamp": inbound.timestamp,
+                "type": inbound.content.kind(),
+                "text": match &inbound.content {
+                    InboundContent::Text { body } => Some(body.clone()),
+                    InboundContent::DeliveryReceipt { status, message_ids, .. } => {
+                        Some(format!("{status:?} for {}", message_ids.join(",")))
+                    }
+                    _ => None,
+                },
+                "is_from_me": inbound.is_from_me,
+            });
+            Some(format!("event: inbound\ndata: {data}\n\n"))
+        }
+        crate::bridge_events::BridgeEvent::OutboundStatus(status) => {
+            let data = serde_json::to_string(status).ok()?;
+            Some(format!("event: status\ndata: {data}\n\n"))
+        }
+        crate::bridge_events::BridgeEvent::Heartbeat => {
+            Some("event: heartbeat\ndata: {}\n\n".to_string())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
 
@@ -822,6 +932,8 @@ pub async fn serve(bridge: Arc<WhatsAppBridge>, port: u16, cancel: CancellationT
     let is_loopback = is_loopback_bind(&bind);
     // Cap concurrent connections to prevent slowloris/flood exhaustion.
     let conn_sem = Arc::new(Semaphore::new(64));
+    // Separate semaphore for SSE so long-lived streams don't starve normal requests.
+    let sse_sem = Arc::new(Semaphore::new(SSE_MAX_CONNECTIONS));
 
     loop {
         tokio::select! {
@@ -836,6 +948,8 @@ pub async fn serve(bridge: Arc<WhatsAppBridge>, port: u16, cancel: CancellationT
                 };
                 let bridge = bridge.clone();
                 let api_token = api_token.clone();
+                let sse_sem = sse_sem.clone();
+                let sse_cancel = cancel.clone();
                 tokio::spawn(async move {
                     let _permit = permit; // held until handler completes
                     let req = match read_request(&mut stream).await {
@@ -851,6 +965,21 @@ pub async fn serve(bridge: Arc<WhatsAppBridge>, port: u16, cancel: CancellationT
                             return;
                         }
                     }
+
+                    // SSE endpoint — long-lived, uses dedicated semaphore
+                    if req.method == "GET" && req.path == "/api/events" {
+                        let sse_permit = match sse_sem.try_acquire_owned() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                let _ = stream.write_all(&json_err(503, "too many SSE connections")).await;
+                                return;
+                            }
+                        };
+                        handle_sse(&bridge, &mut stream, &sse_cancel).await;
+                        drop(sse_permit);
+                        return;
+                    }
+
                     let response = handle_request(&bridge, &req, is_loopback).await;
                     let _ = stream.write_all(&response).await;
                 });
@@ -905,6 +1034,46 @@ pub async fn cli_post(port: u16, path: &str, body: &str) -> anyhow::Result<(u16,
         .await
         .map_err(|_| anyhow::anyhow!("timeout reading response from daemon"))??;
     parse_cli_response(&buf)
+}
+
+/// Stream SSE events from the daemon to stdout until disconnected or Ctrl-C.
+pub async fn cli_stream_sse(port: u16) -> anyhow::Result<()> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let host = cli_connect_host(&api_bind_host());
+    let auth_header = configured_api_token()
+        .map(|token| format!("Authorization: Bearer {token}\r\n"))
+        .unwrap_or_default();
+    let mut stream = tokio::net::TcpStream::connect((&*host, port)).await
+        .map_err(|e| anyhow::anyhow!("cannot connect to whatsrust daemon on {host}:{port}: {e}"))?;
+
+    let req = format!(
+        "GET /api/events HTTP/1.1\r\nHost: {host}:{port}\r\n{auth_header}Accept: text/event-stream\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).await?;
+
+    // Read and discard HTTP headers
+    let mut reader = BufReader::new(stream);
+    let mut header_line = String::new();
+    loop {
+        header_line.clear();
+        let n = reader.read_line(&mut header_line).await?;
+        if n == 0 || header_line.trim().is_empty() {
+            break;
+        }
+    }
+
+    // Stream SSE events to stdout
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) => break, // EOF
+            Ok(_) => print!("{line}"),
+            Err(_) => break,
+        }
+    }
+    Ok(())
 }
 
 fn parse_cli_response(raw: &[u8]) -> anyhow::Result<(u16, Vec<u8>)> {
