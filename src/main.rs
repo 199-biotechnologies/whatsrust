@@ -1053,6 +1053,43 @@ async fn cli_main(args: &[String]) -> Result<()> {
             print_json_result(status, &resp)?;
             Ok(())
         }
+        "vo-image" | "view-once-image" => {
+            require_args(args, 3, "vo-image <jid> <path> [caption]")?;
+            let caption = if args.len() > 3 { Some(args[3..].join(" ")) } else { None };
+            let body = json!({"jid": args[1], "path": args[2], "caption": caption}).to_string();
+            let (status, resp) = api::cli_post(port, "/api/view-once-image", &body).await?;
+            print_json_result(status, &resp)?;
+            Ok(())
+        }
+        "vo-video" | "view-once-video" => {
+            require_args(args, 3, "vo-video <jid> <path> [caption]")?;
+            let caption = if args.len() > 3 { Some(args[3..].join(" ")) } else { None };
+            let body = json!({"jid": args[1], "path": args[2], "caption": caption}).to_string();
+            let (status, resp) = api::cli_post(port, "/api/view-once-video", &body).await?;
+            print_json_result(status, &resp)?;
+            Ok(())
+        }
+        "typing" => {
+            require_args(args, 2, "typing <jid>")?;
+            let body = json!({"jid": args[1]}).to_string();
+            let (status, resp) = api::cli_post(port, "/api/typing", &body).await?;
+            print_json_result(status, &resp)?;
+            Ok(())
+        }
+        "stop-typing" => {
+            require_args(args, 2, "stop-typing <jid>")?;
+            let body = json!({"jid": args[1]}).to_string();
+            let (status, resp) = api::cli_post(port, "/api/stop-typing", &body).await?;
+            print_json_result(status, &resp)?;
+            Ok(())
+        }
+        "subscribe" | "subscribe-presence" => {
+            require_args(args, 2, "subscribe <jid>")?;
+            let body = json!({"jid": args[1]}).to_string();
+            let (status, resp) = api::cli_post(port, "/api/subscribe-presence", &body).await?;
+            print_json_result(status, &resp)?;
+            Ok(())
+        }
         _ => {
             eprintln!("unknown command: {cmd}");
             print_cli_help();
@@ -1153,6 +1190,11 @@ fn print_cli_help() {
     println!("  whatsrust contact <jid> <name> <phone> Send contact card");
     println!("  whatsrust forward <jid> <msg_id>       Forward a cached message");
     println!("  whatsrust poll <jid> <N> <Q> -- <opts> Create poll (N=selectable)");
+    println!("  whatsrust vo-image <jid> <path> [cap]  Send view-once image");
+    println!("  whatsrust vo-video <jid> <path> [cap]  Send view-once video");
+    println!("  whatsrust typing <jid>                 Send typing indicator");
+    println!("  whatsrust stop-typing <jid>            Clear typing indicator");
+    println!("  whatsrust subscribe <jid>              Subscribe to presence updates");
     println!();
     println!("ENVIRONMENT:");
     println!("  WHATSRUST_PORT   API port (default: 7270, fallback: HEALTH_PORT)");

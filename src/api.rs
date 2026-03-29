@@ -290,6 +290,11 @@ async fn handle_request(bridge: &WhatsAppBridge, req: &HttpRequest, is_loopback:
         ("POST", "/api/contact") => handle_contact(bridge, &req.body).await,
         ("POST", "/api/forward") => handle_forward(bridge, &req.body).await,
         ("POST", "/api/poll") => handle_poll(bridge, &req.body).await,
+        ("POST", "/api/view-once-image") => handle_media_with_path(bridge, &req.body, is_loopback, MediaKind::ViewOnceImage).await,
+        ("POST", "/api/view-once-video") => handle_media_with_path(bridge, &req.body, is_loopback, MediaKind::ViewOnceVideo).await,
+        ("POST", "/api/typing") => handle_jid_action(bridge, &req.body, JidAction::StartTyping).await,
+        ("POST", "/api/stop-typing") => handle_jid_action(bridge, &req.body, JidAction::StopTyping).await,
+        ("POST", "/api/subscribe-presence") => handle_jid_action(bridge, &req.body, JidAction::SubscribePresence).await,
 
         _ => json_err(404, "not found"),
     }
@@ -493,6 +498,28 @@ async fn handle_revoke(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
     }
 }
 
+// --- Simple JID-only actions (typing, presence) ---
+
+enum JidAction { StartTyping, StopTyping, SubscribePresence }
+
+#[derive(Deserialize)]
+struct JidReq {
+    jid: String,
+}
+
+async fn handle_jid_action(bridge: &WhatsAppBridge, body: &[u8], action: JidAction) -> Vec<u8> {
+    let req: JidReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
+    let result = match action {
+        JidAction::StartTyping => bridge.start_typing(&req.jid).await,
+        JidAction::StopTyping => bridge.stop_typing(&req.jid).await,
+        JidAction::SubscribePresence => bridge.subscribe_presence(&req.jid).await,
+    };
+    match result {
+        Ok(()) => json_ok_simple(),
+        Err(e) => json_err(500, &e.to_string()),
+    }
+}
+
 // --- Media ---
 
 #[derive(Deserialize)]
@@ -559,7 +586,7 @@ fn mime_for_doc(path: &std::path::Path) -> &'static str {
     }
 }
 
-enum MediaKind { Image, Video, Audio, Doc, Sticker }
+enum MediaKind { Image, Video, Audio, Doc, Sticker, ViewOnceImage, ViewOnceVideo }
 
 async fn handle_media_with_path(bridge: &WhatsAppBridge, body: &[u8], is_loopback: bool, kind: MediaKind) -> Vec<u8> {
     if !is_loopback {
@@ -577,6 +604,8 @@ async fn handle_media_with_path(bridge: &WhatsAppBridge, body: &[u8], is_loopbac
             bridge.send_document(&req.jid, data, mime_for_doc(path), filename).await
         }
         MediaKind::Sticker => bridge.send_sticker(&req.jid, data, "image/webp", false).await,
+        MediaKind::ViewOnceImage => bridge.send_view_once_image(&req.jid, data, mime_for_image(path), req.caption.as_deref()).await,
+        MediaKind::ViewOnceVideo => bridge.send_view_once_video(&req.jid, data, mime_for_video(path), req.caption.as_deref()).await,
     };
     match result {
         Ok(()) => json_ok_simple(),
