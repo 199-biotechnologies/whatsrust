@@ -238,15 +238,6 @@ pub struct Store {
     conn: Arc<Mutex<Connection>>,
 }
 
-/// A row from the outbound message queue.
-#[derive(Debug, Clone)]
-pub struct OutboundRow {
-    pub id: i64,
-    pub jid: String,
-    pub payload: String,
-    pub retries: i32,
-}
-
 /// A row from the inbound message history table.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct InboundRow {
@@ -325,18 +316,6 @@ impl Store {
         Ok(())
     }
 
-    /// Read the linked phone number from the stored device registration.
-    /// Returns None if no device is registered or no phone number is stored.
-    pub async fn get_phone_number(&self) -> Result<Option<String>> {
-        self.run(|c| {
-            let pn: Option<String> = c
-                .query_row("SELECT pn FROM device WHERE id = 1", [], |row| row.get(0))
-                .ok();
-            Ok(pn.filter(|s| !s.is_empty()))
-        })
-        .await
-    }
-
     /// Clear stored device credentials (used after LoggedOut to trigger re-pairing on reconnect).
     pub async fn clear_device(&self) -> Result<()> {
         self.run(|c| {
@@ -350,58 +329,6 @@ impl Store {
     // -----------------------------------------------------------------------
     // Outbound queue — persistent message queue (crash-safe)
     // -----------------------------------------------------------------------
-
-    /// Enqueue a message for outbound delivery. Returns the row ID.
-    pub async fn enqueue_outbound(&self, jid: &str, payload: &str) -> Result<i64> {
-        let j = jid.to_owned();
-        let p = payload.to_owned();
-        let ts = now_secs();
-        self.run(move |c| {
-            c.execute(
-                "INSERT INTO outbound_queue (jid, payload, status, retries, created_at, updated_at)
-                 VALUES (?1, ?2, 'queued', 0, ?3, ?3)",
-                params![j, p, ts],
-            )
-            .map_err(db_err)?;
-            Ok(c.last_insert_rowid())
-        })
-        .await
-    }
-
-    /// Atomically claim the next queued message for processing.
-    /// Sets status to 'inflight' and returns the row, or None if queue is empty.
-    pub async fn claim_next_outbound(&self) -> Result<Option<OutboundRow>> {
-        let ts = now_secs();
-        self.run(move |c| {
-            let tx = c.unchecked_transaction().map_err(db_err)?;
-            let row = tx
-                .query_row(
-                    "SELECT id, jid, payload, retries FROM outbound_queue
-                     WHERE status = 'queued' AND retry_after <= ?1 ORDER BY id LIMIT 1",
-                    params![ts],
-                    |row| {
-                        Ok(OutboundRow {
-                            id: row.get(0)?,
-                            jid: row.get(1)?,
-                            payload: row.get(2)?,
-                            retries: row.get(3)?,
-                        })
-                    },
-                )
-                .optional()
-                .map_err(db_err)?;
-            if let Some(ref r) = row {
-                tx.execute(
-                    "UPDATE outbound_queue SET status = 'inflight', updated_at = ?1 WHERE id = ?2",
-                    params![ts, r.id],
-                )
-                .map_err(db_err)?;
-            }
-            tx.commit().map_err(db_err)?;
-            Ok(row)
-        })
-        .await
-    }
 
     /// Mark an outbound message as successfully sent.
     pub async fn mark_outbound_sent(&self, id: i64) -> Result<()> {

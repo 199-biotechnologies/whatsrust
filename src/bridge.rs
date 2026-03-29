@@ -89,9 +89,6 @@ impl GroupCache {
         self.entries.remove(jid);
     }
 
-    fn clear(&mut self) {
-        self.entries.clear();
-    }
 }
 
 type GroupCacheHandle = Arc<ParkingMutex<GroupCache>>;
@@ -491,6 +488,7 @@ pub struct WhatsAppInbound {
 
 /// Reference to a specific message — used for reactions, replies, edits.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Public API for downstream crates (habb)
 pub struct MessageRef {
     pub chat_jid: String,
     pub message_id: String,
@@ -499,6 +497,7 @@ pub struct MessageRef {
     pub sender_jid: Option<String>,
 }
 
+#[allow(dead_code)] // Public API for downstream crates
 impl MessageRef {
     /// Create from an inbound message.
     pub fn from_inbound(msg: &WhatsAppInbound) -> Self {
@@ -545,7 +544,8 @@ pub struct BridgeConfig {
     /// Maximum burst size for outbound rate limiter (default: 5).
     /// Up to this many messages can be sent immediately before pacing kicks in.
     pub send_burst: u32,
-    /// TCP port for the health endpoint (0 = disabled).
+    /// TCP port for the API server (0 = disabled). Used by main.rs, not the bridge itself.
+    #[allow(dead_code)]
     pub health_port: u16,
     /// Seconds to wait for in-flight operations during graceful shutdown.
     pub drain_timeout_secs: u64,
@@ -716,11 +716,13 @@ impl WhatsAppBridge {
     }
 
     /// Enqueue a text message for durable delivery via the outbound job queue.
+    #[allow(dead_code)] // Public API for library consumers (habb)
     pub async fn send_message(&self, jid: &str, text: &str) -> Result<()> {
         self.send_message_mentioned(jid, text, &[]).await
     }
 
     /// Send a text message with @mentions. Empty mentions slice = no mentions.
+    #[allow(dead_code)] // Public API for library consumers
     pub async fn send_message_mentioned(&self, jid: &str, text: &str, mentions: &[String]) -> Result<()> {
         let payload = serde_json::to_string(&crate::outbound::TextPayload {
             text: text.to_string(),
@@ -738,6 +740,7 @@ impl WhatsAppBridge {
     }
 
     /// Subscribe to bridge state changes.
+    #[allow(dead_code)] // Public API for library consumers
     pub fn subscribe_state(&self) -> watch::Receiver<BridgeState> {
         self.state_rx.clone()
     }
@@ -1033,6 +1036,7 @@ impl WhatsAppBridge {
     }
 
     /// Get a reference to the event bus sender (for internal use by API server).
+    #[allow(dead_code)] // Public API for library consumers
     pub fn event_sender(&self) -> &tokio::sync::broadcast::Sender<Arc<crate::bridge_events::BridgeEvent>> {
         &self.event_tx
     }
@@ -3059,10 +3063,6 @@ fn parse_jid(s: &str) -> Result<Jid> {
 
 fn canonical_chat_key(jid: &Jid) -> String {
     jid.to_string()
-}
-
-fn is_group_jid_str(jid: &str) -> bool {
-    jid.ends_with("@g.us")
 }
 
 pub(crate) fn normalize_poll_spec(

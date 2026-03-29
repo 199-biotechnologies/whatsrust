@@ -9,6 +9,7 @@ use tracing::{debug, warn};
 use whatsapp_rust::Client;
 
 /// Commands sent to the read receipt scheduler.
+#[allow(dead_code)] // Stop variant used in tests and available for graceful shutdown
 pub enum ReadReceiptCmd {
     /// Queue a message to be marked as read (batched by chat).
     Seen {

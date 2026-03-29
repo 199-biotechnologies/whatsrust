@@ -78,6 +78,7 @@ impl AtomicDedupCache {
     }
 
     /// Check if an ID is present (any state).
+    #[allow(dead_code)] // Used in tests
     pub fn contains(&self, id: &str) -> bool {
         self.map.contains_key(id)
     }

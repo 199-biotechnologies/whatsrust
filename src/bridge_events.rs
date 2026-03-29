@@ -19,6 +19,7 @@ const EVENT_BUS_CAPACITY: usize = 256;
 
 /// Unified bridge event envelope.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Heartbeat constructed by SSE handler in api.rs, not bridge itself
 pub enum BridgeEvent {
     /// An inbound WhatsApp message or status update.
     Inbound(Arc<WhatsAppInbound>),
@@ -43,6 +44,7 @@ pub struct OutboundStatusEvent {
 
 /// Lifecycle states for an outbound job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[allow(dead_code)] // Queued + Expired are valid states for SSE consumers / downstream crates
 #[serde(rename_all = "snake_case")]
 pub enum OutboundJobState {
     Queued,

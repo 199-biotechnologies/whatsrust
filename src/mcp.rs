@@ -43,6 +43,7 @@ pub fn run_mcp_server(port: u16) {
 
 #[derive(Deserialize)]
 struct JsonRpcRequest {
+    #[allow(dead_code)] // Required by JSON-RPC spec, validated by serde but not read
     jsonrpc: Option<String>,
     id: Value,
     method: String,
