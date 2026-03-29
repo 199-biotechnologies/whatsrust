@@ -100,12 +100,17 @@ async fn main() -> Result<()> {
         .map(PathBuf::from)
         .or_else(|| Some(PathBuf::from("whatsapp.db.backups")));
 
+    let send_burst: u32 = std::env::var("WHATSRUST_SEND_BURST")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
     let config = BridgeConfig {
         db_path: PathBuf::from("whatsapp.db"),
         pair_phone: std::env::var("WHATSAPP_PAIR_PHONE").ok(),
         allowed_numbers: allowed,
         health_port: api_port,
         backup_dir,
+        send_burst,
         ..Default::default()
     };
 
@@ -1281,6 +1286,7 @@ fn print_cli_help() {
     println!("  WHATSRUST_BIND   API bind address (default: 127.0.0.1)");
     println!("  WHATSRUST_ALLOW_REMOTE=1  Permit non-loopback API binds");
     println!("  WHATSRUST_API_TOKEN  Optional API bearer token; required for remote binds");
+    println!("  WHATSRUST_SEND_BURST     Max burst size before rate limit (default: 5)");
     println!();
     println!("JID FORMAT:");
     println!("  Phone number: 15551234567 or 15551234567@s.whatsapp.net");

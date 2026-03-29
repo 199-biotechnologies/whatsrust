@@ -123,31 +123,73 @@ impl BridgeMetrics {
 }
 
 /// Shared pacing gate for all direct and queued outbound sends.
+/// Token-bucket rate limiter for outbound messages.
+///
+/// Allows short bursts (up to `burst` messages) while enforcing a sustained
+/// rate of one message per `refill_interval`. Tokens refill passively based on
+/// elapsed time, so no background task is needed.
+///
+/// Example with defaults (burst=5, interval=400ms):
+///   - 5 messages fire immediately (draining the bucket)
+///   - Subsequent messages wait ~400ms each until tokens refill
+///   - After 2 seconds of silence, bucket refills to 5
 struct SendPacer {
-    min_send_interval: Duration,
-    last_send: TokioMutex<tokio::time::Instant>,
+    /// Maximum tokens (burst capacity).
+    burst: u32,
+    /// Time to refill one token.
+    refill_interval: Duration,
+    /// State: (available_tokens as f64, last_refill_time).
+    state: TokioMutex<(f64, tokio::time::Instant)>,
 }
 
 impl SendPacer {
     fn new(min_send_interval_ms: u64) -> Self {
+        Self::with_burst(min_send_interval_ms, 5)
+    }
+
+    fn with_burst(refill_interval_ms: u64, burst: u32) -> Self {
         Self {
-            min_send_interval: Duration::from_millis(min_send_interval_ms),
-            last_send: TokioMutex::new(tokio::time::Instant::now() - Duration::from_secs(60)),
+            burst,
+            refill_interval: Duration::from_millis(refill_interval_ms),
+            state: TokioMutex::new((burst as f64, tokio::time::Instant::now())),
         }
     }
 
     async fn wait_turn(&self) {
-        let mut last_send = self.last_send.lock().await;
-        if !self.min_send_interval.is_zero() {
-            let jitter_base_ms = (self.min_send_interval.as_millis() as u64 / 4).max(1);
-            let actual_interval =
-                self.min_send_interval + Duration::from_millis(rand_jitter_ms(jitter_base_ms));
-            let elapsed = last_send.elapsed();
-            if elapsed < actual_interval {
-                tokio::time::sleep(actual_interval - elapsed).await;
-            }
+        if self.refill_interval.is_zero() {
+            return;
         }
-        *last_send = tokio::time::Instant::now();
+        let mut state = self.state.lock().await;
+        let (ref mut tokens, ref mut last_refill) = *state;
+
+        // Passive refill: add tokens based on elapsed time
+        let elapsed = last_refill.elapsed();
+        let refill = elapsed.as_secs_f64() / self.refill_interval.as_secs_f64();
+        if refill > 0.0 {
+            *tokens = (*tokens + refill).min(self.burst as f64);
+            *last_refill = tokio::time::Instant::now();
+        }
+
+        if *tokens >= 1.0 {
+            // Token available — consume and go
+            *tokens -= 1.0;
+        } else {
+            // Wait for next token + jitter
+            let deficit = 1.0 - *tokens;
+            let wait = Duration::from_secs_f64(deficit * self.refill_interval.as_secs_f64());
+            let jitter_ms = rand_jitter_ms((self.refill_interval.as_millis() as u64 / 4).max(1));
+            let total_wait = wait + Duration::from_millis(jitter_ms);
+            drop(state); // release lock during sleep
+            tokio::time::sleep(total_wait).await;
+            // Re-acquire and consume
+            let mut state = self.state.lock().await;
+            let (ref mut tokens, ref mut last_refill) = *state;
+            let elapsed = last_refill.elapsed();
+            let refill = elapsed.as_secs_f64() / self.refill_interval.as_secs_f64();
+            *tokens = (*tokens + refill).min(self.burst as f64);
+            *last_refill = tokio::time::Instant::now();
+            *tokens = (*tokens - 1.0).max(0.0);
+        }
     }
 }
 
@@ -452,6 +494,9 @@ pub struct BridgeConfig {
     pub allowed_numbers: Vec<String>,
     /// Minimum interval between outbound sends (anti-ban pacing, millis).
     pub min_send_interval_ms: u64,
+    /// Maximum burst size for outbound rate limiter (default: 5).
+    /// Up to this many messages can be sent immediately before pacing kicks in.
+    pub send_burst: u32,
     /// TCP port for the health endpoint (0 = disabled).
     pub health_port: u16,
     /// Seconds to wait for in-flight operations during graceful shutdown.
@@ -483,6 +528,7 @@ impl Default for BridgeConfig {
             auto_mark_read: true,
             allowed_numbers: Vec::new(),
             min_send_interval_ms: 400,
+            send_burst: 5,
             health_port: 0,
             drain_timeout_secs: 10,
             backup_dir: None,
@@ -576,7 +622,7 @@ impl WhatsAppBridge {
             Arc::new(ParkingMutex::new(None));
         let rr_tx = spawn_scheduler(None, 200);
         let msg_cache: MsgCache = Arc::new(ParkingMutex::new(BoundedMsgCache::new(MSG_CACHE_CAP)));
-        let send_pacer = Arc::new(SendPacer::new(config.min_send_interval_ms));
+        let send_pacer = Arc::new(SendPacer::with_burst(config.min_send_interval_ms, config.send_burst));
         let subscribed_presence: Arc<DashSet<String>> = Arc::new(DashSet::new());
         let (event_tx, _event_rx) = crate::bridge_events::new_event_bus();
 
@@ -3199,5 +3245,40 @@ mod tests {
         assert!(!should_ignore_jid("15551234567@s.whatsapp.net"));
         assert!(!should_ignore_jid("120363xxxxx@g.us"));
         assert!(!should_ignore_jid("15551234567@c.us"));
+    }
+
+    #[tokio::test]
+    async fn test_send_pacer_burst_allows_immediate_sends() {
+        // Burst=3, 100ms refill — first 3 calls should be near-instant
+        let pacer = SendPacer::with_burst(100, 3);
+        let start = tokio::time::Instant::now();
+        for _ in 0..3 {
+            pacer.wait_turn().await;
+        }
+        let elapsed = start.elapsed();
+        // All 3 should complete well under 100ms (just lock overhead)
+        assert!(elapsed < Duration::from_millis(50), "burst of 3 took {elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn test_send_pacer_throttles_after_burst() {
+        // Burst=1, 100ms refill — second call must wait
+        let pacer = SendPacer::with_burst(100, 1);
+        pacer.wait_turn().await; // consumes the 1 token
+        let start = tokio::time::Instant::now();
+        pacer.wait_turn().await; // must wait for refill
+        let elapsed = start.elapsed();
+        // Should take at least ~100ms (the refill interval) but account for jitter
+        assert!(elapsed >= Duration::from_millis(80), "throttled send was too fast: {elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn test_send_pacer_zero_interval_is_unlimited() {
+        let pacer = SendPacer::with_burst(0, 5);
+        let start = tokio::time::Instant::now();
+        for _ in 0..20 {
+            pacer.wait_turn().await;
+        }
+        assert!(start.elapsed() < Duration::from_millis(10));
     }
 }
