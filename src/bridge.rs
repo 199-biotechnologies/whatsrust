@@ -2811,11 +2811,24 @@ async fn handle_outbound(
         match crate::outbound::execute_job(&row, &jid, &client).await {
             Ok(outcome) => {
                 metrics.record_sent();
-                if let Err(e) = store.mark_outbound_sent(row.id).await {
-                    error!(error = %e, row_id = row.id, "failed to mark job as sent");
+                // Retry mark_sent up to 3 times — failure here means the job
+                // could be re-sent on restart (at-least-once), so we try hard.
+                for attempt in 0..3 {
+                    match store.mark_outbound_sent(row.id).await {
+                        Ok(()) => break,
+                        Err(e) if attempt < 2 => {
+                            warn!(error = %e, row_id = row.id, attempt, "retrying mark_outbound_sent");
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                        Err(e) => {
+                            error!(error = %e, row_id = row.id, "failed to mark job as sent after 3 attempts — may re-send on restart");
+                        }
+                    }
                 }
                 if let Some(ref wa_id) = outcome.wa_message_id {
-                    let _ = store.set_job_wa_message_id(row.id, wa_id).await;
+                    if let Err(e) = store.set_job_wa_message_id(row.id, wa_id).await {
+                        warn!(error = %e, row_id = row.id, "failed to set wa_message_id — receipt correlation may fail");
+                    }
                 }
 
                 // Store poll enc_key if this was a poll send
@@ -2850,8 +2863,17 @@ async fn handle_outbound(
                         "failed to execute outbound job; will retry"
                     );
                 }
-                if let Err(db_e) = store.mark_outbound_failed(row.id, max_retries).await {
-                    error!(error = %db_e, row_id = row.id, "failed to mark job as failed");
+                for attempt in 0..3 {
+                    match store.mark_outbound_failed(row.id, max_retries).await {
+                        Ok(()) => break,
+                        Err(db_e) if attempt < 2 => {
+                            warn!(error = %db_e, row_id = row.id, attempt, "retrying mark_outbound_failed");
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                        Err(db_e) => {
+                            error!(error = %db_e, row_id = row.id, "failed to mark job as failed after 3 attempts — row stuck as inflight");
+                        }
+                    }
                 }
 
                 // Emit Failed status only if max retries exceeded

@@ -98,11 +98,34 @@ fn json_ok_simple() -> Vec<u8> {
 }
 
 fn json_err(status: u16, msg: &str) -> Vec<u8> {
-    json_response(status, &json!({"ok": false, "error": msg}).to_string())
+    let code = match status {
+        400 => "bad_request",
+        401 => "unauthorized",
+        403 => "forbidden",
+        404 => "not_found",
+        503 => "unavailable",
+        _ => "internal_error",
+    };
+    json_response(status, &json!({"ok": false, "code": code, "error": msg}).to_string())
 }
 
 fn parse_body<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Vec<u8>> {
     serde_json::from_slice(body).map_err(|e| json_err(400, &format!("invalid JSON: {e}")))
+}
+
+/// Classify bridge errors into HTTP status codes for machine-friendly responses.
+fn bridge_err(e: anyhow::Error) -> Vec<u8> {
+    let msg = e.to_string();
+    let status = if msg.contains("not connected") || msg.contains("no client") {
+        503
+    } else if msg.contains("bad JID") || msg.contains("empty JID") || msg.contains("required for group") {
+        400
+    } else if msg.contains("timed out") {
+        504
+    } else {
+        500
+    };
+    json_err(status, &msg)
 }
 
 fn bool_env_var(name: &str) -> bool {
@@ -301,6 +324,8 @@ async fn handle_request(bridge: &WhatsAppBridge, req: &HttpRequest, is_loopback:
         ("POST", "/api/view-once-video") => handle_media_with_path(bridge, &req.body, is_loopback, MediaKind::ViewOnceVideo).await,
         ("POST", "/api/typing") => handle_jid_action(bridge, &req.body, JidAction::StartTyping).await,
         ("POST", "/api/stop-typing") => handle_jid_action(bridge, &req.body, JidAction::StopTyping).await,
+        ("POST", "/api/recording") => handle_jid_action(bridge, &req.body, JidAction::StartRecording).await,
+        ("POST", "/api/stop-recording") => handle_jid_action(bridge, &req.body, JidAction::StopRecording).await,
         ("POST", "/api/subscribe-presence") => handle_jid_action(bridge, &req.body, JidAction::SubscribePresence).await,
 
         // Group management
@@ -378,7 +403,7 @@ async fn handle_groups(bridge: &WhatsAppBridge) -> Vec<u8> {
                 .collect();
             json_ok(json!({ "groups": list }))
         }
-        Err(e) => json_err(500, &e.to_string()),
+        Err(e) => bridge_err(e),
     }
 }
 
@@ -403,7 +428,7 @@ async fn handle_group_info(bridge: &WhatsAppBridge, req: &HttpRequest) -> Vec<u8
                 "participants": participants,
             }))
         }
-        Err(e) => json_err(500, &e.to_string()),
+        Err(e) => bridge_err(e),
     }
 }
 
@@ -421,7 +446,7 @@ async fn handle_send(bridge: &WhatsAppBridge, body: &[u8], sync: bool) -> Vec<u8
         // Backward-compat: wait for send, return both job_id and WA message id
         match bridge.send_message_with_id(&req.jid, &req.text).await {
             Ok(id) => json_response(200, &serde_json::json!({"ok": true, "id": id}).to_string()),
-            Err(e) => json_err(500, &e.to_string()),
+            Err(e) => bridge_err(e),
         }
     } else {
         // Async: enqueue and return job_id immediately
@@ -431,7 +456,7 @@ async fn handle_send(bridge: &WhatsAppBridge, body: &[u8], sync: bool) -> Vec<u8
         };
         match bridge.enqueue_op(&req.jid, crate::outbound::OutboundOpKind::Text, &payload, None).await {
             Ok(job_id) => json_response(200, &serde_json::json!({"ok": true, "job_id": job_id}).to_string()),
-            Err(e) => json_err(500, &e.to_string()),
+            Err(e) => bridge_err(e),
         }
     }
 }
@@ -448,7 +473,7 @@ async fn handle_reply(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
     let req: ReplyReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
     match bridge.send_reply(&req.jid, &req.id, &req.sender, &req.text).await {
         Ok(id) => json_ok_id(&id),
-        Err(e) => json_err(500, &e.to_string()),
+        Err(e) => bridge_err(e),
     }
 }
 
@@ -463,7 +488,7 @@ async fn handle_edit(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
     let req: EditReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
     match bridge.edit_message(&req.jid, &req.id, &req.text).await {
         Ok(()) => json_ok_simple(),
-        Err(e) => json_err(500, &e.to_string()),
+        Err(e) => bridge_err(e),
     }
 }
 
@@ -498,7 +523,7 @@ async fn handle_react(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
         from_me,
     ).await {
         Ok(()) => json_ok_simple(),
-        Err(e) => json_err(500, &e.to_string()),
+        Err(e) => bridge_err(e),
     }
 }
 
@@ -511,7 +536,7 @@ async fn handle_unreact(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
         req.from_me.unwrap_or(true),
     ).await {
         Ok(()) => json_ok_simple(),
-        Err(e) => json_err(500, &e.to_string()),
+        Err(e) => bridge_err(e),
     }
 }
 
@@ -525,13 +550,13 @@ async fn handle_revoke(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
     let req: RevokeReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
     match bridge.revoke_message(&req.jid, &req.id).await {
         Ok(()) => json_ok_simple(),
-        Err(e) => json_err(500, &e.to_string()),
+        Err(e) => bridge_err(e),
     }
 }
 
 // --- Simple JID-only actions (typing, presence) ---
 
-enum JidAction { StartTyping, StopTyping, SubscribePresence, GroupLeave }
+enum JidAction { StartTyping, StopTyping, StartRecording, StopRecording, SubscribePresence, GroupLeave }
 
 #[derive(Deserialize)]
 struct JidReq {
@@ -543,12 +568,14 @@ async fn handle_jid_action(bridge: &WhatsAppBridge, body: &[u8], action: JidActi
     let result = match action {
         JidAction::StartTyping => bridge.start_typing(&req.jid).await,
         JidAction::StopTyping => bridge.stop_typing(&req.jid).await,
+        JidAction::StartRecording => bridge.start_recording(&req.jid).await,
+        JidAction::StopRecording => bridge.stop_recording(&req.jid).await,
         JidAction::SubscribePresence => bridge.subscribe_presence(&req.jid).await,
         JidAction::GroupLeave => bridge.leave_group(&req.jid).await,
     };
     match result {
         Ok(()) => json_ok_simple(),
-        Err(e) => json_err(500, &e.to_string()),
+        Err(e) => bridge_err(e),
     }
 }
 
@@ -565,7 +592,7 @@ async fn handle_group_create(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
     let parts: Vec<&str> = req.participants.iter().map(|s| s.as_str()).collect();
     match bridge.create_group(&req.name, &parts).await {
         Ok(gid) => json_ok(json!({"group_jid": gid})),
-        Err(e) => json_err(500, &e.to_string()),
+        Err(e) => bridge_err(e),
     }
 }
 
@@ -579,7 +606,7 @@ async fn handle_group_subject(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
     let req: GroupSubjectReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
     match bridge.set_group_subject(&req.jid, &req.subject).await {
         Ok(()) => json_ok_simple(),
-        Err(e) => json_err(500, &e.to_string()),
+        Err(e) => bridge_err(e),
     }
 }
 
@@ -593,7 +620,7 @@ async fn handle_group_description(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u
     let req: GroupDescriptionReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
     match bridge.set_group_description(&req.jid, req.description.as_deref()).await {
         Ok(()) => json_ok_simple(),
-        Err(e) => json_err(500, &e.to_string()),
+        Err(e) => bridge_err(e),
     }
 }
 
@@ -604,7 +631,7 @@ async fn handle_group_invite_link(bridge: &WhatsAppBridge, req: &HttpRequest) ->
     };
     match bridge.get_group_invite_link(jid).await {
         Ok(link) => json_ok(json!({"link": link})),
-        Err(e) => json_err(500, &e.to_string()),
+        Err(e) => bridge_err(e),
     }
 }
 
@@ -622,19 +649,19 @@ async fn handle_group_participants(bridge: &WhatsAppBridge, body: &[u8], action:
     match action {
         ParticipantAction::Add => match bridge.add_participants(&req.jid, &parts).await {
             Ok(_results) => json_ok_simple(),
-            Err(e) => json_err(500, &e.to_string()),
+            Err(e) => bridge_err(e),
         },
         ParticipantAction::Remove => match bridge.remove_participants(&req.jid, &parts).await {
             Ok(_results) => json_ok_simple(),
-            Err(e) => json_err(500, &e.to_string()),
+            Err(e) => bridge_err(e),
         },
         ParticipantAction::Promote => match bridge.promote_participants(&req.jid, &parts).await {
             Ok(()) => json_ok_simple(),
-            Err(e) => json_err(500, &e.to_string()),
+            Err(e) => bridge_err(e),
         },
         ParticipantAction::Demote => match bridge.demote_participants(&req.jid, &parts).await {
             Ok(()) => json_ok_simple(),
-            Err(e) => json_err(500, &e.to_string()),
+            Err(e) => bridge_err(e),
         },
     }
 }
@@ -728,7 +755,7 @@ async fn handle_media_with_path(bridge: &WhatsAppBridge, body: &[u8], is_loopbac
     };
     match result {
         Ok(()) => json_ok_simple(),
-        Err(e) => json_err(500, &e.to_string()),
+        Err(e) => bridge_err(e),
     }
 }
 
@@ -745,7 +772,7 @@ async fn handle_location(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
     let req: LocationReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
     match bridge.send_location(&req.jid, req.lat, req.lon, None, None).await {
         Ok(()) => json_ok_simple(),
-        Err(e) => json_err(500, &e.to_string()),
+        Err(e) => bridge_err(e),
     }
 }
 
@@ -764,7 +791,7 @@ async fn handle_contact(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
     );
     match bridge.send_contact(&req.jid, &req.name, &vcard).await {
         Ok(()) => json_ok_simple(),
-        Err(e) => json_err(500, &e.to_string()),
+        Err(e) => bridge_err(e),
     }
 }
 
@@ -778,7 +805,7 @@ async fn handle_forward(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
     let req: ForwardReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
     match bridge.forward_message(&req.jid, &req.msg_id).await {
         Ok(id) => json_ok_id(&id),
-        Err(e) => json_err(500, &e.to_string()),
+        Err(e) => bridge_err(e),
     }
 }
 
@@ -802,7 +829,7 @@ async fn handle_poll(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
     };
     match bridge.send_poll(&req.jid, &question, &options, req.selectable_count).await {
         Ok(id) => json_ok_id(&id),
-        Err(e) => json_err(500, &e.to_string()),
+        Err(e) => bridge_err(e),
     }
 }
 

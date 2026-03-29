@@ -205,6 +205,8 @@ async fn main() -> Result<()> {
         println!("  subscribe <jid>                — subscribe to contact presence");
         println!("  typing <jid>                   — show typing indicator");
         println!("  stop-typing <jid>              — cancel typing indicator");
+        println!("  recording <jid>                — show recording indicator");
+        println!("  stop-recording <jid>           — cancel recording indicator");
         println!("  status                         — show bridge state");
         println!("  quit                           — shut down");
         println!();
@@ -605,6 +607,24 @@ async fn main() -> Result<()> {
                             }
                             if let Err(e) = bridge_for_repl.stop_typing(parts[1]).await {
                                 println!("!! stop-typing failed: {e}");
+                            }
+                        }
+                        "recording" | "rec" => {
+                            if parts.len() < 2 {
+                                println!("usage: recording <jid>");
+                                continue;
+                            }
+                            if let Err(e) = bridge_for_repl.start_recording(parts[1]).await {
+                                println!("!! recording failed: {e}");
+                            }
+                        }
+                        "stop-recording" | "sr" => {
+                            if parts.len() < 2 {
+                                println!("usage: stop-recording <jid>");
+                                continue;
+                            }
+                            if let Err(e) = bridge_for_repl.stop_recording(parts[1]).await {
+                                println!("!! stop-recording failed: {e}");
                             }
                         }
                         "edit-test" | "et" => {
@@ -1090,6 +1110,20 @@ async fn cli_main(args: &[String]) -> Result<()> {
             print_json_result(status, &resp)?;
             Ok(())
         }
+        "recording" => {
+            require_args(args, 2, "recording <jid>")?;
+            let body = json!({"jid": args[1]}).to_string();
+            let (status, resp) = api::cli_post(port, "/api/recording", &body).await?;
+            print_json_result(status, &resp)?;
+            Ok(())
+        }
+        "stop-recording" => {
+            require_args(args, 2, "stop-recording <jid>")?;
+            let body = json!({"jid": args[1]}).to_string();
+            let (status, resp) = api::cli_post(port, "/api/stop-recording", &body).await?;
+            print_json_result(status, &resp)?;
+            Ok(())
+        }
         "subscribe" | "subscribe-presence" => {
             require_args(args, 2, "subscribe <jid>")?;
             let body = json!({"jid": args[1]}).to_string();
@@ -1269,6 +1303,8 @@ fn print_cli_help() {
     println!("  whatsrust vo-video <jid> <path> [cap]  Send view-once video");
     println!("  whatsrust typing <jid>                 Send typing indicator");
     println!("  whatsrust stop-typing <jid>            Clear typing indicator");
+    println!("  whatsrust recording <jid>              Send recording indicator");
+    println!("  whatsrust stop-recording <jid>         Clear recording indicator");
     println!("  whatsrust subscribe <jid>              Subscribe to presence updates");
     println!("  whatsrust group-create <name> <jid>... Create group with participants");
     println!("  whatsrust group-subject <jid> <subj>   Set group subject/name");
