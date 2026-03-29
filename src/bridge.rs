@@ -47,6 +47,55 @@ const MAX_MEDIA_BYTES: u64 = 50 * 1024 * 1024; // 50 MiB
 const MAX_CONCURRENT_DOWNLOADS: usize = 4;
 /// Maximum cached messages for forward_message lookup.
 const MSG_CACHE_CAP: usize = 256;
+/// TTL for cached group metadata (5 minutes).
+const GROUP_CACHE_TTL: Duration = Duration::from_secs(300);
+
+// ---------------------------------------------------------------------------
+// Group metadata cache
+// ---------------------------------------------------------------------------
+
+struct CachedGroup {
+    info: GroupInfo,
+    fetched_at: std::time::Instant,
+}
+
+struct GroupCache {
+    entries: std::collections::HashMap<String, CachedGroup>,
+}
+
+impl GroupCache {
+    fn new() -> Self {
+        Self { entries: std::collections::HashMap::new() }
+    }
+
+    fn get(&self, jid: &str) -> Option<&GroupInfo> {
+        self.entries.get(jid).and_then(|e| {
+            if e.fetched_at.elapsed() < GROUP_CACHE_TTL {
+                Some(&e.info)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn insert(&mut self, jid: String, info: GroupInfo) {
+        self.entries.insert(jid, CachedGroup {
+            info,
+            fetched_at: std::time::Instant::now(),
+        });
+    }
+
+    fn invalidate(&mut self, jid: &str) {
+        self.entries.remove(jid);
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+type GroupCacheHandle = Arc<ParkingMutex<GroupCache>>;
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -604,6 +653,8 @@ pub struct WhatsAppBridge {
     subscribed_presence: Arc<DashSet<String>>,
     /// Broadcast event bus for inbound messages, outbound status, and receipts.
     event_tx: tokio::sync::broadcast::Sender<Arc<crate::bridge_events::BridgeEvent>>,
+    /// Cached group metadata (TTL-based, invalidated on group mutation).
+    group_cache: GroupCacheHandle,
 }
 
 impl WhatsAppBridge {
@@ -623,6 +674,7 @@ impl WhatsAppBridge {
         let msg_cache: MsgCache = Arc::new(ParkingMutex::new(BoundedMsgCache::new(MSG_CACHE_CAP)));
         let send_pacer = Arc::new(SendPacer::with_burst(config.min_send_interval_ms, config.send_burst));
         let subscribed_presence: Arc<DashSet<String>> = Arc::new(DashSet::new());
+        let group_cache: GroupCacheHandle = Arc::new(ParkingMutex::new(GroupCache::new()));
         let (event_tx, _event_rx) = crate::bridge_events::new_event_bus();
 
         // Open store early so bridge methods can access it (e.g. poll key storage)
@@ -659,6 +711,7 @@ impl WhatsAppBridge {
             send_pacer,
             subscribed_presence,
             event_tx,
+            group_cache,
         }
     }
 
@@ -702,10 +755,17 @@ impl WhatsAppBridge {
         &self,
         group_jid: &str,
     ) -> Result<GroupInfo> {
+        // Check cache first
+        {
+            let cache = self.group_cache.lock();
+            if let Some(info) = cache.get(group_jid) {
+                return Ok(info.clone());
+            }
+        }
         let jid = parse_jid(group_jid)?;
         let client = get_client_handle(&self.client_handle).context("not connected")?;
         let metadata = client.groups().get_metadata(&jid).await?;
-        Ok(GroupInfo {
+        let info = GroupInfo {
             jid: metadata.id.to_string(),
             subject: metadata.subject,
             participants: metadata
@@ -717,14 +777,16 @@ impl WhatsAppBridge {
                     is_admin: p.is_admin,
                 })
                 .collect(),
-        })
+        };
+        self.group_cache.lock().insert(group_jid.to_string(), info.clone());
+        Ok(info)
     }
 
-    /// Get all groups this device is a member of.
+    /// Get all groups this device is a member of (cached, 5min TTL).
     pub async fn get_joined_groups(&self) -> Result<Vec<GroupInfo>> {
         let client = get_client_handle(&self.client_handle).context("not connected")?;
         let groups = client.groups().get_participating().await?;
-        Ok(groups
+        let result: Vec<GroupInfo> = groups
             .into_values()
             .map(|g| GroupInfo {
                 jid: g.id.to_string(),
@@ -739,7 +801,13 @@ impl WhatsAppBridge {
                     })
                     .collect(),
             })
-            .collect())
+            .collect();
+        // Populate individual group cache entries
+        let mut cache = self.group_cache.lock();
+        for info in &result {
+            cache.insert(info.jid.clone(), info.clone());
+        }
+        Ok(result)
     }
 
     /// Create a new group with the given name and participant phone numbers.
@@ -767,6 +835,7 @@ impl WhatsAppBridge {
         let validated_subject = GroupSubject::new(subject.to_string())
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         client.groups().set_subject(&jid, validated_subject).await?;
+        self.group_cache.lock().invalidate(group_jid);
         Ok(())
     }
 
@@ -775,6 +844,7 @@ impl WhatsAppBridge {
         let jid = parse_jid(group_jid)?;
         let client = get_client_handle(&self.client_handle).context("not connected")?;
         client.groups().leave(&jid).await?;
+        self.group_cache.lock().invalidate(group_jid);
         Ok(())
     }
 
@@ -800,6 +870,7 @@ impl WhatsAppBridge {
             .transpose()
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         client.groups().set_description(&jid, desc, None).await?;
+        self.group_cache.lock().invalidate(group_jid);
         Ok(())
     }
 
@@ -816,6 +887,7 @@ impl WhatsAppBridge {
             .map(|p| parse_jid(p))
             .collect::<Result<Vec<_>>>()?;
         let results = client.groups().add_participants(&jid, &jids).await?;
+        self.group_cache.lock().invalidate(group_jid);
         Ok(results
             .into_iter()
             .map(|r| (r.jid.to_string(), r.status))
@@ -835,6 +907,7 @@ impl WhatsAppBridge {
             .map(|p| parse_jid(p))
             .collect::<Result<Vec<_>>>()?;
         let results = client.groups().remove_participants(&jid, &jids).await?;
+        self.group_cache.lock().invalidate(group_jid);
         Ok(results
             .into_iter()
             .map(|r| (r.jid.to_string(), r.status))
@@ -854,6 +927,7 @@ impl WhatsAppBridge {
             .map(|p| parse_jid(p))
             .collect::<Result<Vec<_>>>()?;
         client.groups().promote_participants(&jid, &jids).await?;
+        self.group_cache.lock().invalidate(group_jid);
         Ok(())
     }
 
@@ -870,6 +944,7 @@ impl WhatsAppBridge {
             .map(|p| parse_jid(p))
             .collect::<Result<Vec<_>>>()?;
         client.groups().demote_participants(&jid, &jids).await?;
+        self.group_cache.lock().invalidate(group_jid);
         Ok(())
     }
 
