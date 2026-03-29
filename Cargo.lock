@@ -2474,6 +2474,7 @@ dependencies = [
  "aes-gcm",
  "anyhow",
  "async-trait",
+ "base64",
  "chrono",
  "dashmap",
  "fs2",

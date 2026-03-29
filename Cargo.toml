@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 aes-gcm = "0.10"
 anyhow = "1"
+base64 = "0.22"
 async-trait = "0.1"
 chrono = "0.4"
 dashmap = "6"

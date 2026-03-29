@@ -311,17 +311,17 @@ async fn handle_request(bridge: &WhatsAppBridge, req: &HttpRequest, is_loopback:
         ("POST", "/api/react") => handle_react(bridge, &req.body).await,
         ("POST", "/api/unreact") => handle_unreact(bridge, &req.body).await,
         ("POST", "/api/revoke") => handle_revoke(bridge, &req.body).await,
-        ("POST", "/api/image") => handle_media_with_path(bridge, &req.body, is_loopback, MediaKind::Image).await,
-        ("POST", "/api/video") => handle_media_with_path(bridge, &req.body, is_loopback, MediaKind::Video).await,
-        ("POST", "/api/audio") => handle_media_with_path(bridge, &req.body, is_loopback, MediaKind::Audio).await,
-        ("POST", "/api/doc") => handle_media_with_path(bridge, &req.body, is_loopback, MediaKind::Doc).await,
-        ("POST", "/api/sticker") => handle_media_with_path(bridge, &req.body, is_loopback, MediaKind::Sticker).await,
+        ("POST", "/api/image") => handle_media(bridge, &req.body, is_loopback, MediaKind::Image).await,
+        ("POST", "/api/video") => handle_media(bridge, &req.body, is_loopback, MediaKind::Video).await,
+        ("POST", "/api/audio") => handle_media(bridge, &req.body, is_loopback, MediaKind::Audio).await,
+        ("POST", "/api/doc") => handle_media(bridge, &req.body, is_loopback, MediaKind::Doc).await,
+        ("POST", "/api/sticker") => handle_media(bridge, &req.body, is_loopback, MediaKind::Sticker).await,
         ("POST", "/api/location") => handle_location(bridge, &req.body).await,
         ("POST", "/api/contact") => handle_contact(bridge, &req.body).await,
         ("POST", "/api/forward") => handle_forward(bridge, &req.body).await,
         ("POST", "/api/poll") => handle_poll(bridge, &req.body).await,
-        ("POST", "/api/view-once-image") => handle_media_with_path(bridge, &req.body, is_loopback, MediaKind::ViewOnceImage).await,
-        ("POST", "/api/view-once-video") => handle_media_with_path(bridge, &req.body, is_loopback, MediaKind::ViewOnceVideo).await,
+        ("POST", "/api/view-once-image") => handle_media(bridge, &req.body, is_loopback, MediaKind::ViewOnceImage).await,
+        ("POST", "/api/view-once-video") => handle_media(bridge, &req.body, is_loopback, MediaKind::ViewOnceVideo).await,
         ("POST", "/api/typing") => handle_jid_action(bridge, &req.body, JidAction::StartTyping).await,
         ("POST", "/api/stop-typing") => handle_jid_action(bridge, &req.body, JidAction::StopTyping).await,
         ("POST", "/api/recording") => handle_jid_action(bridge, &req.body, JidAction::StartRecording).await,
@@ -689,7 +689,14 @@ async fn handle_group_participants(bridge: &WhatsAppBridge, body: &[u8], action:
 #[derive(Deserialize)]
 struct MediaReq {
     jid: String,
-    path: String,
+    /// Local file path (loopback-only).
+    path: Option<String>,
+    /// Base64-encoded media bytes (works for remote + loopback).
+    data: Option<String>,
+    /// MIME type — required when using base64 data, inferred from path otherwise.
+    mime: Option<String>,
+    /// Filename — used for document sends when using base64.
+    filename: Option<String>,
     caption: Option<String>,
 }
 
@@ -752,24 +759,53 @@ fn mime_for_doc(path: &std::path::Path) -> &'static str {
 
 enum MediaKind { Image, Video, Audio, Doc, Sticker, ViewOnceImage, ViewOnceVideo }
 
-async fn handle_media_with_path(bridge: &WhatsAppBridge, body: &[u8], is_loopback: bool, kind: MediaKind) -> Vec<u8> {
-    if !is_loopback {
-        return json_err(403, "local-path media uploads are disabled for non-loopback API binds");
-    }
+async fn handle_media(bridge: &WhatsAppBridge, body: &[u8], is_loopback: bool, kind: MediaKind) -> Vec<u8> {
     let req: MediaReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
-    let data = match read_file_for_media(&req.path).await { Ok(d) => d, Err(e) => return e };
-    let path = std::path::Path::new(&req.path);
-    let result = match kind {
-        MediaKind::Image => bridge.send_image(&req.jid, data, mime_for_image(path), req.caption.as_deref()).await,
-        MediaKind::Video => bridge.send_video(&req.jid, data, mime_for_video(path), req.caption.as_deref()).await,
-        MediaKind::Audio => bridge.send_audio(&req.jid, data, mime_for_audio(path), None).await,
-        MediaKind::Doc => {
-            let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-            bridge.send_document(&req.jid, data, mime_for_doc(path), filename).await
+
+    // Resolve media bytes + mime from either path or base64 data
+    let (data, mime_str, filename_str) = if let Some(ref b64) = req.data {
+        // Base64 mode — works for both loopback and remote (no filesystem access)
+        use base64::Engine;
+        let bytes = match base64::engine::general_purpose::STANDARD.decode(b64) {
+            Ok(b) => b,
+            Err(e) => return json_err(400, &format!("invalid base64: {e}")),
+        };
+        if bytes.len() as u64 > MAX_MEDIA_READ_BYTES {
+            return json_err(400, &format!("decoded data exceeds size limit ({} > {})", bytes.len(), MAX_MEDIA_READ_BYTES));
         }
-        MediaKind::Sticker => bridge.send_sticker(&req.jid, data, "image/webp", false).await,
-        MediaKind::ViewOnceImage => bridge.send_view_once_image(&req.jid, data, mime_for_image(path), req.caption.as_deref()).await,
-        MediaKind::ViewOnceVideo => bridge.send_view_once_video(&req.jid, data, mime_for_video(path), req.caption.as_deref()).await,
+        let mime = req.mime.clone().unwrap_or_else(|| "application/octet-stream".to_string());
+        let fname = req.filename.clone().unwrap_or_else(|| "file".to_string());
+        (bytes, mime, fname)
+    } else if let Some(ref path_str) = req.path {
+        // Path mode — loopback-only
+        if !is_loopback {
+            return json_err(403, "local-path media uploads are disabled for non-loopback API binds");
+        }
+        let bytes = match read_file_for_media(path_str).await { Ok(d) => d, Err(e) => return e };
+        let path = std::path::Path::new(path_str);
+        let mime = req.mime.clone().unwrap_or_else(|| match kind {
+            MediaKind::Image => mime_for_image(path).to_string(),
+            MediaKind::Video => mime_for_video(path).to_string(),
+            MediaKind::Audio => mime_for_audio(path).to_string(),
+            MediaKind::Doc => mime_for_doc(path).to_string(),
+            MediaKind::Sticker => "image/webp".to_string(),
+            MediaKind::ViewOnceImage => mime_for_image(path).to_string(),
+            MediaKind::ViewOnceVideo => mime_for_video(path).to_string(),
+        });
+        let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();
+        (bytes, mime, fname)
+    } else {
+        return json_err(400, "either 'path' (loopback) or 'data' (base64) is required");
+    };
+
+    let result = match kind {
+        MediaKind::Image => bridge.send_image(&req.jid, data, &mime_str, req.caption.as_deref()).await,
+        MediaKind::Video => bridge.send_video(&req.jid, data, &mime_str, req.caption.as_deref()).await,
+        MediaKind::Audio => bridge.send_audio(&req.jid, data, &mime_str, None).await,
+        MediaKind::Doc => bridge.send_document(&req.jid, data, &mime_str, &filename_str).await,
+        MediaKind::Sticker => bridge.send_sticker(&req.jid, data, &mime_str, false).await,
+        MediaKind::ViewOnceImage => bridge.send_view_once_image(&req.jid, data, &mime_str, req.caption.as_deref()).await,
+        MediaKind::ViewOnceVideo => bridge.send_view_once_video(&req.jid, data, &mime_str, req.caption.as_deref()).await,
     };
     match result {
         Ok(()) => json_ok_simple(),
