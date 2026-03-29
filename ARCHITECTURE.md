@@ -1,19 +1,24 @@
 # Architecture
 
-whatsrust is a pure Rust WhatsApp Web bridge. ~5,000 lines across 7 files.
+whatsrust is a pure Rust WhatsApp Web bridge. ~10,000 lines across 13 files.
 
 ## Module Map
 
 ```
 src/
-  bridge.rs          Core: event loop, messaging, outbound queue, health endpoint, metrics
-  storage.rs         rusqlite Signal Protocol store (identity, prekey, session, sender-key)
+  bridge.rs          Core: event loop, messaging, groups, delivery receipts, group cache, presence
+  outbound.rs        Typed outbound ops (17 OpKinds), payload structs, execute_job()
+  bridge_events.rs   Broadcast event bus: BridgeEvent, OutboundStatusEvent, DeliveryStatus
+  api.rs             REST API (37 endpoints), SSE streaming, CLI HTTP client
+  mcp.rs             MCP server (15 tools, JSON-RPC over stdio)
+  storage.rs         rusqlite Signal Protocol store + typed job queue + inbound history
   dedup.rs           Generation-tracked DashMap dedup (concurrent-safe, bounded)
   read_receipts.rs   Batched receipt scheduler with flush-before-reply
+  polls.rs           Poll crypto (HKDF-SHA256 + AES-256-GCM)
   qr.rs              QR rendering (terminal/PNG/HTML/SVG)
   instance_lock.rs   flock-based single-instance guard (prevents StreamReplaced loops)
-  main.rs            REPL + signal handling
-  lib.rs             Library crate exports
+  main.rs            Daemon (REPL + API), CLI client (38 commands), MCP mode
+  lib.rs             Library crate exports (all modules pub, consumed by habb)
 ```
 
 ## Data Flow
@@ -52,13 +57,19 @@ src/
 
 **DashMap with generation counter for dedup.** Lock-free concurrent access. Generation tracking prevents eviction corruption after remove+re-admit cycles.
 
-**Channel architecture.** `mpsc` for inbound, `mpsc` for outbound, `watch` for state + QR. Clean separation between bridge internals and consumers.
+**SQLite-first sends.** All 17 outbound op types write to SQLite before returning success. Outbound worker wakes via `tokio::sync::Notify`, claims jobs with `claim_next_job()`, executes via `execute_job()` (media upload + send). Survives crashes — inflight jobs are requeued on restart.
+
+**Broadcast event bus.** `tokio::sync::broadcast` (cap 256) carries `BridgeEvent::Inbound`, `OutboundStatus`, `Heartbeat`. Feeds SSE endpoint, in-process subscribers, and sync waiters (`enqueue_and_wait` subscribes BEFORE enqueue to avoid race).
+
+**Token-bucket rate limiter.** Allows short bursts (default 5) while enforcing sustained rate (400ms/msg + jitter). Passive refill, no background task.
+
+**Channel architecture.** `mpsc` for inbound to consumer, `broadcast` for event bus, `watch` for state + QR. `Notify` for outbound worker wakeup.
 
 **Single-device only.** No `device_id` column in the protocol store. Cuts query complexity in half vs multi-device implementations.
 
 **Read receipt batching.** Groups message IDs by (chat, participant) on a 200ms coalesce timer. Matches WhatsApp Web's native batching pattern. Flush-before-reply ensures read receipts go out before bot responses.
 
-**Atomic BridgeMetrics.** All counters use `AtomicU64` — no locks, no DB reads for health checks. Served over raw TCP (no HTTP framework dependency).
+**Atomic BridgeMetrics.** All counters use `AtomicU64` — no locks, no DB reads for health checks. API server is raw TCP (no HTTP framework dependency) with connection semaphore (64) + dedicated SSE semaphore (8).
 
 ## Dependencies
 
