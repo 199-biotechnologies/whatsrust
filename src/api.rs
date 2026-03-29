@@ -303,6 +303,8 @@ async fn handle_request(bridge: &WhatsAppBridge, req: &HttpRequest, is_loopback:
         // Groups
         ("GET", "/api/groups") => handle_groups(bridge).await,
         ("GET", "/api/group-info") => handle_group_info(bridge, req).await,
+        ("GET", "/api/history") => handle_history(bridge, req).await,
+        ("GET", "/api/search") => handle_search(bridge, req).await,
 
         // Messaging
         ("POST", "/api/send") => handle_send(bridge, &req.body, req.query_get("sync") == Some("true")).await,
@@ -754,6 +756,37 @@ fn mime_for_doc(path: &std::path::Path) -> &'static str {
         Some("zip") => "application/zip",
         Some("txt") => "text/plain",
         _ => "application/octet-stream",
+    }
+}
+
+// --- History & Search ---
+
+async fn handle_history(bridge: &WhatsAppBridge, req: &HttpRequest) -> Vec<u8> {
+    let jid = req.query_get("jid");
+    let limit: i64 = req.query_get("limit").and_then(|v| v.parse().ok()).unwrap_or(50);
+    let before: Option<i64> = req.query_get("before").and_then(|v| v.parse().ok());
+    match bridge.store().search_inbound(jid, None, limit.min(200), before).await {
+        Ok(rows) => {
+            let count = rows.len();
+            json_ok(json!({"messages": rows, "count": count}))
+        }
+        Err(e) => json_err(500, &e.to_string()),
+    }
+}
+
+async fn handle_search(bridge: &WhatsAppBridge, req: &HttpRequest) -> Vec<u8> {
+    let q = match req.query_get("q") {
+        Some(q) if !q.is_empty() => q,
+        _ => return json_err(400, "query parameter 'q' is required"),
+    };
+    let jid = req.query_get("jid");
+    let limit: i64 = req.query_get("limit").and_then(|v| v.parse().ok()).unwrap_or(20);
+    match bridge.store().search_inbound(jid, Some(q), limit.min(200), None).await {
+        Ok(rows) => {
+            let count = rows.len();
+            json_ok(json!({"messages": rows, "count": count}))
+        }
+        Err(e) => json_err(500, &e.to_string()),
     }
 }
 

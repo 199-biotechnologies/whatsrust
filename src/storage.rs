@@ -187,14 +187,28 @@ CREATE TABLE IF NOT EXISTS poll_keys (
     PRIMARY KEY (chat_jid, poll_id)
 );
 
+-- Inbound message history (searchable, prunable)
+CREATE TABLE IF NOT EXISTS inbound_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_jid TEXT NOT NULL,
+    sender_jid TEXT NOT NULL,
+    message_id TEXT NOT NULL UNIQUE,
+    content_kind TEXT NOT NULL,
+    body_text TEXT,
+    timestamp INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
 -- Indexes for non-PK lookups
 CREATE INDEX IF NOT EXISTS idx_lid_pn_phone ON lid_pn_mapping(phone_number);
 CREATE INDEX IF NOT EXISTS idx_tc_tokens_ts ON tc_tokens(token_timestamp);
 CREATE INDEX IF NOT EXISTS idx_outbound_status ON outbound_queue(status, retry_after, id);
 CREATE INDEX IF NOT EXISTS idx_outbound_wa_id ON outbound_queue(wa_message_id);
+CREATE INDEX IF NOT EXISTS idx_inbound_chat_ts ON inbound_messages(chat_jid, timestamp);
+CREATE INDEX IF NOT EXISTS idx_inbound_msg_id ON inbound_messages(message_id);
 ";
 
-const CURRENT_SCHEMA_VERSION: i64 = 5;
+const CURRENT_SCHEMA_VERSION: i64 = 6;
 
 #[cfg(unix)]
 fn secure_backup_permissions(path: &Path) -> Result<()> {
@@ -233,10 +247,23 @@ pub struct OutboundRow {
     pub retries: i32,
 }
 
+/// A row from the inbound message history table.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct InboundRow {
+    pub id: i64,
+    pub chat_jid: String,
+    pub sender_jid: String,
+    pub message_id: String,
+    pub content_kind: String,
+    pub body_text: Option<String>,
+    pub timestamp: i64,
+}
+
 /// Statistics from a prune operation.
 #[derive(Debug, Clone)]
 pub struct PruneStats {
     pub sent_deleted: u32,
+    pub inbound_deleted: u32,
 }
 
 impl Store {
@@ -593,12 +620,91 @@ impl Store {
     }
 
     // -----------------------------------------------------------------------
+    // Inbound message history
+    // -----------------------------------------------------------------------
+
+    /// Insert an inbound message into the history table. Duplicates (by message_id) are ignored.
+    pub async fn insert_inbound(
+        &self,
+        chat_jid: &str,
+        sender_jid: &str,
+        message_id: &str,
+        content_kind: &str,
+        body_text: Option<&str>,
+        timestamp: i64,
+    ) -> Result<()> {
+        let cj = chat_jid.to_owned();
+        let sj = sender_jid.to_owned();
+        let mid = message_id.to_owned();
+        let ck = content_kind.to_owned();
+        let bt = body_text.map(|s| s.to_owned());
+        let ts = now_secs();
+        self.run(move |c| {
+            c.execute(
+                "INSERT OR IGNORE INTO inbound_messages (chat_jid, sender_jid, message_id, content_kind, body_text, timestamp, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![cj, sj, mid, ck, bt, timestamp, ts],
+            )
+            .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Search inbound message history. Returns recent messages matching filters.
+    pub async fn search_inbound(
+        &self,
+        chat_jid: Option<&str>,
+        query: Option<&str>,
+        limit: i64,
+        before_ts: Option<i64>,
+    ) -> Result<Vec<InboundRow>> {
+        let cj = chat_jid.map(|s| s.to_owned());
+        let q = query.map(|s| format!("%{}%", s.replace('%', "\\%")));
+        let before = before_ts.unwrap_or(i64::MAX);
+        self.run(move |c| {
+            let mut sql = String::from(
+                "SELECT id, chat_jid, sender_jid, message_id, content_kind, body_text, timestamp
+                 FROM inbound_messages WHERE timestamp < ?1"
+            );
+            let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(before)];
+            if let Some(ref jid) = cj {
+                sql.push_str(&format!(" AND chat_jid = ?{}", params_vec.len() + 1));
+                params_vec.push(Box::new(jid.clone()));
+            }
+            if let Some(ref search) = q {
+                sql.push_str(&format!(" AND body_text LIKE ?{} ESCAPE '\\'", params_vec.len() + 1));
+                params_vec.push(Box::new(search.clone()));
+            }
+            sql.push_str(&format!(" ORDER BY timestamp DESC LIMIT ?{}", params_vec.len() + 1));
+            params_vec.push(Box::new(limit));
+
+            let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+            let mut stmt = c.prepare(&sql).map_err(db_err)?;
+            let rows = stmt.query_map(params_refs.as_slice(), |row| {
+                Ok(InboundRow {
+                    id: row.get(0)?,
+                    chat_jid: row.get(1)?,
+                    sender_jid: row.get(2)?,
+                    message_id: row.get(3)?,
+                    content_kind: row.get(4)?,
+                    body_text: row.get(5)?,
+                    timestamp: row.get(6)?,
+                })
+            }).map_err(db_err)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>().map_err(db_err)
+        })
+        .await
+    }
+
+    // -----------------------------------------------------------------------
     // Database pruning — prevent unbounded growth
     // -----------------------------------------------------------------------
 
     /// Prune old data from the database. Returns counts of deleted rows.
-    pub async fn prune_old_data(&self, sent_retention_secs: i64) -> Result<PruneStats> {
+    pub async fn prune_old_data(&self, sent_retention_secs: i64, inbound_retention_secs: i64) -> Result<PruneStats> {
         let sent_cutoff = now_secs() - sent_retention_secs;
+        let inbound_cutoff = now_secs() - inbound_retention_secs;
         self.run(move |c| {
             let tx = c.unchecked_transaction().map_err(db_err)?;
 
@@ -610,12 +716,20 @@ impl Store {
                 )
                 .map_err(db_err)? as u32;
 
+            // 2. Delete old inbound history
+            let inbound_deleted = tx
+                .execute(
+                    "DELETE FROM inbound_messages WHERE created_at < ?1",
+                    params![inbound_cutoff],
+                )
+                .map_err(db_err)? as u32;
+
             tx.commit().map_err(db_err)?;
 
-            // 2. Reclaim disk space progressively (no-op if auto_vacuum != INCREMENTAL)
+            // 3. Reclaim disk space progressively (no-op if auto_vacuum != INCREMENTAL)
             let _ = c.execute_batch("PRAGMA incremental_vacuum(500);");
 
-            Ok(PruneStats { sent_deleted })
+            Ok(PruneStats { sent_deleted, inbound_deleted })
         })
         .await
     }
@@ -823,6 +937,24 @@ fn run_schema_migrations(conn: &Connection, from_version: i64) -> Result<()> {
             conn.execute_batch(
                 "CREATE INDEX IF NOT EXISTS idx_outbound_retry ON outbound_queue(status, retry_after, id);
                  CREATE INDEX IF NOT EXISTS idx_outbound_wa_id ON outbound_queue(wa_message_id);"
+            ).map_err(db_err)?;
+        }
+
+        if from_version < 6 {
+            // v5→v6: inbound message history for search and context
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS inbound_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_jid TEXT NOT NULL,
+                    sender_jid TEXT NOT NULL,
+                    message_id TEXT NOT NULL UNIQUE,
+                    content_kind TEXT NOT NULL,
+                    body_text TEXT,
+                    timestamp INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_inbound_chat_ts ON inbound_messages(chat_jid, timestamp);
+                CREATE INDEX IF NOT EXISTS idx_inbound_msg_id ON inbound_messages(message_id);"
             ).map_err(db_err)?;
         }
 

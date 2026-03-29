@@ -963,6 +963,11 @@ impl WhatsAppBridge {
     }
 
     /// Check if the bridge has an active WhatsApp connection.
+    /// Get a reference to the storage backend (for history/search queries).
+    pub fn store(&self) -> &Store {
+        &self.store
+    }
+
     pub fn metrics(&self) -> &BridgeMetrics {
         &self.metrics
     }
@@ -1486,10 +1491,10 @@ async fn run_bridge(
                 tokio::select! {
                     _ = interval.tick() => {
                         // Prune sent/failed messages older than 24 hours
-                        match prune_store.prune_old_data(86400).await {
+                        match prune_store.prune_old_data(86400, 30 * 86400).await {
                             Ok(stats) => {
-                                if stats.sent_deleted > 0 {
-                                    info!(sent = stats.sent_deleted, "database pruned");
+                                if stats.sent_deleted > 0 || stats.inbound_deleted > 0 {
+                                    info!(sent = stats.sent_deleted, inbound = stats.inbound_deleted, "database pruned");
                                 }
                             }
                             Err(e) => warn!(error = %e, "database prune failed"),
@@ -2003,6 +2008,16 @@ async fn handle_event(
                         is_from_me: info.source.is_from_me,
                         flags,
                     };
+
+                    // Persist to history table for search/context
+                    let body_text = inbound.content.display_text();
+                    let body_opt = if body_text.is_empty() { None } else { Some(body_text.as_str()) };
+                    if let Err(e) = store.insert_inbound(
+                        &inbound.jid, &inbound.sender, &inbound.id,
+                        inbound.content.kind(), body_opt, inbound.timestamp,
+                    ).await {
+                        debug!(error = %e, "failed to insert inbound history (may be duplicate)");
+                    }
 
                     match inbound_tx.send(inbound).await {
                         Ok(()) => {
