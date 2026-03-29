@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use crate::dedup::AtomicDedupCache;
 use crate::read_receipts::{ReadReceiptCmd, spawn_scheduler};
+use dashmap::DashSet;
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex as ParkingMutex;
@@ -544,6 +545,8 @@ pub struct WhatsAppBridge {
     store: Store,
     metrics: Arc<BridgeMetrics>,
     send_pacer: Arc<SendPacer>,
+    /// JIDs with active presence subscriptions — replayed on reconnect.
+    subscribed_presence: Arc<DashSet<String>>,
 }
 
 impl WhatsAppBridge {
@@ -562,6 +565,7 @@ impl WhatsAppBridge {
         let rr_tx = spawn_scheduler(None, 200);
         let msg_cache: MsgCache = Arc::new(ParkingMutex::new(BoundedMsgCache::new(MSG_CACHE_CAP)));
         let send_pacer = Arc::new(SendPacer::new(config.min_send_interval_ms));
+        let subscribed_presence: Arc<DashSet<String>> = Arc::new(DashSet::new());
 
         // Open store early so bridge methods can access it (e.g. poll key storage)
         let store = Store::new(&config.db_path).expect("failed to open database for bridge");
@@ -573,9 +577,10 @@ impl WhatsAppBridge {
         let mc = msg_cache.clone();
         let met = metrics.clone();
         let sp = send_pacer.clone();
+        let sub_pres = subscribed_presence.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                run_bridge(config, inbound_tx, outbound_rx, state_tx, qr_tx, cancel_clone, ch, rr, mc, met, sp).await
+                run_bridge(config, inbound_tx, outbound_rx, state_tx, qr_tx, cancel_clone, ch, rr, mc, met, sp, sub_pres).await
             {
                 error!(error = %e, "WhatsApp bridge exited with error");
             }
@@ -592,6 +597,7 @@ impl WhatsAppBridge {
             store,
             metrics,
             send_pacer,
+            subscribed_presence,
         }
     }
 
@@ -1269,6 +1275,7 @@ impl WhatsAppBridge {
     }
 
     /// Subscribe to a contact's presence updates (online/offline notifications).
+    /// Subscriptions are tracked and replayed automatically on reconnect.
     pub async fn subscribe_presence(&self, jid: &str) -> Result<()> {
         let target = parse_jid(jid)?;
         let client = get_client_handle(&self.client_handle).context("not connected")?;
@@ -1276,7 +1283,9 @@ impl WhatsAppBridge {
             .presence()
             .subscribe(&target)
             .await
-            .map_err(|e| anyhow::anyhow!("presence subscribe failed: {e}"))
+            .map_err(|e| anyhow::anyhow!("presence subscribe failed: {e}"))?;
+        self.subscribed_presence.insert(target.to_string());
+        Ok(())
     }
 
     /// Send a view-once image (disappears after first view).
@@ -1405,6 +1414,7 @@ async fn run_bridge(
     msg_cache: MsgCache,
     metrics: Arc<BridgeMetrics>,
     send_pacer: Arc<SendPacer>,
+    subscribed_presence: Arc<DashSet<String>>,
 ) -> Result<()> {
     info!("WhatsApp bridge starting");
 
@@ -1548,6 +1558,7 @@ async fn run_bridge(
             &metrics,
             &msg_cache,
             &send_pacer,
+            &subscribed_presence,
         )
         .await;
 
@@ -1627,6 +1638,7 @@ async fn run_bot_session(
     metrics: &Arc<BridgeMetrics>,
     msg_cache: &MsgCache,
     send_pacer: &Arc<SendPacer>,
+    subscribed_presence: &Arc<DashSet<String>>,
 ) -> Result<SessionAction> {
     // Clear stale handle from previous session
     set_client_handle(client_handle, None);
@@ -1650,6 +1662,7 @@ async fn run_bot_session(
     let ptx_for_events = config.presence_tx.clone();
     let metrics_for_events = metrics.clone();
     let msg_cache_for_events = msg_cache.clone();
+    let sub_pres_for_events = subscribed_presence.clone();
     // Track previous QR terminal height for in-place overwrite on refresh
     let prev_qr_lines = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
@@ -1674,8 +1687,9 @@ async fn run_bot_session(
             let pql = prev_qr_lines.clone();
             let met = metrics_for_events.clone();
             let mc = msg_cache_for_events.clone();
+            let spres = sub_pres_for_events.clone();
             async move {
-                handle_event(event, client, &ch, &itx, &stx, &qtx, &store, &sr, auto_mark_read, &allowed, &dedup, &bid, &dl_sem, &rr, &ptx, &pql, &met, &mc)
+                handle_event(event, client, &ch, &itx, &stx, &qtx, &store, &sr, auto_mark_read, &allowed, &dedup, &bid, &dl_sem, &rr, &ptx, &pql, &met, &mc, &spres)
                     .await;
             }
         });
@@ -1822,6 +1836,7 @@ async fn handle_event(
     prev_qr_lines: &Arc<std::sync::atomic::AtomicUsize>,
     metrics: &Arc<BridgeMetrics>,
     msg_cache: &MsgCache,
+    subscribed_presence: &Arc<DashSet<String>>,
 ) {
     match event {
         Event::PairingQrCode { code, .. } => {
@@ -1883,6 +1898,22 @@ async fn handle_event(
             });
             metrics.record_connect();
             let _ = state_tx.send(BridgeState::Connected);
+
+            // Replay presence subscriptions from previous sessions
+            let subs: Vec<String> = subscribed_presence.iter().map(|r| r.clone()).collect();
+            if !subs.is_empty() {
+                let c = client.clone();
+                tokio::spawn(async move {
+                    for jid_str in &subs {
+                        if let Ok(jid) = Jid::from_str(jid_str) {
+                            if let Err(e) = c.presence().subscribe(&jid).await {
+                                warn!(jid = %jid_str, error = %e, "failed to replay presence subscription");
+                            }
+                        }
+                    }
+                    info!(count = subs.len(), "replayed presence subscriptions after reconnect");
+                });
+            }
         }
         Event::Message(msg, info) => {
             // Skip noise JIDs: status broadcasts, newsletter channels, server messages
