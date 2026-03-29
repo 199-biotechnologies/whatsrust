@@ -2409,21 +2409,14 @@ async fn extract_content_inner(
 
     // --- Encrypted reaction (enc_reaction_message) ---
     // These carry encrypted payloads we can't decrypt at the bridge level.
-    // Extract target info from the unencrypted key so downstream at least
-    // knows a reaction happened, even without the emoji text.
+    // We cannot distinguish add vs remove without decryption, so log and skip
+    // rather than surfacing misleading data to downstream consumers.
     if let Some(ref enc_react) = msg.enc_reaction_message {
         if let Some(ref key) = enc_react.target_message_key {
             let target_id = key.id.clone().unwrap_or_default();
-            let target_sender = key.participant.clone();
-            // We can't distinguish add vs remove without decrypting, so surface
-            // as a generic reaction-added with a placeholder.
-            debug!(target_id = %target_id, "received enc_reaction_message (encrypted payload, emoji unknown)");
-            return ExtractResult::Content(InboundContent::ReactionAdded {
-                target_id,
-                emoji: "\u{2753}".to_string(), // ❓ — signals encrypted/unknown
-                target_sender,
-            });
+            debug!(target_id = %target_id, "skipping enc_reaction_message (encrypted, cannot determine add/remove)");
         }
+        return ExtractResult::Unhandled;
     }
 
     // --- Edit (incoming edit from others) ---
@@ -2672,17 +2665,6 @@ async fn handle_outbound(
             }
         };
 
-        // Wait for a connected client — do NOT burn retries for "no connection"
-        let Some(client) = get_client_handle(client_handle) else {
-            // Requeue without incrementing retries (connection issue, not send failure)
-            let _ = store.requeue_outbound(row.id).await;
-            tokio::select! {
-                _ = tokio::time::sleep(OUTBOUND_RETRY_DELAY) => {}
-                _ = cancel.cancelled() => break,
-            }
-            continue;
-        };
-
         let jid = match parse_jid(&row.jid) {
             Ok(j) => j,
             Err(e) => {
@@ -2692,8 +2674,20 @@ async fn handle_outbound(
             }
         };
 
-        // Serialize queued sends with the same pacing gate used by direct sends.
+        // Pace BEFORE acquiring client handle — avoids using stale handles after
+        // reconnect during the pacing sleep.
         send_pacer.wait_turn().await;
+
+        // Fetch client AFTER pacing — freshest handle possible.
+        let Some(client) = get_client_handle(client_handle) else {
+            // Requeue without incrementing retries (connection issue, not send failure)
+            let _ = store.requeue_outbound(row.id).await;
+            tokio::select! {
+                _ = tokio::time::sleep(OUTBOUND_RETRY_DELAY) => {}
+                _ = cancel.cancelled() => break,
+            }
+            continue;
+        };
 
         let msg = wa::Message {
             conversation: Some(row.payload.clone()),

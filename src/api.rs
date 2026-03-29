@@ -48,8 +48,9 @@ impl HttpRequest {
 fn http_response(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
     let status_text = match status {
         200 => "OK",
-        401 => "Unauthorized",
         400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
@@ -547,7 +548,7 @@ enum MediaKind { Image, Video, Audio, Doc, Sticker }
 
 async fn handle_media_with_path(bridge: &WhatsAppBridge, body: &[u8], is_loopback: bool, kind: MediaKind) -> Vec<u8> {
     if !is_loopback {
-        return json_err(403, "local-path media uploads are disabled for remote API binds; use loopback or provide base64 data");
+        return json_err(403, "local-path media uploads are disabled for non-loopback API binds");
     }
     let req: MediaReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
     let data = match read_file_for_media(&req.path).await { Ok(d) => d, Err(e) => return e };
