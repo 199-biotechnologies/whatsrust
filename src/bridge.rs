@@ -209,6 +209,7 @@ pub enum InboundContent {
         data: Vec<u8>,
         mime: String,
         filename: String,
+        caption: Option<String>,
     },
     /// Sticker with downloaded bytes.
     Sticker {
@@ -310,9 +311,12 @@ impl InboundContent {
                     None => format!("[video {size}]"),
                 }
             }
-            Self::Document { filename, data, .. } => {
+            Self::Document { filename, data, caption, .. } => {
                 let size = format_size(data.len());
-                format!("[doc: {filename} {size}]")
+                match caption {
+                    Some(c) => format!("[doc: {filename} {size}] {c}"),
+                    None => format!("[doc: {filename} {size}]"),
+                }
             }
             Self::Sticker { is_animated, data, .. } => {
                 let size = format_size(data.len());
@@ -2379,11 +2383,12 @@ async fn extract_content_inner(
         }
         let mime = doc.mimetype.clone().unwrap_or_else(|| "application/octet-stream".to_string());
         let filename = doc.file_name.clone().unwrap_or_else(|| "file".to_string());
+        let caption = doc.caption.clone();
         let _permit = dl_semaphore.acquire().await.expect("semaphore closed");
         match client.download(doc.as_ref() as &dyn Downloadable).await {
             Ok(data) => {
                 if data.len() as u64 > MAX_MEDIA_BYTES { warn!(size = data.len(), "downloaded document exceeds size limit"); return ExtractResult::Unhandled; }
-                return ExtractResult::Content(InboundContent::Document { data, mime, filename });
+                return ExtractResult::Content(InboundContent::Document { data, mime, filename, caption });
             }
             Err(e) => {
                 warn!(error = %e, "failed to download document");
@@ -2401,11 +2406,12 @@ async fn extract_content_inner(
                 }
                 let mime = doc.mimetype.clone().unwrap_or_else(|| "application/octet-stream".to_string());
                 let filename = doc.file_name.clone().unwrap_or_else(|| "file".to_string());
+                let caption = doc.caption.clone();
                 let _permit = dl_semaphore.acquire().await.expect("semaphore closed");
                 match client.download(doc.as_ref() as &dyn Downloadable).await {
                     Ok(data) => {
                         if data.len() as u64 > MAX_MEDIA_BYTES { warn!(size = data.len(), "downloaded document exceeds size limit"); return ExtractResult::Unhandled; }
-                        return ExtractResult::Content(InboundContent::Document { data, mime, filename });
+                        return ExtractResult::Content(InboundContent::Document { data, mime, filename, caption });
                     }
                     Err(e) => {
                         warn!(error = %e, "failed to download document (with caption)");
