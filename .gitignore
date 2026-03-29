@@ -2,6 +2,7 @@
 *.db
 *.db-shm
 *.db-wal
+*.instance.lock
 .claude/
 .worktrees/
 .cargo/config.toml
