@@ -1035,6 +1035,23 @@ impl WhatsAppBridge {
         Ok(job_id)
     }
 
+    /// Enqueue an outbound job scheduled for a future time. Returns the job_id.
+    pub async fn enqueue_op_at(
+        &self,
+        jid: &str,
+        op_kind: crate::outbound::OutboundOpKind,
+        payload_json: &str,
+        payload_blob: Option<Vec<u8>>,
+        execute_at: i64,
+    ) -> Result<i64> {
+        let job_id = self
+            .store
+            .enqueue_job_at(jid, op_kind.as_str(), payload_json, payload_blob, execute_at)
+            .await?;
+        // Don't notify immediately — the worker's periodic timer will pick it up
+        Ok(job_id)
+    }
+
     /// Send an image file to a chat.
     pub async fn send_image(
         &self,
@@ -2779,10 +2796,12 @@ async fn handle_outbound(
         let row = match store.claim_next_job().await {
             Ok(Some(row)) => row,
             Ok(None) => {
-                // Queue empty — wait for notification or cancellation
+                // Queue empty — wait for notification, scheduled timer, or cancellation.
+                // The 5s timer ensures scheduled jobs are picked up even without new enqueues.
                 tokio::select! {
                     _ = cancel.cancelled() => break,
                     _ = outbound_notify.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
                 }
                 continue;
             }

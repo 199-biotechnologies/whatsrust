@@ -440,6 +440,8 @@ struct SendReq {
     text: String,
     #[serde(default)]
     mentions: Vec<String>,
+    /// Unix epoch seconds — if set, defer delivery until this time.
+    schedule_at: Option<i64>,
 }
 
 async fn handle_send(bridge: &WhatsAppBridge, body: &[u8], sync: bool) -> Vec<u8> {
@@ -457,8 +459,19 @@ async fn handle_send(bridge: &WhatsAppBridge, body: &[u8], sync: bool) -> Vec<u8
             Ok(p) => p,
             Err(e) => return json_err(500, &e.to_string()),
         };
-        match bridge.enqueue_op(&req.jid, crate::outbound::OutboundOpKind::Text, &payload, None).await {
-            Ok(job_id) => json_response(200, &serde_json::json!({"ok": true, "job_id": job_id}).to_string()),
+        let result = if let Some(at) = req.schedule_at {
+            bridge.enqueue_op_at(&req.jid, crate::outbound::OutboundOpKind::Text, &payload, None, at).await
+        } else {
+            bridge.enqueue_op(&req.jid, crate::outbound::OutboundOpKind::Text, &payload, None).await
+        };
+        match result {
+            Ok(job_id) => {
+                let mut resp = serde_json::json!({"ok": true, "job_id": job_id});
+                if let Some(at) = req.schedule_at {
+                    resp["scheduled_at"] = serde_json::json!(at);
+                }
+                json_response(200, &resp.to_string())
+            }
             Err(e) => bridge_err(e),
         }
     }

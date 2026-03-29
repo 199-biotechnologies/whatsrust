@@ -497,6 +497,32 @@ impl Store {
         .await
     }
 
+    /// Enqueue a typed outbound job scheduled for a future time. Returns the row ID.
+    /// The job will not be claimed until `execute_at` (unix epoch seconds).
+    pub async fn enqueue_job_at(
+        &self,
+        jid: &str,
+        op_kind: &str,
+        payload_json: &str,
+        payload_blob: Option<Vec<u8>>,
+        execute_at: i64,
+    ) -> Result<i64> {
+        let j = jid.to_owned();
+        let ok = op_kind.to_owned();
+        let pj = payload_json.to_owned();
+        let ts = now_secs();
+        self.run(move |c| {
+            c.execute(
+                "INSERT INTO outbound_queue (jid, payload, op_kind, payload_json, payload_blob, status, retries, retry_after, created_at, updated_at)
+                 VALUES (?1, '', ?2, ?3, ?4, 'queued', 0, ?5, ?6, ?6)",
+                params![j, ok, pj, payload_blob, execute_at, ts],
+            )
+            .map_err(db_err)?;
+            Ok(c.last_insert_rowid())
+        })
+        .await
+    }
+
     /// Atomically claim the next queued job for processing. Returns the full job row.
     pub async fn claim_next_job(&self) -> Result<Option<crate::outbound::OutboundJobRow>> {
         let ts = now_secs();
