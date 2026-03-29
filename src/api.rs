@@ -8,6 +8,8 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use tokio::sync::Semaphore;
+
 use serde::Deserialize;
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -129,12 +131,31 @@ fn configured_api_token() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Constant-time token comparison to prevent timing side-channel leaks.
+fn ct_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.as_bytes()
+        .iter()
+        .zip(b.as_bytes())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
 fn request_has_api_token(req: &HttpRequest, expected_token: &str) -> bool {
-    req.header_get("x-api-token") == Some(expected_token)
-        || req
-            .header_get("authorization")
-            .and_then(|value| value.strip_prefix("Bearer "))
-            == Some(expected_token)
+    if let Some(tok) = req.header_get("x-api-token") {
+        if ct_eq(tok, expected_token) {
+            return true;
+        }
+    }
+    if let Some(bearer) = req
+        .header_get("authorization")
+        .and_then(|v| v.strip_prefix("Bearer "))
+    {
+        return ct_eq(bearer, expected_token);
+    }
+    false
 }
 
 const MAX_MEDIA_READ_BYTES: u64 = 50 * 1024 * 1024;
@@ -242,7 +263,7 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<HttpRequest>
 // Route dispatch
 // ---------------------------------------------------------------------------
 
-async fn handle_request(bridge: &WhatsAppBridge, req: &HttpRequest) -> Vec<u8> {
+async fn handle_request(bridge: &WhatsAppBridge, req: &HttpRequest, is_loopback: bool) -> Vec<u8> {
     match (req.method.as_str(), req.path.as_str()) {
         // Status & QR
         ("GET", "/api/status") | ("GET", "/health") | ("GET", "/") => handle_status(bridge).await,
@@ -258,11 +279,11 @@ async fn handle_request(bridge: &WhatsAppBridge, req: &HttpRequest) -> Vec<u8> {
         ("POST", "/api/edit") => handle_edit(bridge, &req.body).await,
         ("POST", "/api/react") => handle_react(bridge, &req.body).await,
         ("POST", "/api/unreact") => handle_unreact(bridge, &req.body).await,
-        ("POST", "/api/image") => handle_image(bridge, &req.body).await,
-        ("POST", "/api/video") => handle_video(bridge, &req.body).await,
-        ("POST", "/api/audio") => handle_audio(bridge, &req.body).await,
-        ("POST", "/api/doc") => handle_doc(bridge, &req.body).await,
-        ("POST", "/api/sticker") => handle_sticker(bridge, &req.body).await,
+        ("POST", "/api/image") => handle_media_with_path(bridge, &req.body, is_loopback, MediaKind::Image).await,
+        ("POST", "/api/video") => handle_media_with_path(bridge, &req.body, is_loopback, MediaKind::Video).await,
+        ("POST", "/api/audio") => handle_media_with_path(bridge, &req.body, is_loopback, MediaKind::Audio).await,
+        ("POST", "/api/doc") => handle_media_with_path(bridge, &req.body, is_loopback, MediaKind::Doc).await,
+        ("POST", "/api/sticker") => handle_media_with_path(bridge, &req.body, is_loopback, MediaKind::Sticker).await,
         ("POST", "/api/location") => handle_location(bridge, &req.body).await,
         ("POST", "/api/contact") => handle_contact(bridge, &req.body).await,
         ("POST", "/api/forward") => handle_forward(bridge, &req.body).await,
@@ -522,51 +543,26 @@ fn mime_for_doc(path: &std::path::Path) -> &'static str {
     }
 }
 
-async fn handle_image(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+enum MediaKind { Image, Video, Audio, Doc, Sticker }
+
+async fn handle_media_with_path(bridge: &WhatsAppBridge, body: &[u8], is_loopback: bool, kind: MediaKind) -> Vec<u8> {
+    if !is_loopback {
+        return json_err(403, "local-path media uploads are disabled for remote API binds; use loopback or provide base64 data");
+    }
     let req: MediaReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
     let data = match read_file_for_media(&req.path).await { Ok(d) => d, Err(e) => return e };
     let path = std::path::Path::new(&req.path);
-    match bridge.send_image(&req.jid, data, mime_for_image(path), req.caption.as_deref()).await {
-        Ok(()) => json_ok_simple(),
-        Err(e) => json_err(500, &e.to_string()),
-    }
-}
-
-async fn handle_video(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
-    let req: MediaReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
-    let data = match read_file_for_media(&req.path).await { Ok(d) => d, Err(e) => return e };
-    let path = std::path::Path::new(&req.path);
-    match bridge.send_video(&req.jid, data, mime_for_video(path), req.caption.as_deref()).await {
-        Ok(()) => json_ok_simple(),
-        Err(e) => json_err(500, &e.to_string()),
-    }
-}
-
-async fn handle_audio(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
-    let req: MediaReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
-    let data = match read_file_for_media(&req.path).await { Ok(d) => d, Err(e) => return e };
-    let path = std::path::Path::new(&req.path);
-    match bridge.send_audio(&req.jid, data, mime_for_audio(path), None).await {
-        Ok(()) => json_ok_simple(),
-        Err(e) => json_err(500, &e.to_string()),
-    }
-}
-
-async fn handle_doc(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
-    let req: MediaReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
-    let data = match read_file_for_media(&req.path).await { Ok(d) => d, Err(e) => return e };
-    let path = std::path::Path::new(&req.path);
-    let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-    match bridge.send_document(&req.jid, data, mime_for_doc(path), filename).await {
-        Ok(()) => json_ok_simple(),
-        Err(e) => json_err(500, &e.to_string()),
-    }
-}
-
-async fn handle_sticker(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
-    let req: MediaReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
-    let data = match read_file_for_media(&req.path).await { Ok(d) => d, Err(e) => return e };
-    match bridge.send_sticker(&req.jid, data, "image/webp", false).await {
+    let result = match kind {
+        MediaKind::Image => bridge.send_image(&req.jid, data, mime_for_image(path), req.caption.as_deref()).await,
+        MediaKind::Video => bridge.send_video(&req.jid, data, mime_for_video(path), req.caption.as_deref()).await,
+        MediaKind::Audio => bridge.send_audio(&req.jid, data, mime_for_audio(path), None).await,
+        MediaKind::Doc => {
+            let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+            bridge.send_document(&req.jid, data, mime_for_doc(path), filename).await
+        }
+        MediaKind::Sticker => bridge.send_sticker(&req.jid, data, "image/webp", false).await,
+    };
+    match result {
         Ok(()) => json_ok_simple(),
         Err(e) => json_err(500, &e.to_string()),
     }
@@ -679,13 +675,25 @@ pub async fn serve(bridge: Arc<WhatsAppBridge>, port: u16, cancel: CancellationT
         }
     };
 
+    let is_loopback = is_loopback_bind(&bind);
+    // Cap concurrent connections to prevent slowloris/flood exhaustion.
+    let conn_sem = Arc::new(Semaphore::new(64));
+
     loop {
         tokio::select! {
             result = listener.accept() => {
                 let Ok((mut stream, _)) = result else { continue };
+                let permit = match conn_sem.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        let _ = stream.write_all(&json_err(503, "too many connections")).await;
+                        continue;
+                    }
+                };
                 let bridge = bridge.clone();
                 let api_token = api_token.clone();
                 tokio::spawn(async move {
+                    let _permit = permit; // held until handler completes
                     let req = match read_request(&mut stream).await {
                         Some(r) => r,
                         None => {
@@ -699,7 +707,7 @@ pub async fn serve(bridge: Arc<WhatsAppBridge>, port: u16, cancel: CancellationT
                             return;
                         }
                     }
-                    let response = handle_request(&bridge, &req).await;
+                    let response = handle_request(&bridge, &req, is_loopback).await;
                     let _ = stream.write_all(&response).await;
                 });
             }
@@ -808,5 +816,15 @@ mod tests {
             body: Vec::new(),
         };
         assert!(request_has_api_token(&req, "secret"));
+        assert!(!request_has_api_token(&req, "wrong"));
+    }
+
+    #[test]
+    fn test_ct_eq() {
+        assert!(ct_eq("abc", "abc"));
+        assert!(!ct_eq("abc", "abd"));
+        assert!(!ct_eq("abc", "ab"));
+        assert!(!ct_eq("", "a"));
+        assert!(ct_eq("", ""));
     }
 }

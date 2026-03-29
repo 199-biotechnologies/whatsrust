@@ -864,8 +864,10 @@ impl WhatsAppBridge {
         msg: wa::Message,
         action: &'static str,
     ) -> Result<String> {
-        let client = get_client_handle(&self.client_handle).context("not connected")?;
+        // Pace BEFORE acquiring client handle — avoids using stale handles after
+        // reconnect during the pacing sleep.
         self.send_pacer.wait_turn().await;
+        let client = get_client_handle(&self.client_handle).context("not connected")?;
         let msg_id = client
             .send_message(target, msg)
             .await
@@ -951,12 +953,12 @@ impl WhatsAppBridge {
     /// Edit a previously sent message. Requires the message ID from send_message_with_id.
     pub async fn edit_message(&self, jid: &str, message_id: &str, new_text: &str) -> Result<()> {
         let target = parse_jid(jid)?;
-        let client = get_client_handle(&self.client_handle).context("not connected")?;
         let new_content = wa::Message {
             conversation: Some(new_text.to_string()),
             ..Default::default()
         };
         self.send_pacer.wait_turn().await;
+        let client = get_client_handle(&self.client_handle).context("not connected")?;
         client
             .edit_message(target, message_id.to_string(), new_content)
             .await
@@ -968,8 +970,8 @@ impl WhatsAppBridge {
     /// Revoke (delete for everyone) a previously sent message.
     pub async fn revoke_message(&self, jid: &str, message_id: &str) -> Result<()> {
         let target = parse_jid(jid)?;
-        let client = get_client_handle(&self.client_handle).context("not connected")?;
         self.send_pacer.wait_turn().await;
+        let client = get_client_handle(&self.client_handle).context("not connected")?;
         client
             .revoke_message(
                 target,
@@ -1722,12 +1724,16 @@ async fn run_bot_session(
                         match client.send_message(jid, msg).await {
                             Ok(_) => {
                                 metrics.record_sent();
-                                let _ = store.mark_outbound_sent(row.id).await;
+                                if let Err(e) = store.mark_outbound_sent(row.id).await {
+                                    error!(error = %e, row_id = row.id, "shutdown drain: failed to mark sent");
+                                }
                                 sent += 1;
                             }
                             Err(_) => {
                                 // Put back for next session (don't burn retry budget)
-                                let _ = store.requeue_outbound(row.id).await;
+                                if let Err(e) = store.requeue_outbound(row.id).await {
+                                    error!(error = %e, row_id = row.id, "shutdown drain: failed to requeue");
+                                }
                                 break;
                             }
                         }
@@ -1892,9 +1898,13 @@ async fn handle_event(
                 ExtractResult::Content(content) => {
                     // Store poll enc_key so we can decrypt future votes
                     if matches!(content, InboundContent::PollCreated { .. }) {
+                        let v4_inner = msg.poll_creation_message_v4.as_deref()
+                            .and_then(|fp| fp.message.as_deref())
+                            .and_then(|m| m.poll_creation_message.as_deref());
                         let poll = msg.poll_creation_message.as_deref()
                             .or(msg.poll_creation_message_v2.as_deref())
                             .or(msg.poll_creation_message_v3.as_deref())
+                            .or(v4_inner)
                             .or(msg.poll_creation_message_v5.as_deref());
                         if let Some(pc) = poll {
                             if let Some(ref enc_key) = pc.enc_key {
@@ -2397,6 +2407,25 @@ async fn extract_content_inner(
         }
     }
 
+    // --- Encrypted reaction (enc_reaction_message) ---
+    // These carry encrypted payloads we can't decrypt at the bridge level.
+    // Extract target info from the unencrypted key so downstream at least
+    // knows a reaction happened, even without the emoji text.
+    if let Some(ref enc_react) = msg.enc_reaction_message {
+        if let Some(ref key) = enc_react.target_message_key {
+            let target_id = key.id.clone().unwrap_or_default();
+            let target_sender = key.participant.clone();
+            // We can't distinguish add vs remove without decrypting, so surface
+            // as a generic reaction-added with a placeholder.
+            debug!(target_id = %target_id, "received enc_reaction_message (encrypted payload, emoji unknown)");
+            return ExtractResult::Content(InboundContent::ReactionAdded {
+                target_id,
+                emoji: "\u{2753}".to_string(), // ❓ — signals encrypted/unknown
+                target_sender,
+            });
+        }
+    }
+
     // --- Edit (incoming edit from others) ---
     if let Some(ref edited) = msg.edited_message {
         if let Some(ref inner) = edited.message {
@@ -2436,9 +2465,14 @@ async fn extract_content_inner(
 
     // --- Poll creation ---
     {
+        // v4 is a FutureProofMessage wrapper; extract its inner poll_creation_message.
+        let v4_inner = msg.poll_creation_message_v4.as_deref()
+            .and_then(|fp| fp.message.as_deref())
+            .and_then(|m| m.poll_creation_message.as_deref());
         let poll = msg.poll_creation_message.as_deref()
             .or(msg.poll_creation_message_v2.as_deref())
             .or(msg.poll_creation_message_v3.as_deref())
+            .or(v4_inner)
             .or(msg.poll_creation_message_v5.as_deref());
         if let Some(pc) = poll {
             let question = pc.name.clone().unwrap_or_default();
@@ -2669,7 +2703,9 @@ async fn handle_outbound(
         match client.send_message(jid, msg).await {
             Ok(_msg_id) => {
                 metrics.record_sent();
-                let _ = store.mark_outbound_sent(row.id).await;
+                if let Err(e) = store.mark_outbound_sent(row.id).await {
+                    error!(error = %e, row_id = row.id, "failed to mark outbound as sent — may re-send on restart");
+                }
             }
             Err(e) => {
                 if row.retries + 1 >= max_retries {
@@ -2683,9 +2719,9 @@ async fn handle_outbound(
                         "failed to send outbound message; will retry"
                     );
                 }
-                let _ = store.mark_outbound_failed(row.id, max_retries).await;
-                // No sleep needed — retry_after in SQLite handles per-message backoff.
-                // The loop will claim the next eligible message immediately.
+                if let Err(db_e) = store.mark_outbound_failed(row.id, max_retries).await {
+                    error!(error = %db_e, row_id = row.id, "failed to mark outbound as failed — row stuck as inflight");
+                }
             }
         }
 

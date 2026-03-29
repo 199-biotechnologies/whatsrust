@@ -609,43 +609,67 @@ fn run_schema_migrations(conn: &Connection, from_version: i64) -> Result<()> {
         )));
     }
 
-    if from_version < 1 {
-        // v0→v1: initial schema (tables created by SCHEMA execute_batch above).
+    if from_version >= CURRENT_SCHEMA_VERSION {
+        return Ok(());
     }
 
-    if from_version < 2 {
-        // v1→v2: outbound_queue table (idempotent — CREATE IF NOT EXISTS in SCHEMA).
-        // For existing DBs: the table was already created by the SCHEMA batch above.
-        // Just stamp the version.
-    }
+    // Run all migrations inside a single transaction — partial migrations
+    // leave the DB in a consistent pre-migration state on failure.
+    conn.execute_batch("BEGIN IMMEDIATE;").map_err(db_err)?;
 
-    if from_version < 3 {
-        // v2→v3: add retry_after column for per-message exponential backoff.
-        conn.execute_batch(
-            "ALTER TABLE outbound_queue ADD COLUMN retry_after INTEGER NOT NULL DEFAULT 0;"
-        ).ok(); // Ignore error if column already exists (fresh DB has it in schema)
-    }
+    let result = (|| -> Result<()> {
+        if from_version < 1 {
+            // v0→v1: initial schema (tables created by SCHEMA execute_batch above).
+        }
 
-    if from_version < 4 {
-        // v3→v4: poll_keys table for decrypting incoming poll votes.
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS poll_keys (
-                chat_jid TEXT NOT NULL,
-                poll_id TEXT NOT NULL,
-                enc_key BLOB NOT NULL,
-                options_json TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                PRIMARY KEY (chat_jid, poll_id)
-            );"
-        ).map_err(db_err)?;
-    }
+        if from_version < 2 {
+            // v1→v2: outbound_queue table (idempotent — CREATE IF NOT EXISTS in SCHEMA).
+        }
 
-    if from_version < CURRENT_SCHEMA_VERSION {
+        if from_version < 3 {
+            // v2→v3: add retry_after column for per-message exponential backoff.
+            // Check if column already exists (fresh DBs have it in the initial schema).
+            let has_col: bool = conn
+                .prepare("SELECT COUNT(*) FROM pragma_table_info('outbound_queue') WHERE name='retry_after'")
+                .and_then(|mut s| s.query_row([], |r| r.get::<_, i64>(0)))
+                .unwrap_or(0)
+                > 0;
+            if !has_col {
+                conn.execute_batch(
+                    "ALTER TABLE outbound_queue ADD COLUMN retry_after INTEGER NOT NULL DEFAULT 0;"
+                ).map_err(db_err)?;
+            }
+        }
+
+        if from_version < 4 {
+            // v3→v4: poll_keys table for decrypting incoming poll votes.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS poll_keys (
+                    chat_jid TEXT NOT NULL,
+                    poll_id TEXT NOT NULL,
+                    enc_key BLOB NOT NULL,
+                    options_json TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY (chat_jid, poll_id)
+                );"
+            ).map_err(db_err)?;
+        }
+
         conn.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)
             .map_err(db_err)?;
-    }
+        Ok(())
+    })();
 
-    Ok(())
+    match result {
+        Ok(()) => {
+            conn.execute_batch("COMMIT;").map_err(db_err)?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(e)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
