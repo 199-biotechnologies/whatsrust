@@ -2203,19 +2203,8 @@ async fn extract_content_inner(
         warn!(depth, "extract_content recursion limit reached, skipping");
         return ExtractResult::Unhandled;
     }
-    // --- Text ---
-    if let Some(ref text) = msg.conversation {
-        return ExtractResult::Content(InboundContent::Text {
-            body: text.clone(),
-        });
-    }
-    if let Some(ref ext) = msg.extended_text_message {
-        if let Some(ref text) = ext.text {
-            return ExtractResult::Content(InboundContent::Text {
-                body: text.clone(),
-            });
-        }
-    }
+    // --- Media first: WhatsApp can set `conversation` as auto-transcription on
+    // voice notes, so check audio/image/video/document BEFORE text fields. ---
 
     // --- Image ---
     if let Some(ref img) = msg.image_message {
@@ -2512,6 +2501,21 @@ async fn extract_content_inner(
                     debug!(poll_id = %poll_id, "no stored enc_key for poll vote — poll was created before bridge started");
                 }
             }
+        }
+    }
+
+    // --- Text (checked AFTER media: WhatsApp sets `conversation` as auto-
+    // transcription on voice notes, so text must not shadow audio_message) ---
+    if let Some(ref text) = msg.conversation {
+        return ExtractResult::Content(InboundContent::Text {
+            body: text.clone(),
+        });
+    }
+    if let Some(ref ext) = msg.extended_text_message {
+        if let Some(ref text) = ext.text {
+            return ExtractResult::Content(InboundContent::Text {
+                body: text.clone(),
+            });
         }
     }
 
