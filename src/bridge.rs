@@ -927,6 +927,44 @@ impl WhatsAppBridge {
         self.state() == BridgeState::Connected && get_client_handle(&self.client_handle).is_some()
     }
 
+    /// Enqueue a job, wait for the outbound worker to send it, return the WA message ID.
+    /// Subscribes to the event bus *before* enqueueing to avoid missing the Sent event.
+    async fn enqueue_and_wait(&self, jid: &str, op_kind: crate::outbound::OutboundOpKind, payload_json: &str, payload_blob: Option<Vec<u8>>) -> Result<String> {
+        // Subscribe BEFORE enqueue to avoid race with fast worker
+        let mut rx = self.event_tx.subscribe();
+        let job_id = self.enqueue_op(jid, op_kind, payload_json, payload_blob).await?;
+
+        let timeout = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                match rx.recv().await {
+                    Ok(evt) => {
+                        if let crate::bridge_events::BridgeEvent::OutboundStatus(ref s) = *evt {
+                            if s.job_id == job_id {
+                                match s.state {
+                                    crate::bridge_events::OutboundJobState::Sent => {
+                                        return Ok(s.wa_message_id.clone().unwrap_or_default());
+                                    }
+                                    crate::bridge_events::OutboundJobState::Failed => {
+                                        return Err(anyhow::anyhow!(
+                                            "send failed: {}",
+                                            s.error.as_deref().unwrap_or("unknown")
+                                        ));
+                                    }
+                                    _ => {} // Queued, Sending — keep waiting
+                                }
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return Err(anyhow::anyhow!("event bus closed"));
+                    }
+                }
+            }
+        });
+        timeout.await.context("send timed out (30s)")?
+    }
+
     /// Enqueue an outbound job and wake the worker. Returns the job_id.
     /// Public for use by the API server; most callers should use the typed send methods.
     pub async fn enqueue_op(
@@ -1004,39 +1042,7 @@ impl WhatsAppBridge {
     /// and returns the WhatsApp message ID.
     pub async fn send_message_with_id(&self, jid: &str, text: &str) -> Result<String> {
         let payload = serde_json::to_string(&crate::outbound::TextPayload { text: text.to_string() })?;
-        let job_id = self.enqueue_op(jid, crate::outbound::OutboundOpKind::Text, &payload, None).await?;
-
-        // Subscribe to event bus and wait for the matching Sent status
-        let mut rx = self.event_tx.subscribe();
-        let timeout = tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                match rx.recv().await {
-                    Ok(evt) => {
-                        if let crate::bridge_events::BridgeEvent::OutboundStatus(ref s) = *evt {
-                            if s.job_id == job_id {
-                                match s.state {
-                                    crate::bridge_events::OutboundJobState::Sent => {
-                                        return Ok(s.wa_message_id.clone().unwrap_or_default());
-                                    }
-                                    crate::bridge_events::OutboundJobState::Failed => {
-                                        return Err(anyhow::anyhow!(
-                                            "send failed: {}",
-                                            s.error.as_deref().unwrap_or("unknown")
-                                        ));
-                                    }
-                                    _ => {} // Queued, Sending — keep waiting
-                                }
-                            }
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        return Err(anyhow::anyhow!("event bus closed"));
-                    }
-                }
-            }
-        });
-        timeout.await.context("send_message_with_id timed out (30s)")?
+        self.enqueue_and_wait(jid, crate::outbound::OutboundOpKind::Text, &payload, None).await
     }
 
     /// Send a video file to a chat.
@@ -1163,7 +1169,7 @@ impl WhatsAppBridge {
         Ok(())
     }
 
-    /// Create and send a poll. Returns the job ID (poll key is stored after send by the worker).
+    /// Create and send a poll. Returns the WA message ID (poll key is stored by the worker).
     pub async fn send_poll(
         &self,
         jid: &str,
@@ -1177,39 +1183,7 @@ impl WhatsAppBridge {
             options,
             selectable_count,
         })?;
-        let job_id = self.enqueue_op(jid, crate::outbound::OutboundOpKind::Poll, &payload, None).await?;
-
-        // Wait for the send to complete so we can return the WA message ID (needed for poll key storage)
-        let mut rx = self.event_tx.subscribe();
-        let timeout = tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                match rx.recv().await {
-                    Ok(evt) => {
-                        if let crate::bridge_events::BridgeEvent::OutboundStatus(ref s) = *evt {
-                            if s.job_id == job_id {
-                                match s.state {
-                                    crate::bridge_events::OutboundJobState::Sent => {
-                                        return Ok(s.wa_message_id.clone().unwrap_or_default());
-                                    }
-                                    crate::bridge_events::OutboundJobState::Failed => {
-                                        return Err(anyhow::anyhow!(
-                                            "send poll failed: {}",
-                                            s.error.as_deref().unwrap_or("unknown")
-                                        ));
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        return Err(anyhow::anyhow!("event bus closed"));
-                    }
-                }
-            }
-        });
-        timeout.await.context("send_poll timed out (30s)")?
+        self.enqueue_and_wait(jid, crate::outbound::OutboundOpKind::Poll, &payload, None).await
     }
 
     /// Subscribe to a contact's presence updates (online/offline notifications).
@@ -1276,40 +1250,7 @@ impl WhatsAppBridge {
         let payload = serde_json::to_string(&crate::outbound::ForwardPayload {
             original_msg_id: msg_id.to_string(),
         })?;
-
-        let job_id = self.enqueue_op(dst_jid, crate::outbound::OutboundOpKind::Forward, &payload, Some(proto_bytes)).await?;
-
-        // Wait for send completion to return WA message ID
-        let mut rx = self.event_tx.subscribe();
-        let timeout = tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                match rx.recv().await {
-                    Ok(evt) => {
-                        if let crate::bridge_events::BridgeEvent::OutboundStatus(ref s) = *evt {
-                            if s.job_id == job_id {
-                                match s.state {
-                                    crate::bridge_events::OutboundJobState::Sent => {
-                                        return Ok(s.wa_message_id.clone().unwrap_or_default());
-                                    }
-                                    crate::bridge_events::OutboundJobState::Failed => {
-                                        return Err(anyhow::anyhow!(
-                                            "forward failed: {}",
-                                            s.error.as_deref().unwrap_or("unknown")
-                                        ));
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        return Err(anyhow::anyhow!("event bus closed"));
-                    }
-                }
-            }
-        });
-        timeout.await.context("forward timed out (30s)")?
+        self.enqueue_and_wait(dst_jid, crate::outbound::OutboundOpKind::Forward, &payload, Some(proto_bytes)).await
     }
 
     /// Send a text message as a reply/quote to another message.
@@ -1331,39 +1272,7 @@ impl WhatsAppBridge {
             reply_to_id: reply_to_id.to_string(),
             reply_to_sender: reply_to_sender.to_string(),
         })?;
-        let job_id = self.enqueue_op(jid, crate::outbound::OutboundOpKind::Reply, &payload, None).await?;
-
-        // Wait for WA message ID
-        let mut rx = self.event_tx.subscribe();
-        let timeout = tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                match rx.recv().await {
-                    Ok(evt) => {
-                        if let crate::bridge_events::BridgeEvent::OutboundStatus(ref s) = *evt {
-                            if s.job_id == job_id {
-                                match s.state {
-                                    crate::bridge_events::OutboundJobState::Sent => {
-                                        return Ok(s.wa_message_id.clone().unwrap_or_default());
-                                    }
-                                    crate::bridge_events::OutboundJobState::Failed => {
-                                        return Err(anyhow::anyhow!(
-                                            "send reply failed: {}",
-                                            s.error.as_deref().unwrap_or("unknown")
-                                        ));
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        return Err(anyhow::anyhow!("event bus closed"));
-                    }
-                }
-            }
-        });
-        timeout.await.context("send_reply timed out (30s)")?
+        self.enqueue_and_wait(jid, crate::outbound::OutboundOpKind::Reply, &payload, None).await
     }
 }
 
