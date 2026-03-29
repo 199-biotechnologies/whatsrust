@@ -1911,9 +1911,11 @@ async fn handle_event(
                 return;
             }
 
-            // Extract reply-to context and flags from any message type
-            let reply_to = extract_reply_to(&msg);
-            let mut flags = extract_flags(&msg);
+            // Unwrap wrappers before extracting metadata so reply-to and flags
+            // are found on wrapped ephemeral/view-once content too.
+            let inner_msg = unwrap_to_inner(&msg);
+            let reply_to = extract_reply_to(inner_msg);
+            let mut flags = extract_flags(inner_msg);
 
             // Detect view-once *before* extract_content recurses into the wrapper
             if msg.view_once_message.is_some() || msg.view_once_message_v2.is_some() {
@@ -2155,6 +2157,33 @@ async fn handle_event(
 // ---------------------------------------------------------------------------
 // Inbound content extraction
 // ---------------------------------------------------------------------------
+
+/// Unwrap ephemeral/view-once wrappers to reach the inner leaf message.
+/// Returns a reference to the innermost message (or the original if not wrapped).
+fn unwrap_to_inner(msg: &wa::Message) -> &wa::Message {
+    // ephemeral_message wraps the actual content
+    if let Some(ref eph) = msg.ephemeral_message {
+        if let Some(ref inner) = eph.message {
+            return unwrap_to_inner(inner);
+        }
+    }
+    if let Some(ref vo) = msg.view_once_message {
+        if let Some(ref inner) = vo.message {
+            return unwrap_to_inner(inner);
+        }
+    }
+    if let Some(ref vo2) = msg.view_once_message_v2 {
+        if let Some(ref inner) = vo2.message {
+            return unwrap_to_inner(inner);
+        }
+    }
+    if let Some(ref vo2_ext) = msg.view_once_message_v2_extension {
+        if let Some(ref inner) = vo2_ext.message {
+            return unwrap_to_inner(inner);
+        }
+    }
+    msg
+}
 
 /// Extract the stanza_id of a quoted/replied-to message, if present.
 fn extract_reply_to(msg: &wa::Message) -> Option<String> {
