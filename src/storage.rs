@@ -612,6 +612,36 @@ impl Store {
         .await
     }
 
+    /// Delete all inbound messages for a chat (e.g. when the chat is deleted).
+    pub async fn delete_inbound_chat(&self, chat_jid: &str) -> Result<u32> {
+        let jid = chat_jid.to_owned();
+        self.run(move |c| {
+            let n = c
+                .execute(
+                    "DELETE FROM inbound_messages WHERE chat_jid = ?1",
+                    params![jid],
+                )
+                .map_err(db_err)? as u32;
+            Ok(n)
+        })
+        .await
+    }
+
+    /// Delete a single inbound message by its message ID.
+    pub async fn delete_inbound_message(&self, message_id: &str) -> Result<u32> {
+        let mid = message_id.to_owned();
+        self.run(move |c| {
+            let n = c
+                .execute(
+                    "DELETE FROM inbound_messages WHERE message_id = ?1",
+                    params![mid],
+                )
+                .map_err(db_err)? as u32;
+            Ok(n)
+        })
+        .await
+    }
+
     // -----------------------------------------------------------------------
     // Database pruning — prevent unbounded growth
     // -----------------------------------------------------------------------

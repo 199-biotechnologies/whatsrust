@@ -692,9 +692,10 @@ impl WhatsAppBridge {
         let on = outbound_notify.clone();
         let et = event_tx.clone();
         let st = store.clone();
+        let gc = group_cache.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                run_bridge(config, inbound_tx, state_tx, qr_tx, cancel_clone, ch, rr, mc, met, sp, sub_pres, on, et, st).await
+                run_bridge(config, inbound_tx, state_tx, qr_tx, cancel_clone, ch, rr, mc, met, sp, sub_pres, on, et, st, gc).await
             {
                 error!(error = %e, "WhatsApp bridge exited with error");
             }
@@ -1546,6 +1547,7 @@ async fn run_bridge(
     outbound_notify: Arc<tokio::sync::Notify>,
     event_tx: tokio::sync::broadcast::Sender<Arc<crate::bridge_events::BridgeEvent>>,
     store: Store,
+    group_cache: GroupCacheHandle,
 ) -> Result<()> {
     info!("WhatsApp bridge starting");
 
@@ -1671,6 +1673,7 @@ async fn run_bridge(
             &subscribed_presence,
             &outbound_notify,
             &event_tx,
+            &group_cache,
         )
         .await;
 
@@ -1774,6 +1777,7 @@ async fn run_bot_session(
     subscribed_presence: &Arc<DashSet<String>>,
     outbound_notify: &Arc<tokio::sync::Notify>,
     event_tx: &tokio::sync::broadcast::Sender<Arc<crate::bridge_events::BridgeEvent>>,
+    group_cache: &GroupCacheHandle,
 ) -> Result<SessionAction> {
     // Clear stale handle from previous session
     set_client_handle(client_handle, None);
@@ -1801,6 +1805,7 @@ async fn run_bot_session(
     let msg_cache_for_events = msg_cache.clone();
     let sub_pres_for_events = subscribed_presence.clone();
     let event_tx_for_events = event_tx.clone();
+    let gc_for_events = group_cache.clone();
     // Track previous QR terminal height for in-place overwrite on refresh
     let prev_qr_lines = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
@@ -1829,8 +1834,9 @@ async fn run_bot_session(
             let mc = msg_cache_for_events.clone();
             let spres = sub_pres_for_events.clone();
             let etx = event_tx_for_events.clone();
+            let gc = gc_for_events.clone();
             async move {
-                handle_event(event, client, &ch, &itx, &stx, &qtx, &store, &sr, &srr, auto_mark_read, &allowed, &dedup, &bid, &dl_sem, &rr, &ptx, &pql, &met, &mc, &spres, &etx)
+                handle_event(event, client, &ch, &itx, &stx, &qtx, &store, &sr, &srr, auto_mark_read, &allowed, &dedup, &bid, &dl_sem, &rr, &ptx, &pql, &met, &mc, &spres, &etx, &gc)
                     .await;
             }
         });
@@ -1970,6 +1976,7 @@ async fn handle_event(
     msg_cache: &MsgCache,
     subscribed_presence: &Arc<DashSet<String>>,
     event_tx: &tokio::sync::broadcast::Sender<Arc<crate::bridge_events::BridgeEvent>>,
+    group_cache: &GroupCacheHandle,
 ) {
     match event {
         Event::PairingQrCode { code, .. } => {
@@ -2403,6 +2410,112 @@ async fn handle_event(
                 let _ = ptx.try_send(evt);
             }
         }
+        // ----- wa-rs v0.5.0 event variants -----
+
+        Event::QrScannedWithoutMultidevice(_) => {
+            warn!("QR scanned but phone does not have multi-device enabled — pairing will fail");
+        }
+        Event::Notification(_node) => {
+            debug!("raw XML notification from server (internal wa-rs event)");
+        }
+        Event::GroupUpdate(update) => {
+            info!(
+                group = %update.group_jid,
+                participant = ?update.participant,
+                action = ?update.action,
+                "group metadata/participant update"
+            );
+            // Invalidate cache so next query fetches fresh data
+            group_cache.lock().invalidate(&update.group_jid.to_string());
+        }
+        Event::JoinedGroup(lazy) => {
+            if let Some(conv) = lazy.get() {
+                info!(group = %conv.id, "joined new group");
+                group_cache.lock().invalidate(&conv.id);
+            } else {
+                info!("joined new group (could not decode conversation)");
+            }
+        }
+        Event::DeleteChatUpdate(update) => {
+            let jid = update.jid.to_string();
+            info!(chat = %jid, "chat deleted — removing inbound history");
+            let store_clone = store.clone();
+            tokio::spawn(async move {
+                match store_clone.delete_inbound_chat(&jid).await {
+                    Ok(n) if n > 0 => info!(chat = %jid, deleted = n, "purged inbound history for deleted chat"),
+                    Err(e) => warn!(error = %e, "failed to delete inbound history for deleted chat"),
+                    _ => {}
+                }
+            });
+        }
+        Event::DeleteMessageForMeUpdate(update) => {
+            let mid = update.message_id.clone();
+            let chat = update.chat_jid.to_string();
+            info!(message_id = %mid, chat = %chat, "message deleted for me — removing from history");
+            let store_clone = store.clone();
+            tokio::spawn(async move {
+                if let Err(e) = store_clone.delete_inbound_message(&mid).await {
+                    warn!(error = %e, "failed to delete inbound message from history");
+                }
+            });
+        }
+        Event::PictureUpdate(update) => {
+            debug!(jid = %update.jid, "profile picture changed");
+        }
+        Event::UserAboutUpdate(update) => {
+            debug!(jid = %update.jid, "user about/status text changed");
+        }
+        Event::ContactUpdated(update) => {
+            debug!(jid = %update.jid, "contact updated (from app state sync)");
+        }
+        Event::ContactNumberChanged(update) => {
+            debug!(old = %update.old_jid, new = %update.new_jid, "contact changed phone number");
+        }
+        Event::ContactSyncRequested(_) => {
+            debug!("contact sync requested by server");
+        }
+        Event::ContactUpdate(update) => {
+            debug!(jid = %update.jid, "contact action synced");
+        }
+        Event::PushNameUpdate(update) => {
+            debug!(jid = %update.jid, "contact push name changed");
+        }
+        Event::SelfPushNameUpdated(update) => {
+            debug!(old = %update.old_name, new = %update.new_name, "own push name updated");
+        }
+        Event::PinUpdate(update) => {
+            debug!(jid = %update.jid, "chat pin state changed");
+        }
+        Event::MuteUpdate(update) => {
+            debug!(jid = %update.jid, "chat mute state changed");
+        }
+        Event::ArchiveUpdate(update) => {
+            debug!(jid = %update.jid, "chat archive state changed");
+        }
+        Event::StarUpdate(_) => {
+            debug!("message star state changed");
+        }
+        Event::MarkChatAsReadUpdate(update) => {
+            debug!(jid = %update.jid, "chat marked as read/unread");
+        }
+        Event::HistorySync(_) => {
+            debug!("history sync chunk received (ignored — skip_history_sync active)");
+        }
+        Event::OfflineSyncPreview(_) => {
+            debug!("offline sync preview received");
+        }
+        Event::BusinessStatusUpdate(_) => {
+            debug!("business account status changed");
+        }
+        Event::DisappearingModeChanged(update) => {
+            debug!(from = %update.from, duration_secs = update.duration, "disappearing messages mode changed");
+        }
+        Event::NewsletterLiveUpdate(update) => {
+            debug!(newsletter = %update.newsletter_jid, messages = update.messages.len(), "newsletter live update");
+        }
+
+        // Catch-all for future variants we haven't mapped yet
+        #[allow(unreachable_patterns)]
         _ => {
             debug!(?event, "unhandled event");
         }
