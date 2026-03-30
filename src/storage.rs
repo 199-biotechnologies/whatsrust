@@ -571,7 +571,7 @@ impl Store {
         before_ts: Option<i64>,
     ) -> Result<Vec<InboundRow>> {
         let cj = chat_jid.map(|s| s.to_owned());
-        let q = query.map(|s| format!("%{}%", s.replace('%', "\\%")));
+        let q = query.map(|s| format!("%{}%", s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")));
         let before = before_ts.unwrap_or(i64::MAX);
         self.run(move |c| {
             let mut sql = String::from(
@@ -622,7 +622,7 @@ impl Store {
             // 1. Delete completed outbound messages older than retention period
             let sent_deleted = tx
                 .execute(
-                    "DELETE FROM outbound_queue WHERE status IN ('sent', 'failed') AND created_at < ?1",
+                    "DELETE FROM outbound_queue WHERE status IN ('sent', 'failed') AND updated_at < ?1",
                     params![sent_cutoff],
                 )
                 .map_err(db_err)? as u32;

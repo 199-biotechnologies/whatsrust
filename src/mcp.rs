@@ -35,16 +35,22 @@ pub fn run_mcp_server(port: u16) {
             }
         };
 
+        // Notifications have null id — don't send a response
+        let is_notification = req.id.is_null() || req.method.starts_with("notifications/");
         let response = handle_rpc(&req, port);
-        let _ = writeln!(stdout, "{}", serde_json::to_string(&response).unwrap());
-        let _ = stdout.flush();
+        if !is_notification {
+            let _ = writeln!(stdout, "{}", serde_json::to_string(&response).unwrap());
+            let _ = stdout.flush();
+        }
     }
 }
 
 #[derive(Deserialize)]
 struct JsonRpcRequest {
-    #[allow(dead_code)] // Required by JSON-RPC spec, validated by serde but not read
+    #[allow(dead_code)]
     jsonrpc: Option<String>,
+    /// Null for notifications (no response expected).
+    #[serde(default)]
     id: Value,
     method: String,
     params: Option<Value>,

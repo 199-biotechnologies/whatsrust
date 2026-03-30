@@ -52,12 +52,17 @@ impl AtomicDedupCache {
                                 drop(entry);
                                 self.map.remove(&old_id);
                             }
-                            // else: re-admitted with newer gen, skip
                         }
-                        // else: already removed, skip
                     } else {
                         break;
                     }
+                }
+                // Compact order if it grows too far beyond map size (leak from remove/re-admit)
+                if order.len() > self.capacity * 3 {
+                    let live_map = &self.map;
+                    order.retain(|(id, gen)| {
+                        live_map.get(id).is_some_and(|e| e.1 == *gen)
+                    });
                 }
                 true
             }

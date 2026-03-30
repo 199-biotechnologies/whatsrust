@@ -68,17 +68,18 @@ impl GroupCache {
         Self { entries: std::collections::HashMap::new() }
     }
 
-    fn get(&self, jid: &str) -> Option<&GroupInfo> {
-        self.entries.get(jid).and_then(|e| {
-            if e.fetched_at.elapsed() < GROUP_CACHE_TTL {
-                Some(&e.info)
-            } else {
-                None
-            }
-        })
+    fn get(&mut self, jid: &str) -> Option<&GroupInfo> {
+        // Evict the entry if expired
+        if self.entries.get(jid).is_some_and(|e| e.fetched_at.elapsed() >= GROUP_CACHE_TTL) {
+            self.entries.remove(jid);
+            return None;
+        }
+        self.entries.get(jid).map(|e| &e.info)
     }
 
     fn insert(&mut self, jid: String, info: GroupInfo) {
+        // Evict all expired entries on insert to prevent unbounded growth
+        self.entries.retain(|_, e| e.fetched_at.elapsed() < GROUP_CACHE_TTL);
         self.entries.insert(jid, CachedGroup {
             info,
             fetched_at: std::time::Instant::now(),
@@ -761,7 +762,7 @@ impl WhatsAppBridge {
     ) -> Result<GroupInfo> {
         // Check cache first
         {
-            let cache = self.group_cache.lock();
+            let mut cache = self.group_cache.lock();
             if let Some(info) = cache.get(group_jid) {
                 return Ok(info.clone());
             }
