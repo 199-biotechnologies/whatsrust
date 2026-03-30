@@ -1365,6 +1365,134 @@ impl WhatsAppBridge {
         Ok(())
     }
 
+    // --- Chat management (direct client calls, not outbound queue) ---
+
+    /// Pin a chat to the top of the chat list.
+    pub async fn pin_chat(&self, jid: &str) -> Result<()> {
+        let target = parse_jid(jid)?;
+        let client = get_client_handle(&self.client_handle).context("not connected")?;
+        client.chat_actions().pin_chat(&target).await
+            .map_err(|e| anyhow::anyhow!("pin_chat: {e}"))
+    }
+
+    /// Unpin a chat from the top of the chat list.
+    pub async fn unpin_chat(&self, jid: &str) -> Result<()> {
+        let target = parse_jid(jid)?;
+        let client = get_client_handle(&self.client_handle).context("not connected")?;
+        client.chat_actions().unpin_chat(&target).await
+            .map_err(|e| anyhow::anyhow!("unpin_chat: {e}"))
+    }
+
+    /// Mute a chat indefinitely.
+    pub async fn mute_chat(&self, jid: &str) -> Result<()> {
+        let target = parse_jid(jid)?;
+        let client = get_client_handle(&self.client_handle).context("not connected")?;
+        client.chat_actions().mute_chat(&target).await
+            .map_err(|e| anyhow::anyhow!("mute_chat: {e}"))
+    }
+
+    /// Unmute a chat.
+    pub async fn unmute_chat(&self, jid: &str) -> Result<()> {
+        let target = parse_jid(jid)?;
+        let client = get_client_handle(&self.client_handle).context("not connected")?;
+        client.chat_actions().unmute_chat(&target).await
+            .map_err(|e| anyhow::anyhow!("unmute_chat: {e}"))
+    }
+
+    /// Archive a chat.
+    pub async fn archive_chat(&self, jid: &str) -> Result<()> {
+        let target = parse_jid(jid)?;
+        let client = get_client_handle(&self.client_handle).context("not connected")?;
+        client.chat_actions().archive_chat(&target, None).await
+            .map_err(|e| anyhow::anyhow!("archive_chat: {e}"))
+    }
+
+    /// Unarchive a chat.
+    pub async fn unarchive_chat(&self, jid: &str) -> Result<()> {
+        let target = parse_jid(jid)?;
+        let client = get_client_handle(&self.client_handle).context("not connected")?;
+        client.chat_actions().unarchive_chat(&target, None).await
+            .map_err(|e| anyhow::anyhow!("unarchive_chat: {e}"))
+    }
+
+    /// Mark a chat as read (syncs across linked devices).
+    pub async fn mark_chat_as_read(&self, jid: &str) -> Result<()> {
+        let target = parse_jid(jid)?;
+        let client = get_client_handle(&self.client_handle).context("not connected")?;
+        client.chat_actions().mark_chat_as_read(&target, true, None).await
+            .map_err(|e| anyhow::anyhow!("mark_chat_as_read: {e}"))
+    }
+
+    /// Mark a chat as unread (syncs across linked devices).
+    pub async fn mark_chat_as_unread(&self, jid: &str) -> Result<()> {
+        let target = parse_jid(jid)?;
+        let client = get_client_handle(&self.client_handle).context("not connected")?;
+        client.chat_actions().mark_chat_as_read(&target, false, None).await
+            .map_err(|e| anyhow::anyhow!("mark_chat_as_unread: {e}"))
+    }
+
+    /// Delete a chat (including media).
+    pub async fn delete_chat(&self, jid: &str) -> Result<()> {
+        let target = parse_jid(jid)?;
+        let client = get_client_handle(&self.client_handle).context("not connected")?;
+        client.chat_actions().delete_chat(&target, true, None).await
+            .map_err(|e| anyhow::anyhow!("delete_chat: {e}"))
+    }
+
+    /// Delete a message for me only (local deletion).
+    pub async fn delete_message_for_me(
+        &self,
+        jid: &str,
+        message_id: &str,
+        sender_jid: Option<&str>,
+        from_me: bool,
+    ) -> Result<()> {
+        let target = parse_jid(jid)?;
+        let participant = sender_jid.map(parse_jid).transpose()?;
+        let client = get_client_handle(&self.client_handle).context("not connected")?;
+        client
+            .chat_actions()
+            .delete_message_for_me(&target, participant.as_ref(), message_id, from_me, true, None)
+            .await
+            .map_err(|e| anyhow::anyhow!("delete_message_for_me: {e}"))
+    }
+
+    /// Star a message.
+    pub async fn star_message(
+        &self,
+        jid: &str,
+        message_id: &str,
+        sender_jid: Option<&str>,
+        from_me: bool,
+    ) -> Result<()> {
+        let target = parse_jid(jid)?;
+        let participant = sender_jid.map(parse_jid).transpose()?;
+        let client = get_client_handle(&self.client_handle).context("not connected")?;
+        client
+            .chat_actions()
+            .star_message(&target, participant.as_ref(), message_id, from_me)
+            .await
+            .map_err(|e| anyhow::anyhow!("star_message: {e}"))
+    }
+
+    /// Unstar a message.
+    pub async fn unstar_message(
+        &self,
+        jid: &str,
+        message_id: &str,
+        sender_jid: Option<&str>,
+        from_me: bool,
+    ) -> Result<()> {
+        let target = parse_jid(jid)?;
+        let participant = sender_jid.map(parse_jid).transpose()?;
+        let client = get_client_handle(&self.client_handle).context("not connected")?;
+        client
+            .chat_actions()
+            .unstar_message(&target, participant.as_ref(), message_id, from_me)
+            .await
+            .map_err(|e| anyhow::anyhow!("unstar_message: {e}"))
+    }
+
     /// Send a view-once image (disappears after first view).
     pub async fn send_view_once_image(
         &self,

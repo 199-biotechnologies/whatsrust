@@ -840,6 +840,60 @@ async fn main() -> Result<()> {
                                 }
                             }
                         }
+                        "pin-chat" | "unpin-chat" | "mute-chat" | "unmute-chat"
+                        | "archive-chat" | "unarchive-chat" | "mark-read" | "mark-unread"
+                        | "delete-chat" => {
+                            if parts.len() < 2 {
+                                eprintln!("usage: {} <jid>", parts[0]);
+                            } else {
+                                let jid = parts[1];
+                                let result = match parts[0] {
+                                    "pin-chat" => bridge_for_repl.pin_chat(jid).await,
+                                    "unpin-chat" => bridge_for_repl.unpin_chat(jid).await,
+                                    "mute-chat" => bridge_for_repl.mute_chat(jid).await,
+                                    "unmute-chat" => bridge_for_repl.unmute_chat(jid).await,
+                                    "archive-chat" => bridge_for_repl.archive_chat(jid).await,
+                                    "unarchive-chat" => bridge_for_repl.unarchive_chat(jid).await,
+                                    "mark-read" => bridge_for_repl.mark_chat_as_read(jid).await,
+                                    "mark-unread" => bridge_for_repl.mark_chat_as_unread(jid).await,
+                                    "delete-chat" => bridge_for_repl.delete_chat(jid).await,
+                                    _ => unreachable!(),
+                                };
+                                match result {
+                                    Ok(()) => println!("ok"),
+                                    Err(e) => eprintln!("error: {e}"),
+                                }
+                            }
+                        }
+                        "delete-for-me" => {
+                            if parts.len() < 3 {
+                                eprintln!("usage: delete-for-me <jid> <msg_id> [sender] [from_me]");
+                            } else {
+                                let sender = parts.get(3).map(|s| *s);
+                                let from_me = parts.get(4).map(|v| *v != "false").unwrap_or(true);
+                                match bridge_for_repl.delete_message_for_me(parts[1], parts[2], sender, from_me).await {
+                                    Ok(()) => println!("ok"),
+                                    Err(e) => eprintln!("error: {e}"),
+                                }
+                            }
+                        }
+                        "star" | "unstar" => {
+                            if parts.len() < 3 {
+                                eprintln!("usage: {} <jid> <msg_id> [sender] [from_me]", parts[0]);
+                            } else {
+                                let sender = parts.get(3).map(|s| *s);
+                                let from_me = parts.get(4).map(|v| *v != "false").unwrap_or(true);
+                                let result = if parts[0] == "star" {
+                                    bridge_for_repl.star_message(parts[1], parts[2], sender, from_me).await
+                                } else {
+                                    bridge_for_repl.unstar_message(parts[1], parts[2], sender, from_me).await
+                                };
+                                match result {
+                                    Ok(()) => println!("ok"),
+                                    Err(e) => eprintln!("error: {e}"),
+                                }
+                            }
+                        }
                         "status-text" => {
                             if parts.len() < 3 {
                                 println!("usage: status-text <recipients> <text>");
@@ -1224,6 +1278,36 @@ async fn cli_main(args: &[String]) -> Result<()> {
             print_json_result(status, &resp)?;
             Ok(())
         }
+        // Chat management
+        "pin-chat" | "unpin-chat" | "mute-chat" | "unmute-chat"
+        | "archive-chat" | "unarchive-chat" | "mark-read" | "mark-unread"
+        | "delete-chat" => {
+            require_args(args, 2, &format!("{} <jid>", args[0]))?;
+            let endpoint = format!("/api/{}", args[0]);
+            let body = json!({"jid": args[1]}).to_string();
+            let (status, resp) = api::cli_post(port, &endpoint, &body).await?;
+            print_json_result(status, &resp)?;
+            Ok(())
+        }
+        "delete-for-me" => {
+            require_args(args, 3, "delete-for-me <jid> <msg_id> [sender] [from_me]")?;
+            let mut payload = json!({"jid": args[1], "id": args[2]});
+            if let Some(sender) = args.get(3) { payload["sender"] = json!(sender); }
+            if let Some(fm) = args.get(4) { payload["from_me"] = json!(fm != "false"); }
+            let (status, resp) = api::cli_post(port, "/api/delete-for-me", &payload.to_string()).await?;
+            print_json_result(status, &resp)?;
+            Ok(())
+        }
+        "star" | "unstar" => {
+            require_args(args, 3, &format!("{} <jid> <msg_id> [sender] [from_me]", args[0]))?;
+            let endpoint = format!("/api/{}", args[0]);
+            let mut payload = json!({"jid": args[1], "id": args[2]});
+            if let Some(sender) = args.get(3) { payload["sender"] = json!(sender); }
+            if let Some(fm) = args.get(4) { payload["from_me"] = json!(fm != "false"); }
+            let (status, resp) = api::cli_post(port, &endpoint, &payload.to_string()).await?;
+            print_json_result(status, &resp)?;
+            Ok(())
+        }
         "events" => {
             api::cli_stream_sse(port).await?;
             Ok(())
@@ -1415,6 +1499,18 @@ fn print_cli_help() {
     println!("  whatsrust group-remove <jid> <jid>...  Remove participants from group");
     println!("  whatsrust group-promote <jid> <jid>... Promote participants to admin");
     println!("  whatsrust group-demote <jid> <jid>...  Demote admins to regular");
+    println!("  whatsrust pin-chat <jid>               Pin a chat");
+    println!("  whatsrust unpin-chat <jid>             Unpin a chat");
+    println!("  whatsrust mute-chat <jid>              Mute a chat indefinitely");
+    println!("  whatsrust unmute-chat <jid>            Unmute a chat");
+    println!("  whatsrust archive-chat <jid>           Archive a chat");
+    println!("  whatsrust unarchive-chat <jid>         Unarchive a chat");
+    println!("  whatsrust mark-read <jid>              Mark chat as read");
+    println!("  whatsrust mark-unread <jid>            Mark chat as unread");
+    println!("  whatsrust delete-chat <jid>            Delete a chat");
+    println!("  whatsrust delete-for-me <jid> <id>     Delete message for me only");
+    println!("  whatsrust star <jid> <id>              Star a message");
+    println!("  whatsrust unstar <jid> <id>            Unstar a message");
     println!("  whatsrust events                       Stream SSE events (inbound + status)");
     println!("  whatsrust mcp                          MCP server (JSON-RPC over stdio)");
     println!("  whatsrust history <jid> [limit]        Recent messages for a chat");

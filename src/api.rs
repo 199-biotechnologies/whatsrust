@@ -356,6 +356,20 @@ async fn handle_request(bridge: &WhatsAppBridge, req: &HttpRequest, is_loopback:
         ("POST", "/api/group-promote") => handle_group_participants(bridge, &req.body, ParticipantAction::Promote).await,
         ("POST", "/api/group-demote") => handle_group_participants(bridge, &req.body, ParticipantAction::Demote).await,
 
+        // Chat management
+        ("POST", "/api/pin-chat") => handle_jid_action(bridge, &req.body, JidAction::PinChat).await,
+        ("POST", "/api/unpin-chat") => handle_jid_action(bridge, &req.body, JidAction::UnpinChat).await,
+        ("POST", "/api/mute-chat") => handle_jid_action(bridge, &req.body, JidAction::MuteChat).await,
+        ("POST", "/api/unmute-chat") => handle_jid_action(bridge, &req.body, JidAction::UnmuteChat).await,
+        ("POST", "/api/archive-chat") => handle_jid_action(bridge, &req.body, JidAction::ArchiveChat).await,
+        ("POST", "/api/unarchive-chat") => handle_jid_action(bridge, &req.body, JidAction::UnarchiveChat).await,
+        ("POST", "/api/mark-read") => handle_jid_action(bridge, &req.body, JidAction::MarkRead).await,
+        ("POST", "/api/mark-unread") => handle_jid_action(bridge, &req.body, JidAction::MarkUnread).await,
+        ("POST", "/api/delete-chat") => handle_jid_action(bridge, &req.body, JidAction::DeleteChat).await,
+        ("POST", "/api/delete-for-me") => handle_message_action(bridge, &req.body, MessageAction::DeleteForMe).await,
+        ("POST", "/api/star") => handle_message_action(bridge, &req.body, MessageAction::Star).await,
+        ("POST", "/api/unstar") => handle_message_action(bridge, &req.body, MessageAction::Unstar).await,
+
         // Status/story
         ("POST", "/api/status-text") => handle_status_text(bridge, &req.body).await,
         ("POST", "/api/status-image") => handle_status_image(bridge, &req.body).await,
@@ -597,7 +611,11 @@ async fn handle_revoke(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
 
 // --- Simple JID-only actions (typing, presence) ---
 
-enum JidAction { StartTyping, StopTyping, StartRecording, StopRecording, SubscribePresence, GroupLeave }
+enum JidAction {
+    StartTyping, StopTyping, StartRecording, StopRecording, SubscribePresence, GroupLeave,
+    PinChat, UnpinChat, MuteChat, UnmuteChat, ArchiveChat, UnarchiveChat,
+    MarkRead, MarkUnread, DeleteChat,
+}
 
 #[derive(Deserialize)]
 struct JidReq {
@@ -613,6 +631,41 @@ async fn handle_jid_action(bridge: &WhatsAppBridge, body: &[u8], action: JidActi
         JidAction::StopRecording => bridge.stop_recording(&req.jid).await,
         JidAction::SubscribePresence => bridge.subscribe_presence(&req.jid).await,
         JidAction::GroupLeave => bridge.leave_group(&req.jid).await,
+        JidAction::PinChat => bridge.pin_chat(&req.jid).await,
+        JidAction::UnpinChat => bridge.unpin_chat(&req.jid).await,
+        JidAction::MuteChat => bridge.mute_chat(&req.jid).await,
+        JidAction::UnmuteChat => bridge.unmute_chat(&req.jid).await,
+        JidAction::ArchiveChat => bridge.archive_chat(&req.jid).await,
+        JidAction::UnarchiveChat => bridge.unarchive_chat(&req.jid).await,
+        JidAction::MarkRead => bridge.mark_chat_as_read(&req.jid).await,
+        JidAction::MarkUnread => bridge.mark_chat_as_unread(&req.jid).await,
+        JidAction::DeleteChat => bridge.delete_chat(&req.jid).await,
+    };
+    match result {
+        Ok(()) => json_ok_simple(),
+        Err(e) => bridge_err(e),
+    }
+}
+
+// --- Message-level chat actions (star, delete-for-me) ---
+
+enum MessageAction { DeleteForMe, Star, Unstar }
+
+#[derive(Deserialize)]
+struct MessageActionReq {
+    jid: String,
+    id: String,
+    sender: Option<String>,
+    from_me: Option<bool>,
+}
+
+async fn handle_message_action(bridge: &WhatsAppBridge, body: &[u8], action: MessageAction) -> Vec<u8> {
+    let req: MessageActionReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
+    let from_me = req.from_me.unwrap_or(true);
+    let result = match action {
+        MessageAction::DeleteForMe => bridge.delete_message_for_me(&req.jid, &req.id, req.sender.as_deref(), from_me).await,
+        MessageAction::Star => bridge.star_message(&req.jid, &req.id, req.sender.as_deref(), from_me).await,
+        MessageAction::Unstar => bridge.unstar_message(&req.jid, &req.id, req.sender.as_deref(), from_me).await,
     };
     match result {
         Ok(()) => json_ok_simple(),
