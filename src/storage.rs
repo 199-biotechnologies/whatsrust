@@ -1841,7 +1841,8 @@ impl ProtocolStore for Store {
         let cj = chat_jid.to_owned();
         let mid = message_id.to_owned();
         self.run(move |c| {
-            let result: Option<Vec<u8>> = c
+            let tx = c.unchecked_transaction().map_err(db_err)?;
+            let result: Option<Vec<u8>> = tx
                 .query_row(
                     "SELECT message_bytes FROM sent_messages WHERE chat_jid = ?1 AND message_id = ?2",
                     params![cj, mid],
@@ -1850,12 +1851,13 @@ impl ProtocolStore for Store {
                 .optional()
                 .map_err(db_err)?;
             if result.is_some() {
-                c.execute(
+                tx.execute(
                     "DELETE FROM sent_messages WHERE chat_jid = ?1 AND message_id = ?2",
                     params![cj, mid],
                 )
                 .map_err(db_err)?;
             }
+            tx.commit().map_err(db_err)?;
             Ok(result)
         })
         .await
