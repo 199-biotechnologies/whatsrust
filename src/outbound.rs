@@ -26,6 +26,10 @@ pub enum OutboundOpKind {
     Forward,
     ViewOnceImage,
     ViewOnceVideo,
+    StatusText,
+    StatusImage,
+    StatusVideo,
+    StatusRevoke,
 }
 
 impl OutboundOpKind {
@@ -48,6 +52,10 @@ impl OutboundOpKind {
             Self::Forward => "forward",
             Self::ViewOnceImage => "view_once_image",
             Self::ViewOnceVideo => "view_once_video",
+            Self::StatusText => "status_text",
+            Self::StatusImage => "status_image",
+            Self::StatusVideo => "status_video",
+            Self::StatusRevoke => "status_revoke",
         }
     }
 
@@ -70,6 +78,10 @@ impl OutboundOpKind {
             "forward" => Some(Self::Forward),
             "view_once_image" => Some(Self::ViewOnceImage),
             "view_once_video" => Some(Self::ViewOnceVideo),
+            "status_text" => Some(Self::StatusText),
+            "status_image" => Some(Self::StatusImage),
+            "status_video" => Some(Self::StatusVideo),
+            "status_revoke" => Some(Self::StatusRevoke),
             _ => None,
         }
     }
@@ -156,6 +168,37 @@ pub struct PollPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForwardPayload {
     pub original_msg_id: String,
+}
+
+/// Payload for status/story text posts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusTextPayload {
+    pub recipients: Vec<String>,
+    pub text: String,
+    pub background_argb: u32,
+    pub font: i32,
+    pub privacy: Option<String>,
+}
+
+/// Payload for status/story media posts (image or video).
+/// Actual bytes stored in `payload_blob` column.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusMediaPayload {
+    pub recipients: Vec<String>,
+    pub mime: String,
+    pub caption: Option<String>,
+    /// Video duration in seconds. 0 for images.
+    pub seconds: u32,
+    pub privacy: Option<String>,
+}
+
+/// Payload for status/story revocation.
+/// Recipients MUST match the original post — wa-rs encrypts revoke to same device set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusRevokePayload {
+    pub recipients: Vec<String>,
+    pub message_id: String,
+    pub privacy: Option<String>,
 }
 
 /// A queued outbound job row from the database.
@@ -494,6 +537,13 @@ pub async fn execute_job(
                 .map_err(|e| anyhow::anyhow!("forward: {e}"))?;
             Ok(ExecOutcome { wa_message_id: Some(id), poll_key: None })
         }
+
+        OutboundOpKind::StatusText
+        | OutboundOpKind::StatusImage
+        | OutboundOpKind::StatusVideo
+        | OutboundOpKind::StatusRevoke => {
+            anyhow::bail!("status ops not yet wired in execute_job (op: {})", kind.as_str())
+        }
     }
 }
 
@@ -543,5 +593,64 @@ mod tests {
         let p: TextPayload = serde_json::from_str(json).unwrap();
         assert_eq!(p.text, "hello");
         assert!(p.mentions.is_empty());
+    }
+
+    #[test]
+    fn test_status_op_kind_roundtrip() {
+        for kind in [
+            OutboundOpKind::StatusText,
+            OutboundOpKind::StatusImage,
+            OutboundOpKind::StatusVideo,
+            OutboundOpKind::StatusRevoke,
+        ] {
+            assert_eq!(OutboundOpKind::from_str(kind.as_str()), Some(kind));
+        }
+    }
+
+    #[test]
+    fn test_status_text_payload_serde() {
+        let p = StatusTextPayload {
+            recipients: vec!["15551234567".to_string()],
+            text: "Hello from status".to_string(),
+            background_argb: 0xFF1E6E4F,
+            font: 2,
+            privacy: None,
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let p2: StatusTextPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(p2.text, "Hello from status");
+        assert_eq!(p2.recipients.len(), 1);
+        assert_eq!(p2.background_argb, 0xFF1E6E4F);
+        assert_eq!(p2.font, 2);
+        assert!(p2.privacy.is_none());
+    }
+
+    #[test]
+    fn test_status_media_payload_serde() {
+        let p = StatusMediaPayload {
+            recipients: vec!["15551234567".to_string(), "15559876543".to_string()],
+            mime: "image/jpeg".to_string(),
+            caption: Some("My photo".to_string()),
+            seconds: 0,
+            privacy: Some("contacts".to_string()),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let p2: StatusMediaPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(p2.recipients.len(), 2);
+        assert_eq!(p2.caption, Some("My photo".to_string()));
+        assert_eq!(p2.seconds, 0);
+    }
+
+    #[test]
+    fn test_status_revoke_payload_serde() {
+        let p = StatusRevokePayload {
+            recipients: vec!["15551234567".to_string()],
+            message_id: "3EB06D00CAB92340790621".to_string(),
+            privacy: None,
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let p2: StatusRevokePayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(p2.message_id, "3EB06D00CAB92340790621");
+        assert_eq!(p2.recipients.len(), 1);
     }
 }
