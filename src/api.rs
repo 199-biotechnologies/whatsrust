@@ -354,6 +354,12 @@ async fn handle_request(bridge: &WhatsAppBridge, req: &HttpRequest, is_loopback:
         ("POST", "/api/group-promote") => handle_group_participants(bridge, &req.body, ParticipantAction::Promote).await,
         ("POST", "/api/group-demote") => handle_group_participants(bridge, &req.body, ParticipantAction::Demote).await,
 
+        // Status/story
+        ("POST", "/api/status-text") => handle_status_text(bridge, &req.body).await,
+        ("POST", "/api/status-image") => handle_status_image(bridge, &req.body).await,
+        ("POST", "/api/status-video") => handle_status_video(bridge, &req.body).await,
+        ("POST", "/api/status-revoke") => handle_status_revoke(bridge, &req.body).await,
+
         _ => json_err(404, "not found"),
     }
 }
@@ -929,6 +935,95 @@ async fn handle_poll(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
     };
     match bridge.send_poll(&req.jid, &question, &options, req.selectable_count).await {
         Ok(id) => json_ok_id(&id),
+        Err(e) => bridge_err(e),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Status/story request structs + handlers
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct StatusTextReq {
+    recipients: Vec<String>,
+    text: String,
+    #[serde(default = "default_status_bg")]
+    background_argb: u32,
+    #[serde(default)]
+    font: i32,
+    privacy: Option<String>,
+}
+
+fn default_status_bg() -> u32 { 0xFF1E6E4F }
+
+#[derive(Deserialize)]
+struct StatusMediaReq {
+    recipients: Vec<String>,
+    data: String, // base64
+    mime: Option<String>,
+    caption: Option<String>,
+    seconds: Option<u32>,
+    privacy: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct StatusRevokeReq {
+    recipients: Vec<String>,
+    message_id: String,
+    privacy: Option<String>,
+}
+
+async fn handle_status_text(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+    let req: StatusTextReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
+    if req.recipients.is_empty() {
+        return json_err(400, "recipients must not be empty");
+    }
+    match bridge.send_status_text(&req.recipients, &req.text, req.background_argb, req.font, req.privacy).await {
+        Ok(id) => json_response(200, &serde_json::json!({"ok": true, "id": id}).to_string()),
+        Err(e) => bridge_err(e),
+    }
+}
+
+async fn handle_status_image(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+    let req: StatusMediaReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
+    if req.recipients.is_empty() {
+        return json_err(400, "recipients must not be empty");
+    }
+    let data = match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &req.data) {
+        Ok(d) => d,
+        Err(e) => return json_err(400, &format!("bad base64: {e}")),
+    };
+    let mime = req.mime.as_deref().unwrap_or("image/jpeg");
+    match bridge.send_status_image(&req.recipients, data, mime, req.caption.as_deref(), req.privacy).await {
+        Ok(id) => json_response(200, &serde_json::json!({"ok": true, "id": id}).to_string()),
+        Err(e) => bridge_err(e),
+    }
+}
+
+async fn handle_status_video(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+    let req: StatusMediaReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
+    if req.recipients.is_empty() {
+        return json_err(400, "recipients must not be empty");
+    }
+    let data = match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &req.data) {
+        Ok(d) => d,
+        Err(e) => return json_err(400, &format!("bad base64: {e}")),
+    };
+    let mime = req.mime.as_deref().unwrap_or("video/mp4");
+    let seconds = req.seconds.unwrap_or(0);
+    match bridge.send_status_video(&req.recipients, data, mime, req.caption.as_deref(), seconds, req.privacy).await {
+        Ok(id) => json_response(200, &serde_json::json!({"ok": true, "id": id}).to_string()),
+        Err(e) => bridge_err(e),
+    }
+}
+
+async fn handle_status_revoke(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+    let req: StatusRevokeReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
+    if req.recipients.is_empty() {
+        return json_err(400, "recipients must not be empty");
+    }
+    match bridge.revoke_status(&req.recipients, &req.message_id, req.privacy).await {
+        Ok(id) => json_response(200, &serde_json::json!({"ok": true, "id": id}).to_string()),
         Err(e) => bridge_err(e),
     }
 }
