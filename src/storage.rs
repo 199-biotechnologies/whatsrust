@@ -155,14 +155,6 @@ CREATE TABLE IF NOT EXISTS device_registry (
     phash TEXT
 );
 
--- Sender key status (lazy deletion marks)
-CREATE TABLE IF NOT EXISTS sender_key_status (
-    group_jid TEXT NOT NULL,
-    participant TEXT NOT NULL,
-    marked_at INTEGER NOT NULL,
-    PRIMARY KEY (group_jid, participant)
-);
-
 -- Trusted contact privacy tokens
 CREATE TABLE IF NOT EXISTS tc_tokens (
     jid TEXT PRIMARY KEY,
