@@ -300,11 +300,6 @@ impl Store {
         .map_err(db_err)?
     }
 
-    /// Get a reference to the connection for synchronous checks (e.g. PRAGMA integrity_check).
-    pub fn conn_for_check(&self) -> parking_lot::MutexGuard<'_, Connection> {
-        self.conn.lock()
-    }
-
     /// Create a hot backup of the database using SQLite's backup API.
     pub fn snapshot_db(&self, dest_path: &Path) -> Result<()> {
         let guard = self.conn.lock();
@@ -331,12 +326,15 @@ impl Store {
     // -----------------------------------------------------------------------
 
     /// Mark an outbound message as successfully sent.
-    pub async fn mark_outbound_sent(&self, id: i64) -> Result<()> {
+    /// Atomically mark a job as sent AND record its WA message ID in one write.
+    /// Prevents the race where a receipt arrives between separate sent/wa_id updates.
+    pub async fn mark_outbound_sent_with_id(&self, id: i64, wa_message_id: Option<&str>) -> Result<()> {
         let ts = now_secs();
+        let wa = wa_message_id.map(|s| s.to_owned());
         self.run(move |c| {
             c.execute(
-                "UPDATE outbound_queue SET status = 'sent', updated_at = ?1 WHERE id = ?2",
-                params![ts, id],
+                "UPDATE outbound_queue SET status = 'sent', wa_message_id = COALESCE(?1, wa_message_id), updated_at = ?2 WHERE id = ?3",
+                params![wa, ts, id],
             )
             .map_err(db_err)?;
             Ok(())
@@ -515,20 +513,6 @@ impl Store {
         .await
     }
 
-    /// Record the WhatsApp message ID after successful send.
-    pub async fn set_job_wa_message_id(&self, id: i64, wa_id: &str) -> Result<()> {
-        let wa = wa_id.to_owned();
-        let ts = now_secs();
-        self.run(move |c| {
-            c.execute(
-                "UPDATE outbound_queue SET wa_message_id = ?1, updated_at = ?2 WHERE id = ?3",
-                params![wa, ts, id],
-            )
-            .map_err(db_err)?;
-            Ok(())
-        })
-        .await
-    }
 
     /// Update delivery status for a job identified by its WhatsApp message ID.
     pub async fn update_delivery_status(&self, wa_message_id: &str, status: &str) -> Result<()> {

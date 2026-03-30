@@ -256,9 +256,16 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<HttpRequest>
         }
     }
 
-    // Reject oversized bodies (1 MiB limit — largest payload is a file path in JSON)
-    const MAX_BODY: usize = 1024 * 1024;
-    if content_length > MAX_BODY {
+    // Body size limit: 70 MiB for media endpoints (base64 of 50 MiB), 1 MiB otherwise.
+    // We check the route after parsing headers to apply the correct limit.
+    let is_media_route = path.starts_with("/api/image")
+        || path.starts_with("/api/video")
+        || path.starts_with("/api/audio")
+        || path.starts_with("/api/doc")
+        || path.starts_with("/api/sticker")
+        || path.starts_with("/api/view-once");
+    let max_body: usize = if is_media_route { 70 * 1024 * 1024 } else { 1024 * 1024 };
+    if content_length > max_body {
         return None;
     }
 
@@ -276,6 +283,10 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<HttpRequest>
                 Ok(Ok(n)) => body_buf.extend_from_slice(&tmp[..n]),
                 Ok(Err(_)) => break,
             }
+        }
+        // Reject truncated bodies — don't process partial requests
+        if body_buf.len() < content_length {
+            return None;
         }
         body_buf.truncate(content_length);
         body_buf

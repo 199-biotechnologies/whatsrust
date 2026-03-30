@@ -222,7 +222,7 @@ fn http_get(port: u16, path: &str) -> Result<String, String> {
     use std::io::Read;
     use std::net::TcpStream;
 
-    let host = std::env::var("WHATSRUST_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let host = mcp_connect_host();
     let mut stream = TcpStream::connect((&*host, port))
         .map_err(|e| format!("cannot connect to daemon on {host}:{port}: {e}"))?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(30))).ok();
@@ -245,7 +245,7 @@ fn http_post(port: u16, path: &str, body: &Value) -> Result<String, String> {
     use std::io::Read;
     use std::net::TcpStream;
 
-    let host = std::env::var("WHATSRUST_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let host = mcp_connect_host();
     let mut stream = TcpStream::connect((&*host, port))
         .map_err(|e| format!("cannot connect to daemon on {host}:{port}: {e}"))?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(30))).ok();
@@ -271,6 +271,29 @@ fn extract_http_body(raw: &[u8]) -> Result<String, String> {
     let header_end = raw.windows(4)
         .position(|w| w == b"\r\n\r\n")
         .ok_or("invalid HTTP response")?;
-    let body = &raw[header_end + 4..];
-    String::from_utf8(body.to_vec()).map_err(|e| format!("invalid UTF-8: {e}"))
+    let header_str = String::from_utf8_lossy(&raw[..header_end]);
+    // Parse HTTP status code from first line
+    let status: u16 = header_str
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let body = String::from_utf8(raw[header_end + 4..].to_vec())
+        .map_err(|e| format!("invalid UTF-8: {e}"))?;
+    if status >= 400 {
+        Err(body)
+    } else {
+        Ok(body)
+    }
+}
+
+/// Normalize bind host — replace wildcard "0.0.0.0" with "127.0.0.1" for connections.
+fn mcp_connect_host() -> String {
+    let bind = std::env::var("WHATSRUST_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
+    if bind == "0.0.0.0" || bind == "::" {
+        "127.0.0.1".to_string()
+    } else {
+        bind
+    }
 }

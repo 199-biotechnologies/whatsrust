@@ -690,9 +690,10 @@ impl WhatsAppBridge {
         let sub_pres = subscribed_presence.clone();
         let on = outbound_notify.clone();
         let et = event_tx.clone();
+        let st = store.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                run_bridge(config, inbound_tx, state_tx, qr_tx, cancel_clone, ch, rr, mc, met, sp, sub_pres, on, et).await
+                run_bridge(config, inbound_tx, state_tx, qr_tx, cancel_clone, ch, rr, mc, met, sp, sub_pres, on, et, st).await
             {
                 error!(error = %e, "WhatsApp bridge exited with error");
             }
@@ -1470,33 +1471,9 @@ async fn run_bridge(
     subscribed_presence: Arc<DashSet<String>>,
     outbound_notify: Arc<tokio::sync::Notify>,
     event_tx: tokio::sync::broadcast::Sender<Arc<crate::bridge_events::BridgeEvent>>,
+    store: Store,
 ) -> Result<()> {
     info!("WhatsApp bridge starting");
-
-    // Open our lean rusqlite storage backend
-    let store = Store::new(&config.db_path).context("failed to open WhatsApp storage database")?;
-
-    // DB integrity check on startup
-    {
-        let store_check = store.clone();
-        let check_result = tokio::task::spawn_blocking(move || {
-            let conn = store_check.conn_for_check();
-            conn.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
-        })
-        .await
-        .context("integrity check task panicked")?;
-        match check_result {
-            Ok(ref result) if result == "ok" => {
-                info!("database integrity check passed");
-            }
-            Ok(result) => {
-                warn!(result = %result, "database integrity check returned warnings");
-            }
-            Err(e) => {
-                error!(error = %e, "database integrity check failed");
-            }
-        }
-    }
 
     // Recover any messages stuck in 'inflight' from a previous crash
     match store.requeue_stale_inflight(60).await {
@@ -1855,11 +1832,8 @@ async fn run_bot_session(
                         match crate::outbound::execute_job(&row, &jid, &client).await {
                             Ok(outcome) => {
                                 metrics.record_sent();
-                                if let Err(e) = store.mark_outbound_sent(row.id).await {
+                                if let Err(e) = store.mark_outbound_sent_with_id(row.id, outcome.wa_message_id.as_deref()).await {
                                     error!(error = %e, row_id = row.id, "shutdown drain: failed to mark sent");
-                                }
-                                if let Some(wa_id) = &outcome.wa_message_id {
-                                    let _ = store.set_job_wa_message_id(row.id, wa_id).await;
                                 }
                                 sent += 1;
                             }
@@ -2255,6 +2229,7 @@ async fn handle_event(
                 DeliveryStatus::Delivered => Some(crate::bridge_events::OutboundJobState::Delivered),
                 DeliveryStatus::Read => Some(crate::bridge_events::OutboundJobState::Read),
                 DeliveryStatus::Played => Some(crate::bridge_events::OutboundJobState::Played),
+                DeliveryStatus::Failed => Some(crate::bridge_events::OutboundJobState::Failed),
                 _ => None,
             };
             if let Some(state) = job_state {
@@ -2924,6 +2899,16 @@ async fn handle_outbound(
             break;
         }
 
+        // Don't claim jobs while disconnected — avoids hot-loop churn
+        if get_client_handle(client_handle).is_none() {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = outbound_notify.notified() => {}
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+            }
+            continue;
+        }
+
         // Try to claim the next queued job
         let row = match store.claim_next_job().await {
             Ok(Some(row)) => row,
@@ -2946,16 +2931,6 @@ async fn handle_outbound(
                 continue;
             }
         };
-
-        // Emit Sending status
-        let _ = event_tx.send(Arc::new(crate::bridge_events::BridgeEvent::OutboundStatus(
-            crate::bridge_events::OutboundStatusEvent {
-                job_id: row.id,
-                state: crate::bridge_events::OutboundJobState::Sending,
-                wa_message_id: None,
-                error: None,
-            },
-        )));
 
         let jid = match parse_jid(&row.jid) {
             Ok(j) => j,
@@ -2988,26 +2963,31 @@ async fn handle_outbound(
             continue;
         };
 
+        // Emit Sending only after client is confirmed available
+        let _ = event_tx.send(Arc::new(crate::bridge_events::BridgeEvent::OutboundStatus(
+            crate::bridge_events::OutboundStatusEvent {
+                job_id: row.id,
+                state: crate::bridge_events::OutboundJobState::Sending,
+                wa_message_id: None,
+                error: None,
+            },
+        )));
+
         match crate::outbound::execute_job(&row, &jid, &client).await {
             Ok(outcome) => {
                 metrics.record_sent();
-                // Retry mark_sent up to 3 times — failure here means the job
-                // could be re-sent on restart (at-least-once), so we try hard.
+                // Atomically mark sent + set wa_message_id in one DB write.
+                // Prevents race where receipt arrives between separate updates.
                 for attempt in 0..3 {
-                    match store.mark_outbound_sent(row.id).await {
+                    match store.mark_outbound_sent_with_id(row.id, outcome.wa_message_id.as_deref()).await {
                         Ok(()) => break,
                         Err(e) if attempt < 2 => {
-                            warn!(error = %e, row_id = row.id, attempt, "retrying mark_outbound_sent");
+                            warn!(error = %e, row_id = row.id, attempt, "retrying mark_outbound_sent_with_id");
                             tokio::time::sleep(Duration::from_millis(50)).await;
                         }
                         Err(e) => {
                             error!(error = %e, row_id = row.id, "failed to mark job as sent after 3 attempts — may re-send on restart");
                         }
-                    }
-                }
-                if let Some(ref wa_id) = outcome.wa_message_id {
-                    if let Err(e) = store.set_job_wa_message_id(row.id, wa_id).await {
-                        warn!(error = %e, row_id = row.id, "failed to set wa_message_id — receipt correlation may fail");
                     }
                 }
 
