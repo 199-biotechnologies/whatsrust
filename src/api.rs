@@ -263,7 +263,9 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<HttpRequest>
         || path.starts_with("/api/audio")
         || path.starts_with("/api/doc")
         || path.starts_with("/api/sticker")
-        || path.starts_with("/api/view-once");
+        || path.starts_with("/api/view-once")
+        || path.starts_with("/api/status-image")
+        || path.starts_with("/api/status-video");
     let max_body: usize = if is_media_route { 70 * 1024 * 1024 } else { 1024 * 1024 };
     if content_length > max_body {
         return None;
