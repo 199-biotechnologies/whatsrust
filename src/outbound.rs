@@ -226,6 +226,28 @@ pub struct PollKeyInfo {
     pub options: Vec<String>,
 }
 
+/// Parse a privacy string into a StatusPrivacySetting.
+pub fn parse_status_privacy(s: Option<String>) -> whatsapp_rust::StatusPrivacySetting {
+    match s.as_deref() {
+        Some("allowlist") => whatsapp_rust::StatusPrivacySetting::AllowList,
+        Some("denylist") => whatsapp_rust::StatusPrivacySetting::DenyList,
+        _ => whatsapp_rust::StatusPrivacySetting::Contacts,
+    }
+}
+
+/// Parse a list of phone number strings into Vec<Jid>.
+fn parse_recipient_jids(recipients: &[String]) -> anyhow::Result<Vec<wacore_binary::jid::Jid>> {
+    use std::str::FromStr;
+    recipients
+        .iter()
+        .map(|r| {
+            let normalized = r.trim().replace('+', "").replace(' ', "").replace('-', "");
+            wacore_binary::jid::Jid::from_str(&format!("{normalized}@s.whatsapp.net"))
+                .map_err(|e| anyhow::anyhow!("bad recipient JID '{r}': {e}"))
+        })
+        .collect()
+}
+
 /// Build and send a wa::Message from a job row. Returns the WA message ID if applicable.
 ///
 /// Media ops upload bytes to WhatsApp servers before sending. Edit/revoke use
@@ -538,11 +560,56 @@ pub async fn execute_job(
             Ok(ExecOutcome { wa_message_id: Some(id), poll_key: None })
         }
 
-        OutboundOpKind::StatusText
-        | OutboundOpKind::StatusImage
-        | OutboundOpKind::StatusVideo
-        | OutboundOpKind::StatusRevoke => {
-            anyhow::bail!("status ops not yet wired in execute_job (op: {})", kind.as_str())
+        OutboundOpKind::StatusText => {
+            let p: StatusTextPayload = serde_json::from_str(&row.payload_json)?;
+            let recipients = parse_recipient_jids(&p.recipients)?;
+            let opts = whatsapp_rust::StatusSendOptions {
+                privacy: parse_status_privacy(p.privacy),
+            };
+            let id = client.status().send_text(&p.text, p.background_argb, p.font, recipients, opts).await
+                .map_err(|e| anyhow::anyhow!("send status text: {e}"))?;
+            Ok(ExecOutcome { wa_message_id: Some(id), poll_key: None })
+        }
+
+        OutboundOpKind::StatusImage => {
+            let p: StatusMediaPayload = serde_json::from_str(&row.payload_json)?;
+            let data = row.payload_blob.clone()
+                .ok_or_else(|| anyhow::anyhow!("status image op missing payload_blob"))?;
+            let recipients = parse_recipient_jids(&p.recipients)?;
+            let opts = whatsapp_rust::StatusSendOptions {
+                privacy: parse_status_privacy(p.privacy),
+            };
+            let upload = client.upload(data, MediaType::Image).await
+                .map_err(|e| anyhow::anyhow!("status image upload: {e}"))?;
+            let id = client.status().send_image(&upload, vec![], p.caption.as_deref(), recipients, opts).await
+                .map_err(|e| anyhow::anyhow!("send status image: {e}"))?;
+            Ok(ExecOutcome { wa_message_id: Some(id), poll_key: None })
+        }
+
+        OutboundOpKind::StatusVideo => {
+            let p: StatusMediaPayload = serde_json::from_str(&row.payload_json)?;
+            let data = row.payload_blob.clone()
+                .ok_or_else(|| anyhow::anyhow!("status video op missing payload_blob"))?;
+            let recipients = parse_recipient_jids(&p.recipients)?;
+            let opts = whatsapp_rust::StatusSendOptions {
+                privacy: parse_status_privacy(p.privacy),
+            };
+            let upload = client.upload(data, MediaType::Video).await
+                .map_err(|e| anyhow::anyhow!("status video upload: {e}"))?;
+            let id = client.status().send_video(&upload, vec![], p.seconds, p.caption.as_deref(), recipients, opts).await
+                .map_err(|e| anyhow::anyhow!("send status video: {e}"))?;
+            Ok(ExecOutcome { wa_message_id: Some(id), poll_key: None })
+        }
+
+        OutboundOpKind::StatusRevoke => {
+            let p: StatusRevokePayload = serde_json::from_str(&row.payload_json)?;
+            let recipients = parse_recipient_jids(&p.recipients)?;
+            let opts = whatsapp_rust::StatusSendOptions {
+                privacy: parse_status_privacy(p.privacy),
+            };
+            let id = client.status().revoke(p.message_id, recipients, opts).await
+                .map_err(|e| anyhow::anyhow!("revoke status: {e}"))?;
+            Ok(ExecOutcome { wa_message_id: Some(id), poll_key: None })
         }
     }
 }
@@ -652,5 +719,14 @@ mod tests {
         let p2: StatusRevokePayload = serde_json::from_str(&json).unwrap();
         assert_eq!(p2.message_id, "3EB06D00CAB92340790621");
         assert_eq!(p2.recipients.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_status_privacy() {
+        assert_eq!(parse_status_privacy(None).as_str(), "contacts");
+        assert_eq!(parse_status_privacy(Some("contacts".to_string())).as_str(), "contacts");
+        assert_eq!(parse_status_privacy(Some("allowlist".to_string())).as_str(), "allowlist");
+        assert_eq!(parse_status_privacy(Some("denylist".to_string())).as_str(), "denylist");
+        assert_eq!(parse_status_privacy(Some("bogus".to_string())).as_str(), "contacts");
     }
 }
