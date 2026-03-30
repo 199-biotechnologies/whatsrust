@@ -1451,6 +1451,79 @@ impl WhatsAppBridge {
         })?;
         self.enqueue_and_wait(jid, crate::outbound::OutboundOpKind::Reply, &payload, None).await
     }
+
+    /// Post a text status/story. Returns the WA message ID (sync).
+    pub async fn send_status_text(
+        &self,
+        recipients: &[String],
+        text: &str,
+        background_argb: u32,
+        font: i32,
+        privacy: Option<String>,
+    ) -> Result<String> {
+        let payload = serde_json::to_string(&crate::outbound::StatusTextPayload {
+            recipients: recipients.to_vec(),
+            text: text.to_string(),
+            background_argb,
+            font,
+            privacy,
+        })?;
+        self.enqueue_and_wait("status@broadcast", crate::outbound::OutboundOpKind::StatusText, &payload, None).await
+    }
+
+    /// Post an image status/story. Returns the WA message ID (sync).
+    pub async fn send_status_image(
+        &self,
+        recipients: &[String],
+        data: Vec<u8>,
+        mime: &str,
+        caption: Option<&str>,
+        privacy: Option<String>,
+    ) -> Result<String> {
+        let payload = serde_json::to_string(&crate::outbound::StatusMediaPayload {
+            recipients: recipients.to_vec(),
+            mime: mime.to_string(),
+            caption: caption.map(|c| c.to_string()),
+            seconds: 0,
+            privacy,
+        })?;
+        self.enqueue_and_wait("status@broadcast", crate::outbound::OutboundOpKind::StatusImage, &payload, Some(data)).await
+    }
+
+    /// Post a video status/story. Returns the WA message ID (sync).
+    pub async fn send_status_video(
+        &self,
+        recipients: &[String],
+        data: Vec<u8>,
+        mime: &str,
+        caption: Option<&str>,
+        seconds: u32,
+        privacy: Option<String>,
+    ) -> Result<String> {
+        let payload = serde_json::to_string(&crate::outbound::StatusMediaPayload {
+            recipients: recipients.to_vec(),
+            mime: mime.to_string(),
+            caption: caption.map(|c| c.to_string()),
+            seconds,
+            privacy,
+        })?;
+        self.enqueue_and_wait("status@broadcast", crate::outbound::OutboundOpKind::StatusVideo, &payload, Some(data)).await
+    }
+
+    /// Revoke a previously posted status/story. Returns the WA message ID (sync).
+    pub async fn revoke_status(
+        &self,
+        recipients: &[String],
+        message_id: &str,
+        privacy: Option<String>,
+    ) -> Result<String> {
+        let payload = serde_json::to_string(&crate::outbound::StatusRevokePayload {
+            recipients: recipients.to_vec(),
+            message_id: message_id.to_string(),
+            privacy,
+        })?;
+        self.enqueue_and_wait("status@broadcast", crate::outbound::OutboundOpKind::StatusRevoke, &payload, None).await
+    }
 }
 
 // ---------------------------------------------------------------------------
