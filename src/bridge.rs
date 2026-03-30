@@ -1809,6 +1809,7 @@ async fn run_bot_session(
         .with_backend(Arc::new(store.clone()))
         .with_transport_factory(TokioWebSocketTransportFactory::new())
         .with_http_client(UreqHttpClient::new())
+        .with_runtime(whatsapp_rust::TokioRuntime)
         .on_event(move |event, client| {
             let ch = ch.clone();
             let itx = itx.clone();

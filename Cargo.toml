@@ -41,12 +41,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # We skip the default sqlite-storage feature to avoid Diesel/libsqlite3-sys conflicts.
 # Our own rusqlite backend (src/storage.rs) replaces it.
 # For local dev, .cargo/config.toml patches these to ../whatsapp-rust path deps.
-whatsapp-rust = { git = "https://github.com/199-biotechnologies/whatsapp-rust", rev = "6fa2f8a67a25fa088864e95571f7fa00ed7b1ecf", default-features = false }
-wacore = { git = "https://github.com/199-biotechnologies/whatsapp-rust", rev = "6fa2f8a67a25fa088864e95571f7fa00ed7b1ecf" }
-wacore-binary = { git = "https://github.com/199-biotechnologies/whatsapp-rust", rev = "6fa2f8a67a25fa088864e95571f7fa00ed7b1ecf" }
-waproto = { git = "https://github.com/199-biotechnologies/whatsapp-rust", rev = "6fa2f8a67a25fa088864e95571f7fa00ed7b1ecf" }
-whatsapp-rust-tokio-transport = { git = "https://github.com/199-biotechnologies/whatsapp-rust", rev = "6fa2f8a67a25fa088864e95571f7fa00ed7b1ecf" }
-whatsapp-rust-ureq-http-client = { git = "https://github.com/199-biotechnologies/whatsapp-rust", rev = "6fa2f8a67a25fa088864e95571f7fa00ed7b1ecf" }
+whatsapp-rust = { git = "https://github.com/199-biotechnologies/whatsapp-rust", rev = "44632d3e8dae0eabdabffc582cb1cc53daab1abb", default-features = false, features = ["tokio-runtime", "tokio-transport", "ureq-client", "moka-cache", "simd", "signal", "tokio-native"] }
+wacore = { git = "https://github.com/199-biotechnologies/whatsapp-rust", rev = "44632d3e8dae0eabdabffc582cb1cc53daab1abb" }
+wacore-binary = { git = "https://github.com/199-biotechnologies/whatsapp-rust", rev = "44632d3e8dae0eabdabffc582cb1cc53daab1abb" }
+waproto = { git = "https://github.com/199-biotechnologies/whatsapp-rust", rev = "44632d3e8dae0eabdabffc582cb1cc53daab1abb" }
+whatsapp-rust-tokio-transport = { git = "https://github.com/199-biotechnologies/whatsapp-rust", rev = "44632d3e8dae0eabdabffc582cb1cc53daab1abb" }
+whatsapp-rust-ureq-http-client = { git = "https://github.com/199-biotechnologies/whatsapp-rust", rev = "44632d3e8dae0eabdabffc582cb1cc53daab1abb" }
 
 [profile.release]
 opt-level = "z"

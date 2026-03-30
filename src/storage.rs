@@ -54,7 +54,9 @@ CREATE TABLE IF NOT EXISTS device (
     app_version_tertiary INTEGER NOT NULL DEFAULT 0,
     app_version_last_fetched_ms INTEGER NOT NULL DEFAULT 0,
     edge_routing_info BLOB,
-    props_hash TEXT
+    props_hash TEXT,
+    next_pre_key_id INTEGER NOT NULL DEFAULT 0,
+    nct_salt BLOB
 );
 
 -- Signal Protocol: identity keys
@@ -111,11 +113,21 @@ CREATE TABLE IF NOT EXISTS app_state_mutation_macs (
     PRIMARY KEY (name, index_mac)
 );
 
--- SKDM (Sender Key Distribution Message) recipients per group
-CREATE TABLE IF NOT EXISTS skdm_recipients (
+-- Per-device sender key tracking (replaces skdm_recipients)
+CREATE TABLE IF NOT EXISTS sender_key_devices (
     group_jid TEXT NOT NULL,
     device_jid TEXT NOT NULL,
+    needs_sender_key INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (group_jid, device_jid)
+);
+
+-- Sent message store for retry handling
+CREATE TABLE IF NOT EXISTS sent_messages (
+    chat_jid TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    message_bytes BLOB NOT NULL,
+    timestamp INTEGER NOT NULL,
+    PRIMARY KEY (chat_jid, message_id)
 );
 
 -- LID (Linked Identity) to phone number mapping
@@ -208,7 +220,7 @@ CREATE INDEX IF NOT EXISTS idx_inbound_chat_ts ON inbound_messages(chat_jid, tim
 CREATE INDEX IF NOT EXISTS idx_inbound_msg_id ON inbound_messages(message_id);
 ";
 
-const CURRENT_SCHEMA_VERSION: i64 = 6;
+const CURRENT_SCHEMA_VERSION: i64 = 7;
 
 #[cfg(unix)]
 fn secure_backup_permissions(path: &Path) -> Result<()> {
@@ -869,6 +881,50 @@ fn run_schema_migrations(conn: &Connection, from_version: i64) -> Result<()> {
             ).map_err(db_err)?;
         }
 
+        if from_version < 7 {
+            // v6→v7: wa-rs v0.5.0 — new ProtocolStore tables + device columns.
+            // Replace skdm_recipients with sender_key_devices.
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS skdm_recipients;
+                 DROP TABLE IF EXISTS sender_key_status;
+
+                 CREATE TABLE IF NOT EXISTS sender_key_devices (
+                     group_jid TEXT NOT NULL,
+                     device_jid TEXT NOT NULL,
+                     needs_sender_key INTEGER NOT NULL DEFAULT 1,
+                     PRIMARY KEY (group_jid, device_jid)
+                 );
+
+                 CREATE TABLE IF NOT EXISTS sent_messages (
+                     chat_jid TEXT NOT NULL,
+                     message_id TEXT NOT NULL,
+                     message_bytes BLOB NOT NULL,
+                     timestamp INTEGER NOT NULL,
+                     PRIMARY KEY (chat_jid, message_id)
+                 );"
+            ).map_err(db_err)?;
+
+            // Add new device columns (idempotent check).
+            let add_dev_col = |col: &str, def: &str| -> std::result::Result<(), StoreError> {
+                let exists: bool = conn
+                    .prepare(&format!(
+                        "SELECT COUNT(*) FROM pragma_table_info('device') WHERE name='{col}'"
+                    ))
+                    .and_then(|mut s| s.query_row([], |r| r.get::<_, i64>(0)))
+                    .unwrap_or(0)
+                    > 0;
+                if !exists {
+                    conn.execute_batch(&format!(
+                        "ALTER TABLE device ADD COLUMN {col} {def};"
+                    ))
+                    .map_err(db_err)?;
+                }
+                Ok(())
+            };
+            add_dev_col("next_pre_key_id", "INTEGER NOT NULL DEFAULT 0")?;
+            add_dev_col("nct_salt", "BLOB")?;
+        }
+
         conn.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)
             .map_err(db_err)?;
         Ok(())
@@ -939,8 +995,9 @@ fn save_device_to_db(conn: &Connection, device: &Device) -> Result<()> {
         "INSERT INTO device (id, pn, lid, registration_id, noise_key, identity_key,
          signed_pre_key, signed_pre_key_id, signed_pre_key_signature, adv_secret_key,
          account, push_name, app_version_primary, app_version_secondary,
-         app_version_tertiary, app_version_last_fetched_ms, edge_routing_info, props_hash)
-         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+         app_version_tertiary, app_version_last_fetched_ms, edge_routing_info, props_hash,
+         next_pre_key_id, nct_salt)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
          ON CONFLICT(id) DO UPDATE SET
             pn=excluded.pn, lid=excluded.lid, registration_id=excluded.registration_id,
             noise_key=excluded.noise_key, identity_key=excluded.identity_key,
@@ -953,7 +1010,9 @@ fn save_device_to_db(conn: &Connection, device: &Device) -> Result<()> {
             app_version_tertiary=excluded.app_version_tertiary,
             app_version_last_fetched_ms=excluded.app_version_last_fetched_ms,
             edge_routing_info=excluded.edge_routing_info,
-            props_hash=excluded.props_hash",
+            props_hash=excluded.props_hash,
+            next_pre_key_id=excluded.next_pre_key_id,
+            nct_salt=excluded.nct_salt",
         params![
             pn,
             lid,
@@ -972,6 +1031,8 @@ fn save_device_to_db(conn: &Connection, device: &Device) -> Result<()> {
             device.app_version_last_fetched_ms,
             device.edge_routing_info,
             device.props_hash,
+            device.next_pre_key_id as i64,
+            device.nct_salt,
         ],
     )
     .map_err(db_err)?;
@@ -985,7 +1046,8 @@ fn load_device_from_db(conn: &Connection) -> Result<Option<Device>> {
             "SELECT pn, lid, registration_id, noise_key, identity_key, signed_pre_key,
              signed_pre_key_id, signed_pre_key_signature, adv_secret_key, account,
              push_name, app_version_primary, app_version_secondary, app_version_tertiary,
-             app_version_last_fetched_ms, edge_routing_info, props_hash
+             app_version_last_fetched_ms, edge_routing_info, props_hash,
+             next_pre_key_id, nct_salt
              FROM device WHERE id = 1",
             [],
             |row| {
@@ -1007,6 +1069,8 @@ fn load_device_from_db(conn: &Connection) -> Result<Option<Device>> {
                     row.get::<_, i64>(14)?,
                     row.get::<_, Option<Vec<u8>>>(15)?,
                     row.get::<_, Option<String>>(16)?,
+                    row.get::<_, i64>(17)?,
+                    row.get::<_, Option<Vec<u8>>>(18)?,
                 ))
             },
         )
@@ -1031,6 +1095,8 @@ fn load_device_from_db(conn: &Connection) -> Result<Option<Device>> {
         v_ts,
         eri,
         ph,
+        npk_id_raw,
+        nct_raw,
     )) = row
     else {
         return Ok(None);
@@ -1050,6 +1116,8 @@ fn load_device_from_db(conn: &Connection) -> Result<Option<Device>> {
             )))
         }
     };
+    let npk_id = to_u32(npk_id_raw, "next_pre_key_id")?;
+    let nct = nct_raw;
 
     Ok(Some(Device {
         pn: if pn_s.is_empty() {
@@ -1091,6 +1159,9 @@ fn load_device_from_db(conn: &Connection) -> Result<Option<Device>> {
         device_props: DEVICE_PROPS.clone(),
         edge_routing_info: eri,
         props_hash: ph,
+        next_pre_key_id: npk_id,
+        nct_salt: nct,
+        nct_salt_sync_seen: false,
     }))
 }
 
@@ -1264,6 +1335,18 @@ impl SignalStore for Store {
             c.execute("DELETE FROM signed_prekeys WHERE id = ?1", params![id])
                 .map_err(db_err)?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn get_max_prekey_id(&self) -> Result<u32> {
+        self.run(|c| {
+            let id: Option<u32> = c
+                .query_row("SELECT MAX(id) FROM prekeys", [], |r| r.get(0))
+                .optional()
+                .map_err(db_err)?
+                .flatten();
+            Ok(id.unwrap_or(0))
         })
         .await
     }
@@ -1447,6 +1530,19 @@ impl AppSyncStore for Store {
         })
         .await
     }
+
+    async fn get_latest_sync_key_id(&self) -> Result<Option<Vec<u8>>> {
+        self.run(|c| {
+            c.query_row(
+                "SELECT key_id FROM app_state_keys ORDER BY rowid DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_err)
+        })
+        .await
+    }
 }
 
 // ===========================================================================
@@ -1455,36 +1551,35 @@ impl AppSyncStore for Store {
 
 #[async_trait]
 impl ProtocolStore for Store {
-    async fn get_skdm_recipients(&self, group_jid: &str) -> Result<Vec<Jid>> {
+    async fn get_sender_key_devices(&self, group_jid: &str) -> Result<Vec<(String, bool)>> {
         let gj = group_jid.to_owned();
         self.run(move |c| {
             let mut stmt = c
-                .prepare("SELECT device_jid FROM skdm_recipients WHERE group_jid = ?1")
+                .prepare(
+                    "SELECT device_jid, needs_sender_key FROM sender_key_devices WHERE group_jid = ?1",
+                )
                 .map_err(db_err)?;
             let rows = stmt
-                .query_map(params![gj], |row| row.get::<_, String>(0))
+                .query_map(params![gj], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?))
+                })
                 .map_err(db_err)?;
-            let mut out = Vec::new();
-            for r in rows {
-                let s = r.map_err(db_err)?;
-                if let Ok(jid) = Jid::from_str(&s) {
-                    out.push(jid);
-                }
-            }
-            Ok(out)
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(db_err)
         })
         .await
     }
 
-    async fn add_skdm_recipients(&self, group_jid: &str, device_jids: &[Jid]) -> Result<()> {
+    async fn set_sender_key_status(&self, group_jid: &str, entries: &[(&str, bool)]) -> Result<()> {
         let gj = group_jid.to_owned();
-        let jids: Vec<String> = device_jids.iter().map(|j| j.to_string()).collect();
+        let owned: Vec<(String, bool)> = entries.iter().map(|(s, b)| (s.to_string(), *b)).collect();
         self.run(move |c| {
             let tx = c.unchecked_transaction().map_err(db_err)?;
-            for jid in &jids {
+            for (device_jid, needs) in &owned {
                 tx.execute(
-                    "INSERT OR IGNORE INTO skdm_recipients (group_jid, device_jid) VALUES (?1, ?2)",
-                    params![gj, jid],
+                    "INSERT INTO sender_key_devices (group_jid, device_jid, needs_sender_key) VALUES (?1, ?2, ?3) \
+                     ON CONFLICT(group_jid, device_jid) DO UPDATE SET needs_sender_key = ?3",
+                    params![gj, device_jid, needs],
                 )
                 .map_err(db_err)?;
             }
@@ -1493,11 +1588,11 @@ impl ProtocolStore for Store {
         .await
     }
 
-    async fn clear_skdm_recipients(&self, group_jid: &str) -> Result<()> {
+    async fn clear_sender_key_devices(&self, group_jid: &str) -> Result<()> {
         let gj = group_jid.to_owned();
         self.run(move |c| {
             c.execute(
-                "DELETE FROM skdm_recipients WHERE group_jid = ?1",
+                "DELETE FROM sender_key_devices WHERE group_jid = ?1",
                 params![gj],
             )
             .map_err(db_err)?;
@@ -1699,16 +1794,20 @@ impl ProtocolStore for Store {
         .await
     }
 
-    async fn mark_forget_sender_key(&self, group_jid: &str, participant: &str) -> Result<()> {
-        let gj = group_jid.to_owned();
-        let p = participant.to_owned();
+    async fn store_sent_message(
+        &self,
+        chat_jid: &str,
+        message_id: &str,
+        payload: &[u8],
+    ) -> Result<()> {
+        let cj = chat_jid.to_owned();
+        let mid = message_id.to_owned();
+        let bytes = payload.to_vec();
         let ts = now_secs();
         self.run(move |c| {
             c.execute(
-                "INSERT INTO sender_key_status (group_jid, participant, marked_at)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT(group_jid, participant) DO UPDATE SET marked_at = excluded.marked_at",
-                params![gj, p, ts],
+                "INSERT OR REPLACE INTO sent_messages (chat_jid, message_id, message_bytes, timestamp) VALUES (?1, ?2, ?3, ?4)",
+                params![cj, mid, bytes, ts],
             )
             .map_err(db_err)?;
             Ok(())
@@ -1716,26 +1815,40 @@ impl ProtocolStore for Store {
         .await
     }
 
-    async fn consume_forget_marks(&self, group_jid: &str) -> Result<Vec<String>> {
-        let gj = group_jid.to_owned();
+    async fn take_sent_message(&self, chat_jid: &str, message_id: &str) -> Result<Option<Vec<u8>>> {
+        let cj = chat_jid.to_owned();
+        let mid = message_id.to_owned();
         self.run(move |c| {
-            let tx = c.unchecked_transaction().map_err(db_err)?;
-            let mut stmt = tx
-                .prepare("SELECT participant FROM sender_key_status WHERE group_jid = ?1")
+            let result: Option<Vec<u8>> = c
+                .query_row(
+                    "SELECT message_bytes FROM sent_messages WHERE chat_jid = ?1 AND message_id = ?2",
+                    params![cj, mid],
+                    |r| r.get(0),
+                )
+                .optional()
                 .map_err(db_err)?;
-            let participants: Vec<String> = stmt
-                .query_map(params![gj], |row| row.get(0))
-                .map_err(db_err)?
-                .collect::<std::result::Result<_, _>>()
+            if result.is_some() {
+                c.execute(
+                    "DELETE FROM sent_messages WHERE chat_jid = ?1 AND message_id = ?2",
+                    params![cj, mid],
+                )
                 .map_err(db_err)?;
-            drop(stmt);
-            tx.execute(
-                "DELETE FROM sender_key_status WHERE group_jid = ?1",
-                params![gj],
-            )
-            .map_err(db_err)?;
-            tx.commit().map_err(db_err)?;
-            Ok(participants)
+            }
+            Ok(result)
+        })
+        .await
+    }
+
+    async fn delete_expired_sent_messages(&self, cutoff_timestamp: i64) -> Result<u32> {
+        self.run(move |c| {
+            let count = c
+                .execute(
+                    "DELETE FROM sent_messages WHERE timestamp < ?1",
+                    params![cutoff_timestamp],
+                )
+                .map_err(db_err)?;
+            u32::try_from(count)
+                .map_err(|_| StoreError::Database(format!("delete count {count} out of u32 range")))
         })
         .await
     }
