@@ -840,6 +840,35 @@ async fn main() -> Result<()> {
                                 }
                             }
                         }
+                        "status-text" => {
+                            if parts.len() < 3 {
+                                println!("usage: status-text <recipients> <text>");
+                                continue;
+                            }
+                            let recipients: Vec<String> = parts[1].split(',').map(|s| s.trim().to_string()).collect();
+                            let text = parts[2..].join(" ");
+                            match bridge_for_repl
+                                .send_status_text(&recipients, &text, 0xFF1E6E4F, 0, None)
+                                .await
+                            {
+                                Ok(id) => println!(">> status posted (id: {id})"),
+                                Err(e) => println!("!! status-text failed: {e}"),
+                            }
+                        }
+                        "status-revoke" => {
+                            if parts.len() < 3 {
+                                println!("usage: status-revoke <recipients> <message_id>");
+                                continue;
+                            }
+                            let recipients: Vec<String> = parts[1].split(',').map(|s| s.trim().to_string()).collect();
+                            match bridge_for_repl
+                                .revoke_status(&recipients, parts[2], None)
+                                .await
+                            {
+                                Ok(id) => println!(">> status revoked (id: {id})"),
+                                Err(e) => println!("!! status-revoke failed: {e}"),
+                            }
+                        }
                         "quit" | "q" | "exit" => {
                             cancel_for_repl.cancel();
                             break;
@@ -1217,6 +1246,57 @@ async fn cli_main(args: &[String]) -> Result<()> {
             let jid_param = args.get(2).map(|j| format!("&jid={j}")).unwrap_or_default();
             let (status, body) = api::cli_get(port, &format!("/api/search?q={query}{jid_param}")).await?;
             print_json_result(status, &body)?;
+            Ok(())
+        }
+        "status-text" => {
+            require_args(args, 3, "status-text <recipients> <text>")?;
+            let body = json!({
+                "recipients": args[1].split(',').collect::<Vec<&str>>(),
+                "text": args[2..].join(" ")
+            }).to_string();
+            let (status, resp) = api::cli_post(port, "/api/status-text", &body).await?;
+            print_json_result(status, &resp)?;
+            Ok(())
+        }
+        "status-image" => {
+            require_args(args, 3, "status-image <recipients> <path> [caption]")?;
+            let data = std::fs::read(&args[2])?;
+            let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &data);
+            let mime = if args[2].ends_with(".png") { "image/png" } else { "image/jpeg" };
+            let caption = if args.len() > 3 { Some(args[3..].join(" ")) } else { None };
+            let body = json!({
+                "recipients": args[1].split(',').collect::<Vec<&str>>(),
+                "data": b64,
+                "mime": mime,
+                "caption": caption
+            }).to_string();
+            let (status, resp) = api::cli_post(port, "/api/status-image", &body).await?;
+            print_json_result(status, &resp)?;
+            Ok(())
+        }
+        "status-video" => {
+            require_args(args, 3, "status-video <recipients> <path> [caption]")?;
+            let data = std::fs::read(&args[2])?;
+            let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &data);
+            let caption = if args.len() > 3 { Some(args[3..].join(" ")) } else { None };
+            let body = json!({
+                "recipients": args[1].split(',').collect::<Vec<&str>>(),
+                "data": b64,
+                "mime": "video/mp4",
+                "caption": caption
+            }).to_string();
+            let (status, resp) = api::cli_post(port, "/api/status-video", &body).await?;
+            print_json_result(status, &resp)?;
+            Ok(())
+        }
+        "status-revoke" => {
+            require_args(args, 3, "status-revoke <recipients> <msg_id>")?;
+            let body = json!({
+                "recipients": args[1].split(',').collect::<Vec<&str>>(),
+                "message_id": args[2]
+            }).to_string();
+            let (status, resp) = api::cli_post(port, "/api/status-revoke", &body).await?;
+            print_json_result(status, &resp)?;
             Ok(())
         }
         _ => {
