@@ -1,8 +1,8 @@
 <div align="center">
 
-# whatsrust
+# WhatsRust
 
-**WhatsApp in pure Rust. Single binary. No Node.js. No Baileys. No kidding.**
+**WhatsApp in pure Rust. One 5 MB binary. 15 MB RAM. No Node.js required.**
 
 <br />
 
@@ -16,75 +16,116 @@
 &nbsp;
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)](LICENSE)
 &nbsp;
+[![54 API Endpoints](https://img.shields.io/badge/API-54_endpoints-green?style=for-the-badge)](https://github.com/199-biotechnologies/whatsrust#api)
+&nbsp;
+[![30 MCP Tools](https://img.shields.io/badge/MCP-30_tools-blueviolet?style=for-the-badge)](https://github.com/199-biotechnologies/whatsrust#mcp-server-for-ai-agents)
+&nbsp;
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen?style=for-the-badge)](https://github.com/199-biotechnologies/whatsrust/pulls)
 
 ---
 
-One Rust binary that handles the full WhatsApp protocol: text, image, audio, video, stickers, reactions, edits, polls, status stories, groups, and chat management. 5 MB on disk. 15 MB in memory. 54 API endpoints. Works as a daemon, a CLI, a library, or an MCP server for AI agents.
+A single Rust binary that handles the full WhatsApp Web protocol: text, images, audio, video, stickers, reactions, edits, polls, status stories, groups, and chat management. No npm. No Python. No Docker. Just `cargo build` and scan the QR code.
 
-[Quick Start](#quick-start) | [Features](#features) | [API](#api) | [Use as a Library](#use-as-a-library) | [Contributing](#contributing)
+[Install](#install) | [How It Works](#how-it-works) | [Features](#features) | [API](#api) | [MCP Tools](#mcp-server-for-ai-agents) | [Contributing](#contributing)
 
 </div>
 
 ---
 
-## Why this exists
+## Why WhatsRust exists
 
-If you've built anything on WhatsApp, you've met Baileys. Node.js. 200 MB of node_modules. Crashes at 3 AM. Memory leaks you can set your watch to. Works great until it doesn't, and then you're reading someone else's JavaScript at 4 AM wondering where your life went wrong.
+Every WhatsApp automation library follows the same playbook: Node.js, Baileys, and a `node_modules` folder the size of a small country. It works until 3 AM when the process crashes, the memory leak finally wins, and you're reading someone else's JavaScript trying to figure out what went wrong.
 
-whatsrust replaces all of that with one Rust binary. We built it because we needed WhatsApp inside agent software and got tired of babysitting a Node sidecar. So we killed it.
+We needed WhatsApp inside agent software and got tired of babysitting a Node sidecar. So we replaced it with one Rust binary.
 
-| | Baileys | whatsrust |
+### Before vs After
+
+| | Node.js + Baileys | **WhatsRust** |
 |---|---------|-----------|
-| Language | Node.js | Rust |
-| Binary | ~90 MB with node_modules | 5 MB |
-| Memory | ~50 MB idle | ~15 MB |
-| Crash recovery | Roll your own | SQLite-backed queue + per-message backoff |
-| API | None | 54 REST endpoints, CLI, MCP server |
-| Status/Stories | Manual | Text, image, video, revoke |
-| Chat management | Manual | Pin, mute, archive, delete, star (12 ops) |
-| Group management | Manual API calls | 12 methods, full CRUD |
-| Anti-ban pacing | None | Read receipt batching, typing sim, jitter |
-| Dependencies | npm install and pray | `cargo build` |
+| **Language** | JavaScript / Node.js | Rust |
+| **Install size** | ~200 MB with node_modules | **5 MB** single binary |
+| **Memory usage** | ~50-120 MB idle | **~15 MB** |
+| **Dependencies** | `npm install` + hope | `cargo build` |
+| **Crash recovery** | Roll your own | SQLite-backed queue + per-message backoff |
+| **API** | None built-in | **54 REST endpoints** + CLI + MCP server |
+| **Status/stories** | DIY | Text, image, video, revoke -- all built in |
+| **Chat management** | Manual API calls | **12 operations** (pin, mute, archive, star...) |
+| **Group management** | Manual | **12 methods**, full CRUD |
+| **Anti-ban protection** | None | Read receipt batching, typing sim, jitter |
+| **AI agent support** | None | **30 MCP tools** for Claude Code, etc. |
 
 ---
 
-## Quick start
+## Install
 
 ```bash
 git clone https://github.com/199-biotechnologies/whatsrust
 cd whatsrust && cargo run
 ```
 
-Scan the QR with your phone. Done.
+Scan the QR code with your phone. That's it.
 
 ```bash
 # Phone number pairing instead of QR
 WHATSAPP_PAIR_PHONE="+1234567890" cargo run
 
-# With allowlist + custom port
+# With sender allowlist + custom port
 WHATSAPP_ALLOWED="1234567890" WHATSRUST_PORT=8080 cargo run
 ```
 
 ---
 
+## How it works
+
+WhatsRust runs as a daemon with a built-in REPL, REST API, and MCP server. Every outbound message goes through a durable SQLite queue -- messages survive crashes and restarts. Inbound messages are deduplicated with a generation-tracked concurrent map.
+
+```
+src/
+  bridge.rs          Core: events, messaging, queue, groups, chat management
+  outbound.rs        21 typed outbound ops, durable SQLite queue
+  bridge_events.rs   Broadcast event bus (tokio::sync::broadcast)
+  api.rs             REST API (54 endpoints) + SSE + CLI HTTP client
+  mcp.rs             MCP server (30 tools, JSON-RPC over stdio)
+  storage.rs         rusqlite Signal Protocol store + schema migrations
+  polls.rs           Poll crypto (HKDF-SHA256 + AES-256-GCM)
+  dedup.rs           Generation-tracked DashMap (concurrent-safe)
+  read_receipts.rs   Batched receipt scheduler
+  qr.rs              QR rendering (terminal/PNG/HTML/SVG)
+  instance_lock.rs   flock-based single-instance guard
+  main.rs            Daemon (REPL) + CLI (54 commands) + MCP mode
+  lib.rs             Library crate exports
+```
+
+~11,000 lines across 13 files. Built on [`whatsapp-rust`](https://github.com/jlucaso1/whatsapp-rust) (v0.5.0, MIT) for the protocol layer.
+
+### Four ways to run it
+
+| Mode | How |
+|------|-----|
+| **Daemon** | `cargo run` -- REPL with 54 commands |
+| **CLI** | `whatsrust send 15551234567 "Hello"` -- JSON to stdout |
+| **Library** | `WhatsAppBridge::start(config, tx, cancel)` -- embed in your Rust app |
+| **MCP server** | `whatsrust mcp` -- 30 tools for AI agents (Claude Code, etc.) |
+
+---
+
 ## Features
 
-### Every message type
+### Every WhatsApp message type
 
 Text, image, audio/voice, video, document, sticker, location, contact card, reaction (add/remove), edit, revoke, reply/quote, forward, view-once (image/video), poll (create + encrypted vote decryption), status/story (text/image/video/revoke).
 
 ### Chat management (12 operations)
 
-Pin/unpin chat, mute/unmute, archive/unarchive, mark read/unread, delete chat, delete message for me, star/unstar messages. Direct app-state mutations that sync across all linked devices.
+Pin/unpin, mute/unmute, archive/unarchive, mark read/unread, delete chat, delete message for me, star/unstar. Direct app-state mutations that sync across all linked devices.
 
 ### Full group management
 
-List groups, get info, create, rename, set description, add/remove/promote/demote participants, invite links. Group metadata cached with TTL + mutation invalidation.
+List groups, get info, create, rename, set description, add/remove/promote/demote participants, invite links. Group metadata cached with TTL and mutation invalidation.
 
 ### Status/story posting
 
-Post text stories with custom background colors and fonts. Post image and video stories. Revoke posted stories. Privacy controls (contacts, allowlist, denylist). All go through the durable outbound queue.
+Text stories with custom background colors and fonts. Image and video stories. Revoke posted stories. Privacy controls (contacts, allowlist, denylist). All go through the durable outbound queue.
 
 ### Stays alive
 
@@ -103,15 +144,6 @@ Post text stories with custom background colors and fonts. Post image and video 
 - **Recording indicator** before voice notes.
 - **Configurable send pacing** with randomized jitter intervals.
 - **Auto presence management.** Available on connect, unavailable on shutdown.
-
-### Four ways to use it
-
-| Mode | How |
-|------|-----|
-| **Daemon** | `cargo run` -- REPL with 54 commands |
-| **CLI** | `whatsrust send 15551234567 "Hello"` -- JSON to stdout |
-| **Library** | `WhatsAppBridge::start(config, tx, cancel)` -- embed in your app |
-| **MCP server** | `whatsrust mcp` -- 30 tools for AI agents (Claude Code, etc.) |
 
 ---
 
@@ -156,6 +188,7 @@ Output:
 54 REST endpoints on `localhost:7270`. JSON in, JSON out. No framework -- raw TCP for minimal overhead.
 
 ### Messaging
+
 | Endpoint | Body |
 |----------|------|
 | `POST /api/send` | `{jid, text, mentions?, schedule_at?}` |
@@ -170,6 +203,7 @@ Output:
 | `POST /api/forward` | `{jid, msg_id}` |
 
 ### Status/stories
+
 | Endpoint | Body |
 |----------|------|
 | `POST /api/status-text` | `{recipients, text, background_argb?, font?}` |
@@ -178,6 +212,7 @@ Output:
 | `POST /api/status-revoke` | `{recipients, message_id}` |
 
 ### Chat management
+
 | Endpoint | Body |
 |----------|------|
 | `POST /api/pin-chat` | `{jid}` |
@@ -191,6 +226,14 @@ Output:
 Plus: SSE streaming (`GET /api/events`), groups, presence, health check, QR.
 
 Async sends return `{ok, job_id}`. Add `?sync=true` to wait for the WhatsApp message ID.
+
+---
+
+## MCP server for AI agents
+
+Run `whatsrust mcp` to start a Model Context Protocol server with 30 tools over JSON-RPC stdio. Connect it to Claude Code, Cursor, or any MCP-compatible AI agent and your agent can send messages, manage groups, post stories, and handle chat operations through WhatsApp.
+
+Works out of the box with Claude Code -- just add it to your MCP config and your AI agent gets full WhatsApp access.
 
 ---
 
@@ -226,29 +269,6 @@ while let Some(msg) = inbound_rx.recv().await {
 ```
 
 Inbound messages arrive as `WhatsAppInbound` with sender, JID, message ID, reply context, `MessageFlags` (forwarded, view-once), and typed content. Media arrives as raw bytes -- no second download step.
-
----
-
-## How it's built
-
-```
-src/
-  bridge.rs          Core: events, messaging, queue, groups, chat management
-  outbound.rs        21 typed outbound ops, durable SQLite queue
-  bridge_events.rs   Broadcast event bus (tokio::sync::broadcast)
-  api.rs             REST API (54 endpoints) + SSE + CLI HTTP client
-  mcp.rs             MCP server (30 tools, JSON-RPC over stdio)
-  storage.rs         rusqlite Signal Protocol store + schema migrations
-  polls.rs           Poll crypto (HKDF-SHA256 + AES-256-GCM)
-  dedup.rs           Generation-tracked DashMap (concurrent-safe)
-  read_receipts.rs   Batched receipt scheduler
-  qr.rs              QR rendering (terminal/PNG/HTML/SVG)
-  instance_lock.rs   flock-based single-instance guard
-  main.rs            Daemon (REPL) + CLI (54 commands) + MCP mode
-  lib.rs             Library crate exports
-```
-
-~11,000 lines across 13 files. Built on [`whatsapp-rust`](https://github.com/jlucaso1/whatsapp-rust) (v0.5.0, MIT) for the protocol layer.
 
 ---
 
