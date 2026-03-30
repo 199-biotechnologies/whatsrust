@@ -173,6 +173,37 @@ fn tool_definitions() -> Vec<Value> {
                 "options":{"type":"array","items":{"type":"string"}},
                 "selectable_count":{"type":"integer","description":"Max selectable options"}
             },"required":["jid","question","options","selectable_count"]})),
+        tool_def("whatsrust_status_text", "Post a text status/story to specified recipients",
+            json!({"type":"object","properties":{
+                "recipients":{"type":"array","items":{"type":"string"},"description":"Phone numbers of recipients"},
+                "text":{"type":"string","description":"Status text"},
+                "background_argb":{"type":"integer","description":"Background color as 0xAARRGGBB (default 0xFF1E6E4F)"},
+                "font":{"type":"integer","description":"Font style 0-4 (default 0)"},
+                "privacy":{"type":"string","description":"contacts|allowlist|denylist (default contacts)"}
+            },"required":["recipients","text"]})),
+        tool_def("whatsrust_status_image", "Post an image status/story",
+            json!({"type":"object","properties":{
+                "recipients":{"type":"array","items":{"type":"string"}},
+                "data":{"type":"string","description":"Base64-encoded image"},
+                "mime":{"type":"string","description":"MIME type (default image/jpeg)"},
+                "caption":{"type":"string"},
+                "privacy":{"type":"string"}
+            },"required":["recipients","data"]})),
+        tool_def("whatsrust_status_video", "Post a video status/story",
+            json!({"type":"object","properties":{
+                "recipients":{"type":"array","items":{"type":"string"}},
+                "data":{"type":"string","description":"Base64-encoded video"},
+                "mime":{"type":"string","description":"MIME type (default video/mp4)"},
+                "caption":{"type":"string"},
+                "seconds":{"type":"integer","description":"Duration in seconds"},
+                "privacy":{"type":"string"}
+            },"required":["recipients","data"]})),
+        tool_def("whatsrust_status_revoke", "Revoke a previously posted status/story",
+            json!({"type":"object","properties":{
+                "recipients":{"type":"array","items":{"type":"string"},"description":"Same recipients as original post"},
+                "message_id":{"type":"string","description":"ID returned when status was posted"},
+                "privacy":{"type":"string"}
+            },"required":["recipients","message_id"]})),
     ]
 }
 
@@ -214,6 +245,10 @@ fn call_tool(name: &str, args: &Value, port: u16) -> Value {
         "whatsrust_location" => http_post(port, "/api/location", args),
         "whatsrust_contact" => http_post(port, "/api/contact", args),
         "whatsrust_poll" => http_post(port, "/api/poll", args),
+        "whatsrust_status_text" => http_post(port, "/api/status-text", args),
+        "whatsrust_status_image" => http_post(port, "/api/status-image", args),
+        "whatsrust_status_video" => http_post(port, "/api/status-video", args),
+        "whatsrust_status_revoke" => http_post(port, "/api/status-revoke", args),
         _ => Err(format!("unknown tool: {name}")),
     };
 
