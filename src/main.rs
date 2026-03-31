@@ -289,7 +289,7 @@ async fn main() -> Result<()> {
                                         _ => "audio/ogg; codecs=opus",
                                     };
                                     match bridge_for_repl
-                                        .send_audio(parts[1], data, mime, None)
+                                        .send_audio(parts[1], data, mime, None, true)
                                         .await
                                     {
                                         Ok(()) => println!(">> audio sent to {}", parts[1]),
@@ -343,7 +343,7 @@ async fn main() -> Result<()> {
                                         _ => "application/octet-stream",
                                     };
                                     match bridge_for_repl
-                                        .send_document(parts[1], data, mime, filename)
+                                        .send_document(parts[1], data, mime, filename, None)
                                         .await
                                     {
                                         Ok(()) => println!(">> doc sent to {}", parts[1]),

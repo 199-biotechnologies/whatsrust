@@ -775,6 +775,9 @@ struct MediaReq {
     /// Filename — used for document sends when using base64.
     filename: Option<String>,
     caption: Option<String>,
+    /// For audio: if false, sends as regular audio file instead of voice note.
+    /// Defaults to true (voice note / PTT).
+    voice_note: Option<bool>,
 }
 
 async fn read_file_for_media(path: &str) -> Result<Vec<u8>, Vec<u8>> {
@@ -909,8 +912,8 @@ async fn handle_media(bridge: &WhatsAppBridge, body: &[u8], is_loopback: bool, k
     let result = match kind {
         MediaKind::Image => bridge.send_image(&req.jid, data, &mime_str, req.caption.as_deref()).await,
         MediaKind::Video => bridge.send_video(&req.jid, data, &mime_str, req.caption.as_deref()).await,
-        MediaKind::Audio => bridge.send_audio(&req.jid, data, &mime_str, None).await,
-        MediaKind::Doc => bridge.send_document(&req.jid, data, &mime_str, &filename_str).await,
+        MediaKind::Audio => bridge.send_audio(&req.jid, data, &mime_str, None, req.voice_note.unwrap_or(true)).await,
+        MediaKind::Doc => bridge.send_document(&req.jid, data, &mime_str, &filename_str, req.caption.as_deref()).await,
         MediaKind::Sticker => bridge.send_sticker(&req.jid, data, &mime_str, false).await,
         MediaKind::ViewOnceImage => bridge.send_view_once_image(&req.jid, data, &mime_str, req.caption.as_deref()).await,
         MediaKind::ViewOnceVideo => bridge.send_view_once_video(&req.jid, data, &mime_str, req.caption.as_deref()).await,

@@ -116,7 +116,13 @@ pub struct MediaPayload {
     pub filename: Option<String>,
     /// Audio duration in seconds (voice notes).
     pub seconds: Option<u32>,
+    /// If true (default), audio is sent as push-to-talk voice note.
+    /// Set to false to send as a regular audio file attachment.
+    #[serde(default = "default_true")]
+    pub is_voice_note: bool,
 }
+
+fn default_true() -> bool { true }
 
 /// Payload for location ops.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -366,13 +372,15 @@ pub async fn execute_job(
             let p: MediaPayload = serde_json::from_str(&row.payload_json)?;
             let data = row.payload_blob.clone()
                 .ok_or_else(|| anyhow::anyhow!("audio op missing payload_blob"))?;
-            let _ = client.chatstate().send_recording(target).await;
+            if p.is_voice_note {
+                let _ = client.chatstate().send_recording(target).await;
+            }
             let upload = client.upload(data, MediaType::Audio, UploadOptions::default()).await
                 .map_err(|e| anyhow::anyhow!("audio upload: {e}"))?;
             let msg = wa::Message {
                 audio_message: Some(Box::new(wa::message::AudioMessage {
                     mimetype: Some(p.mime),
-                    ptt: Some(true),
+                    ptt: Some(p.is_voice_note),
                     seconds: p.seconds,
                     url: Some(upload.url),
                     direct_path: Some(upload.direct_path),
@@ -386,7 +394,9 @@ pub async fn execute_job(
             };
             let send_result = client.send_message(target.clone(), msg).await
                 .map_err(|e| anyhow::anyhow!("send audio: {e}"));
-            let _ = client.chatstate().send_paused(target).await;
+            if p.is_voice_note {
+                let _ = client.chatstate().send_paused(target).await;
+            }
             let result = send_result?;
             Ok(ExecOutcome { wa_message_id: Some(result.message_id), poll_key: None })
         }
@@ -401,6 +411,7 @@ pub async fn execute_job(
                 document_message: Some(Box::new(wa::message::DocumentMessage {
                     mimetype: Some(p.mime),
                     file_name: p.filename,
+                    caption: p.caption,
                     url: Some(upload.url),
                     direct_path: Some(upload.direct_path),
                     media_key: Some(upload.media_key),

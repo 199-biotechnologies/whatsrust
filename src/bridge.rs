@@ -1152,24 +1152,27 @@ impl WhatsAppBridge {
             caption: caption.map(|c| c.to_string()),
             filename: None,
             seconds: None,
+            is_voice_note: true,
         })?;
         self.enqueue_op(jid, crate::outbound::OutboundOpKind::Image, &payload, Some(data)).await?;
         Ok(())
     }
 
-    /// Send an audio file as a voice note (PTT).
+    /// Send an audio file. If `is_voice_note` is true (default), sends as PTT voice note.
     pub async fn send_audio(
         &self,
         jid: &str,
         data: Vec<u8>,
         mime: &str,
         seconds: Option<u32>,
+        is_voice_note: bool,
     ) -> Result<()> {
         let payload = serde_json::to_string(&crate::outbound::MediaPayload {
             mime: mime.to_string(),
             caption: None,
             filename: None,
             seconds,
+            is_voice_note,
         })?;
         self.enqueue_op(jid, crate::outbound::OutboundOpKind::Audio, &payload, Some(data)).await?;
         Ok(())
@@ -1223,6 +1226,7 @@ impl WhatsAppBridge {
             caption: caption.map(|c| c.to_string()),
             filename: None,
             seconds: None,
+            is_voice_note: true,
         })?;
         self.enqueue_op(jid, crate::outbound::OutboundOpKind::Video, &payload, Some(data)).await?;
         Ok(())
@@ -1235,12 +1239,14 @@ impl WhatsAppBridge {
         data: Vec<u8>,
         mime: &str,
         filename: &str,
+        caption: Option<&str>,
     ) -> Result<()> {
         let payload = serde_json::to_string(&crate::outbound::MediaPayload {
             mime: mime.to_string(),
-            caption: None,
+            caption: caption.map(|c| c.to_string()),
             filename: Some(filename.to_string()),
             seconds: None,
+            is_voice_note: true,
         })?;
         self.enqueue_op(jid, crate::outbound::OutboundOpKind::Document, &payload, Some(data)).await?;
         Ok(())
@@ -1260,6 +1266,7 @@ impl WhatsAppBridge {
             caption: None,
             filename: None,
             seconds: if is_animated { Some(1) } else { Some(0) },
+            is_voice_note: true,
         })?;
         self.enqueue_op(jid, crate::outbound::OutboundOpKind::Sticker, &payload, Some(data)).await?;
         Ok(())
@@ -1506,6 +1513,7 @@ impl WhatsAppBridge {
             caption: caption.map(|c| c.to_string()),
             filename: None,
             seconds: None,
+            is_voice_note: true,
         })?;
         self.enqueue_op(jid, crate::outbound::OutboundOpKind::ViewOnceImage, &payload, Some(data)).await?;
         Ok(())
@@ -1524,6 +1532,7 @@ impl WhatsAppBridge {
             caption: caption.map(|c| c.to_string()),
             filename: None,
             seconds: None,
+            is_voice_note: true,
         })?;
         self.enqueue_op(jid, crate::outbound::OutboundOpKind::ViewOnceVideo, &payload, Some(data)).await?;
         Ok(())
