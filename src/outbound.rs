@@ -120,6 +120,9 @@ pub struct ReplyPayload {
     /// JIDs to @mention in the reply.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mentions: Vec<String>,
+    /// If true, payload_blob contains the quoted message proto for quote header display.
+    #[serde(default)]
+    pub has_quoted_message: bool,
 }
 
 /// Payload for media ops (image, video, audio, document, sticker, view-once).
@@ -339,9 +342,18 @@ pub async fn execute_job(
 
         OutboundOpKind::Reply => {
             let p: ReplyPayload = serde_json::from_str(&row.payload_json)?;
+            // Decode quoted message proto from payload_blob if available (for quote header)
+            let quoted_message = if p.has_quoted_message {
+                row.payload_blob.as_ref().and_then(|blob| {
+                    prost::Message::decode(blob.as_slice()).ok().map(Box::new)
+                })
+            } else {
+                None
+            };
             let context_info = wa::ContextInfo {
                 stanza_id: Some(p.reply_to_id),
                 participant: Some(p.reply_to_sender),
+                quoted_message,
                 mentioned_jid: p.mentions,
                 ..Default::default()
             };
@@ -559,8 +571,13 @@ pub async fn execute_job(
 
         OutboundOpKind::Edit => {
             let p: EditPayload = serde_json::from_str(&row.payload_json)?;
+            // Use extended_text_message so edits work on messages that originally had
+            // mentions, link previews, or other extended features.
             let new_content = wa::Message {
-                conversation: Some(p.new_text),
+                extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+                    text: Some(p.new_text),
+                    ..Default::default()
+                })),
                 ..Default::default()
             };
             client.edit_message(target.clone(), p.message_id, new_content).await

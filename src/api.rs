@@ -1157,6 +1157,7 @@ fn format_sse_event(event: &crate::bridge_events::BridgeEvent) -> Option<String>
                 "jid": inbound.jid,
                 "id": inbound.id,
                 "sender": inbound.sender,
+                "push_name": if inbound.push_name.is_empty() { None } else { Some(&inbound.push_name) },
                 "timestamp": inbound.timestamp,
                 "type": inbound.content.kind(),
                 "text": match &inbound.content {
@@ -1166,6 +1167,11 @@ fn format_sse_event(event: &crate::bridge_events::BridgeEvent) -> Option<String>
                     }
                     _ => None,
                 },
+                "reply_to": inbound.reply_to.as_ref().map(|r| serde_json::json!({
+                    "id": r.stanza_id,
+                    "participant": r.participant,
+                    "quoted_text": r.quoted_text,
+                })),
                 "is_from_me": inbound.is_from_me,
             });
             Some(format!("event: inbound\ndata: {data}\n\n"))

@@ -462,6 +462,17 @@ pub struct MessageFlags {
     pub is_view_once: bool,
 }
 
+/// Context of a quoted/replied-to message.
+#[derive(Debug, Clone, Default)]
+pub struct ReplyContext {
+    /// Stanza ID of the quoted message.
+    pub stanza_id: String,
+    /// Sender JID of the quoted message (for group context).
+    pub participant: Option<String>,
+    /// Text body of the quoted message (if available from context_info.quoted_message).
+    pub quoted_text: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Fields consumed by bot integrations, not the REPL
 pub struct WhatsAppInbound {
@@ -477,10 +488,12 @@ pub struct WhatsAppInbound {
     pub sender: String,
     /// Raw sender JID (may be LID)
     pub sender_raw: String,
+    /// Sender's display name (push name) as set in their WhatsApp profile.
+    pub push_name: String,
     /// Unix timestamp
     pub timestamp: i64,
-    /// If this message is a reply, the ID of the quoted message
-    pub reply_to: Option<String>,
+    /// If this message is a reply, context about the quoted message.
+    pub reply_to: Option<ReplyContext>,
     /// Whether this is from our own account
     pub is_from_me: bool,
     /// Forwarding and view-once metadata
@@ -1610,13 +1623,20 @@ impl WhatsAppBridge {
             Err(e) => warn!(error = %e, chat = %target, "read-receipt flush failed before reply"),
             Ok(true) => {}
         }
+        // Look up the original message from cache for quote header display
+        let quoted_blob = {
+            let cache = self.msg_cache.lock();
+            cache.get(reply_to_id).map(|m| prost::Message::encode_to_vec(m.as_ref()))
+        };
+        let has_quoted = quoted_blob.is_some();
         let payload = serde_json::to_string(&crate::outbound::ReplyPayload {
             text: text.to_string(),
             reply_to_id: reply_to_id.to_string(),
             reply_to_sender: reply_to_sender.to_string(),
             mentions: mentions.to_vec(),
+            has_quoted_message: has_quoted,
         })?;
-        self.enqueue_and_wait(jid, crate::outbound::OutboundOpKind::Reply, &payload, None).await
+        self.enqueue_and_wait(jid, crate::outbound::OutboundOpKind::Reply, &payload, quoted_blob).await
     }
 
     /// Post a text status/story. Returns the WA message ID (sync).
@@ -2304,6 +2324,7 @@ async fn handle_event(
                         content,
                         sender,
                         sender_raw,
+                        push_name: info.push_name.clone(),
                         timestamp: info.timestamp.timestamp(),
                         reply_to,
                         is_from_me: info.source.is_from_me,
@@ -2501,6 +2522,7 @@ async fn handle_event(
                 id: msg_ids.first().cloned().unwrap_or_default(),
                 sender: sender.clone(),
                 sender_raw: sender.clone(),
+                push_name: String::new(),
                 timestamp: receipt.timestamp.timestamp(),
                 content: InboundContent::DeliveryReceipt {
                     message_ids: msg_ids,
@@ -2719,49 +2741,33 @@ fn unwrap_to_inner(msg: &wa::Message) -> &wa::Message {
     msg
 }
 
-/// Extract the stanza_id of a quoted/replied-to message, if present.
-fn extract_reply_to(msg: &wa::Message) -> Option<String> {
-    // Check extended_text_message context
-    if let Some(ref ext) = msg.extended_text_message {
-        if let Some(ref ctx) = ext.context_info {
-            if ctx.stanza_id.is_some() {
-                return ctx.stanza_id.clone();
-            }
-        }
-    }
-    // Check image_message context
-    if let Some(ref img) = msg.image_message {
-        if let Some(ref ctx) = img.context_info {
-            if ctx.stanza_id.is_some() {
-                return ctx.stanza_id.clone();
-            }
-        }
-    }
-    // Check video_message context
-    if let Some(ref vid) = msg.video_message {
-        if let Some(ref ctx) = vid.context_info {
-            if ctx.stanza_id.is_some() {
-                return ctx.stanza_id.clone();
-            }
-        }
-    }
-    // Check audio_message context
-    if let Some(ref aud) = msg.audio_message {
-        if let Some(ref ctx) = aud.context_info {
-            if ctx.stanza_id.is_some() {
-                return ctx.stanza_id.clone();
-            }
-        }
-    }
-    // Check document_message context
-    if let Some(ref doc) = msg.document_message {
-        if let Some(ref ctx) = doc.context_info {
-            if ctx.stanza_id.is_some() {
-                return ctx.stanza_id.clone();
-            }
-        }
-    }
-    None
+/// Extract reply context (stanza_id, participant, quoted text) from any message variant.
+fn extract_reply_to(msg: &wa::Message) -> Option<ReplyContext> {
+    // Find context_info from any message variant that carries it
+    let ctx = msg.extended_text_message.as_ref().and_then(|m| m.context_info.as_deref())
+        .or_else(|| msg.image_message.as_ref().and_then(|m| m.context_info.as_deref()))
+        .or_else(|| msg.video_message.as_ref().and_then(|m| m.context_info.as_deref()))
+        .or_else(|| msg.audio_message.as_ref().and_then(|m| m.context_info.as_deref()))
+        .or_else(|| msg.document_message.as_ref().and_then(|m| m.context_info.as_deref()))
+        .or_else(|| msg.sticker_message.as_ref().and_then(|m| m.context_info.as_deref()));
+
+    let ctx = ctx?;
+    let stanza_id = ctx.stanza_id.as_ref()?;
+
+    // Extract quoted text from the quoted_message proto if available
+    let quoted_text = ctx.quoted_message.as_deref().and_then(|qm| {
+        qm.conversation.clone()
+            .or_else(|| qm.extended_text_message.as_ref().and_then(|e| e.text.clone()))
+            .or_else(|| qm.image_message.as_ref().and_then(|i| i.caption.clone()))
+            .or_else(|| qm.video_message.as_ref().and_then(|v| v.caption.clone()))
+            .or_else(|| qm.document_message.as_ref().and_then(|d| d.caption.clone()))
+    });
+
+    Some(ReplyContext {
+        stanza_id: stanza_id.clone(),
+        participant: ctx.participant.clone(),
+        quoted_text,
+    })
 }
 
 /// Extract forwarding metadata from any message variant's context_info.
@@ -3504,6 +3510,8 @@ pub fn add_forward_context(mut msg: wa::Message) -> wa::Message {
     set_forward_ctx!(msg.audio_message);
     set_forward_ctx!(msg.document_message);
     set_forward_ctx!(msg.sticker_message);
+    set_forward_ctx!(msg.location_message);
+    set_forward_ctx!(msg.contact_message);
 
     msg
 }
@@ -3726,6 +3734,7 @@ mod tests {
             content: InboundContent::Text { body: "hi".into() },
             sender: "447957491755".into(),
             sender_raw: "447957491755@s.whatsapp.net".into(),
+            push_name: String::new(),
             timestamp: 1000,
             reply_to: None,
             is_from_me: false,
@@ -3750,6 +3759,7 @@ mod tests {
             content: InboundContent::Text { body: "hi".into() },
             sender: "myphone".into(),
             sender_raw: "myphone@s.whatsapp.net".into(),
+            push_name: String::new(),
             timestamp: 1000,
             reply_to: None,
             is_from_me: true,

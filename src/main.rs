@@ -150,8 +150,16 @@ async fn main() -> Result<()> {
         while let Some(msg) = inbound_rx.recv().await {
             let reply_tag = msg
                 .reply_to
-                .as_deref()
-                .map(|id| format!(" (reply to {id})"))
+                .as_ref()
+                .map(|r| {
+                    let qt = r.quoted_text.as_deref().unwrap_or("");
+                    if qt.is_empty() {
+                        format!(" (reply to {})", r.stanza_id)
+                    } else {
+                        let preview = if qt.len() > 40 { &qt[..40] } else { qt };
+                        format!(" (reply to {}: \"{}\")", r.stanza_id, preview)
+                    }
+                })
                 .unwrap_or_default();
             let flags_tag = {
                 let mut parts = Vec::new();
@@ -163,10 +171,12 @@ async fn main() -> Result<()> {
                 }
                 if parts.is_empty() { String::new() } else { format!(" [{}]", parts.join(",")) }
             };
+            let name_tag = if msg.push_name.is_empty() { String::new() } else { format!(" ~{}", msg.push_name) };
             println!(
-                "\n<< [{}] {} ({}){}{}: {}",
+                "\n<< [{}] {}{} ({}){}{}: {}",
                 msg.jid,
                 msg.sender,
+                name_tag,
                 msg.content.kind(),
                 reply_tag,
                 flags_tag,
