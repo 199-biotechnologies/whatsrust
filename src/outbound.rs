@@ -406,6 +406,7 @@ pub async fn execute_job(
                 video_message: Some(Box::new(wa::message::VideoMessage {
                     mimetype: Some(p.mime),
                     caption: p.caption,
+                    seconds: p.seconds,
                     url: Some(upload.url),
                     direct_path: Some(upload.direct_path),
                     media_key: Some(upload.media_key),
@@ -493,6 +494,8 @@ pub async fn execute_job(
                 sticker_message: Some(Box::new(wa::message::StickerMessage {
                     mimetype: Some(p.mime),
                     is_animated: Some(is_animated),
+                    width: Some(512),
+                    height: Some(512),
                     url: Some(upload.url),
                     direct_path: Some(upload.direct_path),
                     media_key: Some(upload.media_key),
@@ -516,6 +519,7 @@ pub async fn execute_job(
                     degrees_longitude: Some(p.lon),
                     name: p.name,
                     address: p.address,
+                    url: Some(format!("https://maps.google.com/maps?q={},{}", p.lat, p.lon)),
                     ..Default::default()
                 })),
                 ..Default::default()

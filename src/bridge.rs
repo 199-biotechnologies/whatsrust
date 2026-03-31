@@ -272,12 +272,16 @@ pub enum InboundContent {
     /// Plain text or extended text message.
     Text {
         body: String,
+        /// Link preview metadata from ExtendedTextMessage, if present.
+        link_preview: Option<InboundLinkPreview>,
     },
     /// Image with downloaded bytes.
     Image {
         data: Vec<u8>,
         mime: String,
         caption: Option<String>,
+        width: Option<u32>,
+        height: Option<u32>,
     },
     /// Audio (voice note or file) with downloaded bytes.
     Audio {
@@ -291,6 +295,11 @@ pub enum InboundContent {
         data: Vec<u8>,
         mime: String,
         caption: Option<String>,
+        seconds: Option<u32>,
+        width: Option<u32>,
+        height: Option<u32>,
+        /// True if this is a GIF (auto-looping, no controls).
+        is_gif: bool,
     },
     /// Document/file with downloaded bytes.
     Document {
@@ -298,12 +307,15 @@ pub enum InboundContent {
         mime: String,
         filename: String,
         caption: Option<String>,
+        page_count: Option<u32>,
     },
     /// Sticker with downloaded bytes.
     Sticker {
         data: Vec<u8>,
         mime: String,
         is_animated: bool,
+        /// Emoji or label describing the sticker (from accessibility_label).
+        sticker_emoji: Option<String>,
     },
     /// Location pin.
     Location {
@@ -311,11 +323,15 @@ pub enum InboundContent {
         lon: f64,
         name: Option<String>,
         address: Option<String>,
+        url: Option<String>,
+        is_live: bool,
     },
-    /// Contact card (vCard).
+    /// Contact card(s) (vCard).
     Contact {
         display_name: String,
         vcard: String,
+        /// Additional contacts if multiple were sent.
+        additional_contacts: Vec<(String, String)>,
     },
     /// Emoji reaction added to a message.
     ReactionAdded {
@@ -384,7 +400,7 @@ impl InboundContent {
     /// Extract a human-readable summary for display.
     pub fn display_text(&self) -> String {
         match self {
-            Self::Text { body } => body.clone(),
+            Self::Text { body, .. } => body.clone(),
             Self::Image { caption, data, .. } => {
                 let size = format_size(data.len());
                 match caption {
@@ -462,6 +478,15 @@ pub struct MessageFlags {
     pub is_view_once: bool,
 }
 
+/// Link preview metadata extracted from inbound ExtendedTextMessage.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Public API for library consumers
+pub struct InboundLinkPreview {
+    pub url: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+}
+
 /// Context of a quoted/replied-to message.
 #[derive(Debug, Clone, Default)]
 pub struct ReplyContext {
@@ -496,6 +521,12 @@ pub struct WhatsAppInbound {
     pub reply_to: Option<ReplyContext>,
     /// Whether this is from our own account
     pub is_from_me: bool,
+    /// Whether this message is in a group chat (vs DM).
+    pub is_group: bool,
+    /// JIDs @mentioned in this message (from context_info.mentioned_jid).
+    pub mentions: Vec<String>,
+    /// Disappearing messages timer in seconds (0 = off), from context_info.expiration.
+    pub ephemeral_expiration: Option<u32>,
     /// Forwarding and view-once metadata
     pub flags: MessageFlags,
 }
@@ -2272,11 +2303,11 @@ async fn handle_event(
             // are found on wrapped ephemeral/view-once content too.
             let inner_msg = unwrap_to_inner(&msg);
             let reply_to = extract_reply_to(inner_msg);
-            let mut flags = extract_flags(inner_msg);
+            let mut ctx_meta = extract_context_meta(inner_msg);
 
             // Detect view-once *before* extract_content recurses into the wrapper
             if msg.view_once_message.is_some() || msg.view_once_message_v2.is_some() {
-                flags.is_view_once = true;
+                ctx_meta.flags.is_view_once = true;
             }
 
             // Cache the raw message for forward_message lookup (LRU eviction)
@@ -2328,7 +2359,10 @@ async fn handle_event(
                         timestamp: info.timestamp.timestamp(),
                         reply_to,
                         is_from_me: info.source.is_from_me,
-                        flags,
+                        is_group: info.source.is_group,
+                        mentions: ctx_meta.mentions,
+                        ephemeral_expiration: ctx_meta.ephemeral_expiration,
+                        flags: ctx_meta.flags,
                     };
 
                     // Persist to history table for search/context
@@ -2531,7 +2565,10 @@ async fn handle_event(
                     sender,
                 },
                 reply_to: None,
-                is_from_me: true, // receipts are always about our own outbound messages
+                is_from_me: true,
+                is_group: false,
+                mentions: Vec::new(),
+                ephemeral_expiration: None,
                 flags: MessageFlags::default(),
             };
             let inbound_arc = Arc::new(inbound.clone());
@@ -2770,9 +2807,15 @@ fn extract_reply_to(msg: &wa::Message) -> Option<ReplyContext> {
     })
 }
 
-/// Extract forwarding metadata from any message variant's context_info.
-fn extract_flags(msg: &wa::Message) -> MessageFlags {
-    // Check all message types that carry context_info
+/// Extracted context_info metadata: flags, mentions, ephemeral expiration.
+struct ContextMeta {
+    flags: MessageFlags,
+    mentions: Vec<String>,
+    ephemeral_expiration: Option<u32>,
+}
+
+/// Extract forwarding metadata, mentions, and ephemeral timer from any message variant's context_info.
+fn extract_context_meta(msg: &wa::Message) -> ContextMeta {
     let ctx = msg.extended_text_message.as_ref().and_then(|m| m.context_info.as_deref())
         .or_else(|| msg.image_message.as_ref().and_then(|m| m.context_info.as_deref()))
         .or_else(|| msg.video_message.as_ref().and_then(|m| m.context_info.as_deref()))
@@ -2781,12 +2824,20 @@ fn extract_flags(msg: &wa::Message) -> MessageFlags {
         .or_else(|| msg.sticker_message.as_ref().and_then(|m| m.context_info.as_deref()));
 
     match ctx {
-        Some(ci) => MessageFlags {
-            is_forwarded: ci.is_forwarded.unwrap_or(false),
-            forwarding_score: ci.forwarding_score.unwrap_or(0),
-            is_view_once: false, // set separately before extract_content recurses
+        Some(ci) => ContextMeta {
+            flags: MessageFlags {
+                is_forwarded: ci.is_forwarded.unwrap_or(false),
+                forwarding_score: ci.forwarding_score.unwrap_or(0),
+                is_view_once: false,
+            },
+            mentions: ci.mentioned_jid.clone(),
+            ephemeral_expiration: ci.expiration.filter(|&e| e > 0),
         },
-        None => MessageFlags::default(),
+        None => ContextMeta {
+            flags: MessageFlags::default(),
+            mentions: Vec::new(),
+            ephemeral_expiration: None,
+        },
     }
 }
 
@@ -2827,11 +2878,13 @@ async fn extract_content_inner(
         }
         let caption = img.caption.clone();
         let mime = img.mimetype.clone().unwrap_or_else(|| "image/jpeg".to_string());
+        let width = img.width;
+        let height = img.height;
         let _permit = dl_semaphore.acquire().await.expect("semaphore closed");
         match client.download(img.as_ref() as &dyn Downloadable).await {
             Ok(data) => {
                 if data.len() as u64 > MAX_MEDIA_BYTES { warn!(size = data.len(), "downloaded image exceeds size limit"); return ExtractResult::Unhandled; }
-                return ExtractResult::Content(InboundContent::Image { data, mime, caption });
+                return ExtractResult::Content(InboundContent::Image { data, mime, caption, width, height });
             }
             Err(e) => {
                 warn!(error = %e, "failed to download image");
@@ -2847,11 +2900,15 @@ async fn extract_content_inner(
         }
         let caption = vid.caption.clone();
         let mime = vid.mimetype.clone().unwrap_or_else(|| "video/mp4".to_string());
+        let seconds = vid.seconds;
+        let width = vid.width;
+        let height = vid.height;
+        let is_gif = vid.gif_playback.unwrap_or(false);
         let _permit = dl_semaphore.acquire().await.expect("semaphore closed");
         match client.download(vid as &dyn Downloadable).await {
             Ok(data) => {
                 if data.len() as u64 > MAX_MEDIA_BYTES { warn!(size = data.len(), "downloaded video exceeds size limit"); return ExtractResult::Unhandled; }
-                return ExtractResult::Content(InboundContent::Video { data, mime, caption });
+                return ExtractResult::Content(InboundContent::Video { data, mime, caption, seconds, width, height, is_gif });
             }
             Err(e) => {
                 warn!(error = %e, "failed to download video");
@@ -2889,11 +2946,12 @@ async fn extract_content_inner(
         let mime = doc.mimetype.clone().unwrap_or_else(|| "application/octet-stream".to_string());
         let filename = doc.file_name.clone().unwrap_or_else(|| "file".to_string());
         let caption = doc.caption.clone();
+        let page_count = doc.page_count;
         let _permit = dl_semaphore.acquire().await.expect("semaphore closed");
         match client.download(doc.as_ref() as &dyn Downloadable).await {
             Ok(data) => {
                 if data.len() as u64 > MAX_MEDIA_BYTES { warn!(size = data.len(), "downloaded document exceeds size limit"); return ExtractResult::Unhandled; }
-                return ExtractResult::Content(InboundContent::Document { data, mime, filename, caption });
+                return ExtractResult::Content(InboundContent::Document { data, mime, filename, caption, page_count });
             }
             Err(e) => {
                 warn!(error = %e, "failed to download document");
@@ -2912,11 +2970,12 @@ async fn extract_content_inner(
                 let mime = doc.mimetype.clone().unwrap_or_else(|| "application/octet-stream".to_string());
                 let filename = doc.file_name.clone().unwrap_or_else(|| "file".to_string());
                 let caption = doc.caption.clone();
+                let page_count = doc.page_count;
                 let _permit = dl_semaphore.acquire().await.expect("semaphore closed");
                 match client.download(doc.as_ref() as &dyn Downloadable).await {
                     Ok(data) => {
                         if data.len() as u64 > MAX_MEDIA_BYTES { warn!(size = data.len(), "downloaded document exceeds size limit"); return ExtractResult::Unhandled; }
-                        return ExtractResult::Content(InboundContent::Document { data, mime, filename, caption });
+                        return ExtractResult::Content(InboundContent::Document { data, mime, filename, caption, page_count });
                     }
                     Err(e) => {
                         warn!(error = %e, "failed to download document (with caption)");
@@ -2934,11 +2993,12 @@ async fn extract_content_inner(
         }
         let mime = stk.mimetype.clone().unwrap_or_else(|| "image/webp".to_string());
         let is_animated = stk.is_animated.unwrap_or(false);
+        let sticker_emoji = stk.accessibility_label.clone();
         let _permit = dl_semaphore.acquire().await.expect("semaphore closed");
         match client.download(stk.as_ref() as &dyn Downloadable).await {
             Ok(data) => {
                 if data.len() as u64 > MAX_MEDIA_BYTES { warn!(size = data.len(), "downloaded sticker exceeds size limit"); return ExtractResult::Unhandled; }
-                return ExtractResult::Content(InboundContent::Sticker { data, mime, is_animated });
+                return ExtractResult::Content(InboundContent::Sticker { data, mime, is_animated, sticker_emoji });
             }
             Err(e) => {
                 warn!(error = %e, "failed to download sticker");
@@ -2950,23 +3010,29 @@ async fn extract_content_inner(
     // --- Location ---
     if let Some(ref loc) = msg.location_message {
         if let (Some(lat), Some(lon)) = (loc.degrees_latitude, loc.degrees_longitude) {
+            let url = loc.url.clone().or_else(|| Some(format!("https://maps.google.com/maps?q={lat},{lon}")));
             return ExtractResult::Content(InboundContent::Location {
                 lat,
                 lon,
                 name: loc.name.clone(),
                 address: loc.address.clone(),
+                url,
+                is_live: false,
             });
         }
     }
 
-    // --- Live location (bridge as static snapshot) ---
+    // --- Live location (snapshot with is_live=true) ---
     if let Some(ref loc) = msg.live_location_message {
         if let (Some(lat), Some(lon)) = (loc.degrees_latitude, loc.degrees_longitude) {
+            let url = Some(format!("https://maps.google.com/maps?q={lat},{lon}"));
             return ExtractResult::Content(InboundContent::Location {
                 lat,
                 lon,
                 name: loc.caption.clone(),
                 address: None,
+                url,
+                is_live: true,
             });
         }
     }
@@ -2976,18 +3042,25 @@ async fn extract_content_inner(
         return ExtractResult::Content(InboundContent::Contact {
             display_name: contact.display_name.clone().unwrap_or_default(),
             vcard: contact.vcard.clone().unwrap_or_default(),
+            additional_contacts: Vec::new(),
         });
     }
 
     // --- Multiple contacts ---
     if let Some(ref arr) = msg.contacts_array_message {
-        // Bridge as first contact (most common case is single)
         if let Some(first) = arr.contacts.first() {
+            let additional: Vec<(String, String)> = arr.contacts.iter().skip(1)
+                .map(|c| (
+                    c.display_name.clone().unwrap_or_default(),
+                    c.vcard.clone().unwrap_or_default(),
+                ))
+                .collect();
             return ExtractResult::Content(InboundContent::Contact {
                 display_name: first.display_name.clone().unwrap_or_else(|| {
                     arr.display_name.clone().unwrap_or_default()
                 }),
                 vcard: first.vcard.clone().unwrap_or_default(),
+                additional_contacts: additional,
             });
         }
     }
@@ -3155,12 +3228,20 @@ async fn extract_content_inner(
     if let Some(ref text) = msg.conversation {
         return ExtractResult::Content(InboundContent::Text {
             body: text.clone(),
+            link_preview: None,
         });
     }
     if let Some(ref ext) = msg.extended_text_message {
         if let Some(ref text) = ext.text {
+            // Extract link preview metadata if present
+            let link_preview = ext.matched_text.as_ref().map(|url| InboundLinkPreview {
+                url: url.clone(),
+                title: ext.title.clone(),
+                description: ext.description.clone(),
+            });
             return ExtractResult::Content(InboundContent::Text {
                 body: text.clone(),
+                link_preview,
             });
         }
     }
@@ -3731,13 +3812,16 @@ mod tests {
             bridge_id: "default".into(),
             jid: "group@g.us".into(),
             id: "msg123".into(),
-            content: InboundContent::Text { body: "hi".into() },
+            content: InboundContent::Text { body: "hi".into(), link_preview: None },
             sender: "447957491755".into(),
             sender_raw: "447957491755@s.whatsapp.net".into(),
             push_name: String::new(),
             timestamp: 1000,
             reply_to: None,
             is_from_me: false,
+            is_group: true,
+            mentions: Vec::new(),
+            ephemeral_expiration: None,
             flags: MessageFlags::default(),
         };
         let mref = MessageRef::from_inbound(&msg);
@@ -3756,13 +3840,16 @@ mod tests {
             bridge_id: "default".into(),
             jid: "chat@s.whatsapp.net".into(),
             id: "msg456".into(),
-            content: InboundContent::Text { body: "hi".into() },
+            content: InboundContent::Text { body: "hi".into(), link_preview: None },
             sender: "myphone".into(),
             sender_raw: "myphone@s.whatsapp.net".into(),
             push_name: String::new(),
             timestamp: 1000,
             reply_to: None,
             is_from_me: true,
+            is_group: false,
+            mentions: Vec::new(),
+            ephemeral_expiration: None,
             flags: MessageFlags::default(),
         };
         let mref = MessageRef::from_inbound(&msg);

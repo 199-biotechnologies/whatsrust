@@ -1161,7 +1161,7 @@ fn format_sse_event(event: &crate::bridge_events::BridgeEvent) -> Option<String>
                 "timestamp": inbound.timestamp,
                 "type": inbound.content.kind(),
                 "text": match &inbound.content {
-                    InboundContent::Text { body } => Some(body.clone()),
+                    InboundContent::Text { body, .. } => Some(body.clone()),
                     InboundContent::DeliveryReceipt { status, message_ids, .. } => {
                         Some(format!("{status:?} for {}", message_ids.join(",")))
                     }
