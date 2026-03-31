@@ -350,6 +350,8 @@ pub enum InboundContent {
     Edit {
         target_id: String,
         new_text: String,
+        /// Updated @mentions from the edited message (may differ from original).
+        mentions: Vec<String>,
     },
     /// Someone revoked (deleted) a message.
     Revoke {
@@ -445,7 +447,7 @@ impl InboundContent {
             Self::Contact { display_name, .. } => format!("[contact: {display_name}]"),
             Self::ReactionAdded { emoji, target_id, .. } => format!("[react {emoji} on {target_id}]"),
             Self::ReactionRemoved { target_id, .. } => format!("[unreact on {target_id}]"),
-            Self::Edit { target_id, new_text } => format!("[edit {target_id}] {new_text}"),
+            Self::Edit { target_id, new_text, .. } => format!("[edit {target_id}] {new_text}"),
             Self::Revoke { target_id } => format!("[deleted {target_id}]"),
             Self::PollCreated { question, options, selectable_count } => {
                 format!("[poll: {question} (pick {selectable_count}) — {}]", options.join(" | "))
@@ -3118,7 +3120,12 @@ async fn extract_content_inner(
                         })
                     })
                     .unwrap_or_default();
-                return ExtractResult::Content(InboundContent::Edit { target_id, new_text });
+                let mentions = proto.edited_message.as_ref()
+                    .and_then(|m| m.extended_text_message.as_ref())
+                    .and_then(|e| e.context_info.as_ref())
+                    .map(|ci| ci.mentioned_jid.clone())
+                    .unwrap_or_default();
+                return ExtractResult::Content(InboundContent::Edit { target_id, new_text, mentions });
             }
         }
     }
