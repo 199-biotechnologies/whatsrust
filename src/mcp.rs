@@ -105,12 +105,18 @@ fn handle_rpc(req: &JsonRpcRequest, port: u16) -> JsonRpcResponse {
 fn tool_definitions() -> Vec<Value> {
     vec![
         tool_def("whatsrust_status", "Get bridge status, metrics, and connection state", json!({"type":"object","properties":{}})),
-        tool_def("whatsrust_send", "Send a text message (optionally with @mentions)",
+        tool_def("whatsrust_send", "Send a text message (optionally with @mentions and/or link preview)",
             json!({"type":"object","properties":{
                 "jid":{"type":"string","description":"Recipient JID (phone@s.whatsapp.net or group@g.us)"},
                 "text":{"type":"string","description":"Message text"},
                 "mentions":{"type":"array","items":{"type":"string"},"description":"JIDs to @mention (optional)"},
-                "schedule_at":{"type":"integer","description":"Unix epoch to defer send (optional)"}
+                "schedule_at":{"type":"integer","description":"Unix epoch to defer send (optional)"},
+                "link_preview":{"type":"object","description":"Link preview card (optional)","properties":{
+                    "url":{"type":"string","description":"URL to preview (must appear in text)"},
+                    "title":{"type":"string","description":"Preview title (og:title)"},
+                    "description":{"type":"string","description":"Preview description (og:description)"},
+                    "thumbnail_b64":{"type":"string","description":"Base64-encoded JPEG thumbnail"}
+                },"required":["url"]}
             },"required":["jid","text"]})),
         tool_def("whatsrust_reply", "Reply to a message (quote)",
             json!({"type":"object","properties":{

@@ -730,11 +730,39 @@ impl WhatsAppBridge {
         let payload = serde_json::to_string(&crate::outbound::TextPayload {
             text: text.to_string(),
             mentions: mentions.to_vec(),
+            link_preview: None,
         })?;
         self.store
             .enqueue_job(jid, crate::outbound::OutboundOpKind::Text.as_str(), &payload, None)
             .await?;
         self.outbound_notify.notify_one();
+        Ok(())
+    }
+
+    /// Send a text message with a link preview card.
+    #[allow(dead_code)] // Public API for library consumers
+    pub async fn send_message_with_preview(
+        &self,
+        jid: &str,
+        text: &str,
+        url: &str,
+        title: Option<&str>,
+        description: Option<&str>,
+        thumbnail: Option<&[u8]>,
+        mentions: &[String],
+    ) -> Result<()> {
+        use base64::Engine;
+        let payload = serde_json::to_string(&crate::outbound::TextPayload {
+            text: text.to_string(),
+            mentions: mentions.to_vec(),
+            link_preview: Some(crate::outbound::LinkPreview {
+                url: url.to_string(),
+                title: title.map(|s| s.to_string()),
+                description: description.map(|s| s.to_string()),
+                thumbnail_b64: thumbnail.map(|b| base64::engine::general_purpose::STANDARD.encode(b)),
+            }),
+        })?;
+        self.enqueue_op(jid, crate::outbound::OutboundOpKind::Text, &payload, None).await?;
         Ok(())
     }
 
@@ -1209,6 +1237,7 @@ impl WhatsAppBridge {
         let payload = serde_json::to_string(&crate::outbound::TextPayload {
             text: text.to_string(),
             mentions: mentions.to_vec(),
+            link_preview: None,
         })?;
         self.enqueue_and_wait(jid, crate::outbound::OutboundOpKind::Text, &payload, None).await
     }

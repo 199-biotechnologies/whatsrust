@@ -479,6 +479,8 @@ struct SendReq {
     mentions: Vec<String>,
     /// Unix epoch seconds — if set, defer delivery until this time.
     schedule_at: Option<i64>,
+    /// Optional link preview metadata — attaches a preview card to the message.
+    link_preview: Option<crate::outbound::LinkPreview>,
 }
 
 async fn handle_send(bridge: &WhatsAppBridge, body: &[u8], sync: bool) -> Vec<u8> {
@@ -492,6 +494,7 @@ async fn handle_send(bridge: &WhatsAppBridge, body: &[u8], sync: bool) -> Vec<u8
         let payload = match serde_json::to_string(&crate::outbound::TextPayload {
             text: req.text,
             mentions: req.mentions,
+            link_preview: req.link_preview,
         }) {
             Ok(p) => p,
             Err(e) => return json_err(500, &e.to_string()),

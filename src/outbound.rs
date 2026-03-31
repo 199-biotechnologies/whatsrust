@@ -87,6 +87,18 @@ impl OutboundOpKind {
     }
 }
 
+/// Link preview metadata for outbound text messages.
+/// When present, the message is sent as ExtendedTextMessage with a preview card.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkPreview {
+    /// The URL being previewed (must appear in the message text).
+    pub url: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    /// Base64-encoded JPEG thumbnail (≤320px recommended).
+    pub thumbnail_b64: Option<String>,
+}
+
 /// Payload for text message ops.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TextPayload {
@@ -94,6 +106,9 @@ pub struct TextPayload {
     /// JIDs to @mention (e.g. ["user@s.whatsapp.net"]). Empty = no mentions.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mentions: Vec<String>,
+    /// Optional link preview — attaches a preview card to the message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_preview: Option<LinkPreview>,
 }
 
 /// Payload for reply ops.
@@ -274,17 +289,44 @@ pub async fn execute_job(
     match kind {
         OutboundOpKind::Text => {
             let p: TextPayload = serde_json::from_str(&row.payload_json)?;
-            let msg = if p.mentions.is_empty() {
+            let has_mentions = !p.mentions.is_empty();
+            let has_preview = p.link_preview.is_some();
+
+            let msg = if !has_mentions && !has_preview {
+                // Simple text — no mentions, no preview
                 wa::Message { conversation: Some(p.text), ..Default::default() }
             } else {
-                // Mentions require extended_text_message with context_info
+                // Extended text — needed for mentions and/or link preview
+                let context_info = if has_mentions {
+                    Some(Box::new(wa::ContextInfo {
+                        mentioned_jid: p.mentions,
+                        ..Default::default()
+                    }))
+                } else {
+                    None
+                };
+
+                let (matched_text, title, description, jpeg_thumbnail, preview_type) =
+                    if let Some(ref lp) = p.link_preview {
+                        let thumb = lp.thumbnail_b64.as_deref().and_then(|b64| {
+                            use base64::Engine;
+                            base64::engine::general_purpose::STANDARD.decode(b64).ok()
+                        });
+                        let pt = if thumb.is_some() { Some(5) } else { Some(0) }; // 5 = Image
+                        (Some(lp.url.clone()), lp.title.clone(), lp.description.clone(), thumb, pt)
+                    } else {
+                        (None, None, None, None, None)
+                    };
+
                 wa::Message {
                     extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
                         text: Some(p.text),
-                        context_info: Some(Box::new(wa::ContextInfo {
-                            mentioned_jid: p.mentions,
-                            ..Default::default()
-                        })),
+                        matched_text,
+                        title,
+                        description,
+                        jpeg_thumbnail,
+                        preview_type,
+                        context_info,
                         ..Default::default()
                     })),
                     ..Default::default()
@@ -646,7 +688,7 @@ mod tests {
 
     #[test]
     fn test_text_payload_serde() {
-        let p = TextPayload { text: "hello".to_string(), mentions: vec![] };
+        let p = TextPayload { text: "hello".to_string(), mentions: vec![], link_preview: None };
         let json = serde_json::to_string(&p).unwrap();
         assert!(!json.contains("mentions")); // empty vec skipped
         let p2: TextPayload = serde_json::from_str(&json).unwrap();
@@ -659,6 +701,7 @@ mod tests {
         let p = TextPayload {
             text: "Hey @user".to_string(),
             mentions: vec!["user@s.whatsapp.net".to_string()],
+            link_preview: None,
         };
         let json = serde_json::to_string(&p).unwrap();
         assert!(json.contains("mentions"));
