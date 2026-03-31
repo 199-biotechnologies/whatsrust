@@ -17,7 +17,7 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-use crate::bridge::{BridgeState, WhatsAppBridge, InboundContent};
+use crate::bridge::{BridgeState, WhatsAppBridge};
 use crate::qr::QrRender;
 
 /// Maximum concurrent SSE connections (separate from request semaphore).
@@ -486,8 +486,15 @@ struct SendReq {
 async fn handle_send(bridge: &WhatsAppBridge, body: &[u8], sync: bool) -> Vec<u8> {
     let req: SendReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
     if sync {
+        // Reject features not supported in sync mode — prevents silent data loss
+        if req.link_preview.is_some() {
+            return json_err(400, "link_preview is not supported with ?sync=true (use async mode)");
+        }
+        if req.schedule_at.is_some() {
+            return json_err(400, "schedule_at is not supported with ?sync=true (use async mode)");
+        }
         match bridge.send_message_with_id_mentioned(&req.jid, &req.text, &req.mentions).await {
-            Ok(id) => json_response(200, &serde_json::json!({"ok": true, "id": id}).to_string()),
+            Ok(id) => json_ok_id(&id),
             Err(e) => bridge_err(e),
         }
     } else {
@@ -521,7 +528,10 @@ async fn handle_send(bridge: &WhatsAppBridge, body: &[u8], sync: bool) -> Vec<u8
 struct ReplyReq {
     jid: String,
     id: String,
-    sender: String,
+    #[serde(default)]
+    sender: Option<String>,
+    #[serde(default, alias = "sender_raw")]
+    sender_jid: Option<String>,
     text: String,
     #[serde(default)]
     mentions: Vec<String>,
@@ -529,7 +539,17 @@ struct ReplyReq {
 
 async fn handle_reply(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
     let req: ReplyReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
-    match bridge.send_reply_mentioned(&req.jid, &req.id, &req.sender, &req.text, &req.mentions).await {
+    let reply_sender = req
+        .sender_jid
+        .or(req.sender)
+        .filter(|s| !s.trim().is_empty());
+    let Some(reply_sender) = reply_sender else {
+        return json_err(400, "sender or sender_jid is required");
+    };
+    if req.jid.ends_with("@g.us") && !reply_sender.contains('@') {
+        return json_err(400, "sender_jid (full WhatsApp JID) is required for group replies");
+    }
+    match bridge.send_reply_mentioned(&req.jid, &req.id, &reply_sender, &req.text, &req.mentions).await {
         Ok(id) => json_ok_id(&id),
         Err(e) => bridge_err(e),
     }
@@ -567,13 +587,30 @@ struct ReactionTargetReq {
     sender_jid: Option<String>,
 }
 
+fn resolve_group_reaction_target(
+    jid: &str,
+    from_me: Option<bool>,
+    sender_jid: Option<&str>,
+) -> Result<bool, Vec<u8>> {
+    if jid.ends_with("@g.us") {
+        if sender_jid.is_none() {
+            return Err(json_err(400, "sender_jid is required for group reactions"));
+        }
+        return from_me.ok_or_else(|| json_err(400, "from_me is required for group reactions"));
+    }
+
+    Ok(from_me.unwrap_or(sender_jid.is_none()))
+}
+
 async fn handle_react(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
     let req: ReactReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
-    // If sender_jid is provided and from_me not explicitly set, infer from_me=false
-    let from_me = req.from_me.unwrap_or(req.sender_jid.is_none());
     if req.emoji.is_empty() {
         return json_err(400, "emoji must not be empty");
     }
+    let from_me = match resolve_group_reaction_target(&req.jid, req.from_me, req.sender_jid.as_deref()) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
     match bridge.send_reaction(
         &req.jid,
         &req.id,
@@ -588,11 +625,15 @@ async fn handle_react(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
 
 async fn handle_unreact(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
     let req: ReactionTargetReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
+    let from_me = match resolve_group_reaction_target(&req.jid, req.from_me, req.sender_jid.as_deref()) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
     match bridge.remove_reaction(
         &req.jid,
         &req.id,
         req.sender_jid.as_deref(),
-        req.from_me.unwrap_or(req.sender_jid.is_none()),
+        from_me,
     ).await {
         Ok(()) => json_ok_simple(),
         Err(e) => bridge_err(e),
@@ -876,6 +917,11 @@ enum MediaKind { Image, Video, Audio, Doc, Sticker, ViewOnceImage, ViewOnceVideo
 async fn handle_media(bridge: &WhatsAppBridge, body: &[u8], is_loopback: bool, kind: MediaKind) -> Vec<u8> {
     let req: MediaReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
 
+    // Reject ambiguous requests with both path and base64 data
+    if req.path.is_some() && req.data.is_some() {
+        return json_err(400, "provide either 'path' or 'data', not both");
+    }
+
     // Resolve media bytes + mime from either path or base64 data
     let (data, mime_str, filename_str) = if let Some(ref b64) = req.data {
         // Base64 mode — works for both loopback and remote (no filesystem access)
@@ -884,6 +930,9 @@ async fn handle_media(bridge: &WhatsAppBridge, body: &[u8], is_loopback: bool, k
             Ok(b) => b,
             Err(e) => return json_err(400, &format!("invalid base64: {e}")),
         };
+        if bytes.is_empty() {
+            return json_err(400, "decoded data is empty (0 bytes)");
+        }
         if bytes.len() as u64 > MAX_MEDIA_READ_BYTES {
             return json_err(400, &format!("decoded data exceeds size limit ({} > {})", bytes.len(), MAX_MEDIA_READ_BYTES));
         }
@@ -953,11 +1002,18 @@ struct ContactReq {
 
 async fn handle_contact(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
     let req: ContactReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
+    // Sanitize: vCard fields must not contain newlines or control characters
+    // which could inject additional vCard properties or corrupt the structure.
+    let safe_name = req.name.replace(['\n', '\r', '\0'], " ");
+    let safe_phone: String = req.phone.chars().filter(|c| c.is_ascii_digit() || *c == '+').collect();
+    if safe_phone.is_empty() {
+        return json_err(400, "phone must contain at least one digit");
+    }
     let vcard = format!(
         "BEGIN:VCARD\nVERSION:3.0\nFN:{}\nTEL;type=CELL:+{}\nEND:VCARD",
-        req.name, req.phone
+        safe_name, safe_phone
     );
-    match bridge.send_contact(&req.jid, &req.name, &vcard).await {
+    match bridge.send_contact(&req.jid, &safe_name, &vcard).await {
         Ok(()) => json_ok_simple(),
         Err(e) => bridge_err(e),
     }
@@ -1103,6 +1159,11 @@ async fn handle_sse(
 ) {
     use tokio::io::AsyncWriteExt;
 
+    enum SseFrame {
+        Write(String),
+        CloseAfter(String),
+    }
+
     // Send SSE response headers
     let headers = "HTTP/1.1 200 OK\r\n\
         Content-Type: text/event-stream\r\n\
@@ -1118,70 +1179,85 @@ async fn handle_sse(
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
-        let event_data = tokio::select! {
+        let frame = tokio::select! {
             result = rx.recv() => {
                 match result {
-                    Ok(evt) => format_sse_event(&evt),
+                    Ok(evt) => format_sse_event(&evt).map(SseFrame::Write),
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        // Client too slow — send a comment and disconnect
-                        Some(format!(": lagged {n} events, reconnect\n\n"))
+                        let data = json!({ "missed": n }).to_string();
+                        Some(SseFrame::CloseAfter(format_sse_frame("gap", None, &data)))
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
             _ = heartbeat.tick() => {
-                Some("event: heartbeat\ndata: {}\n\n".to_string())
+                Some(SseFrame::Write(format_sse_frame("heartbeat", None, "{}")))
             }
             _ = cancel.cancelled() => break,
         };
 
-        if let Some(data) = event_data {
+        if let Some(frame) = frame {
+            let (data, close_after_write) = match frame {
+                SseFrame::Write(data) => (data, false),
+                SseFrame::CloseAfter(data) => (data, true),
+            };
             let write_result = tokio::time::timeout(
                 SSE_WRITE_TIMEOUT,
                 stream.write_all(data.as_bytes()),
             )
             .await;
             match write_result {
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => {
+                    if close_after_write {
+                        break;
+                    }
+                }
                 _ => break, // write error or timeout — client gone
             }
         }
     }
 }
 
+fn format_sse_frame(event: &str, id: Option<&str>, data: &str) -> String {
+    let mut frame = String::new();
+    if let Some(id) = id {
+        frame.push_str("id: ");
+        frame.push_str(id);
+        frame.push('\n');
+    }
+    frame.push_str("event: ");
+    frame.push_str(event);
+    frame.push('\n');
+    for line in data.lines() {
+        frame.push_str("data: ");
+        frame.push_str(line);
+        frame.push('\n');
+    }
+    frame.push('\n');
+    frame
+}
+
 /// Format a BridgeEvent as an SSE event string.
 fn format_sse_event(event: &crate::bridge_events::BridgeEvent) -> Option<String> {
     match event {
         crate::bridge_events::BridgeEvent::Inbound(inbound) => {
-            let data = serde_json::json!({
-                "jid": inbound.jid,
-                "id": inbound.id,
-                "sender": inbound.sender,
-                "push_name": if inbound.push_name.is_empty() { None } else { Some(&inbound.push_name) },
-                "timestamp": inbound.timestamp,
-                "type": inbound.content.kind(),
-                "text": match &inbound.content {
-                    InboundContent::Text { body, .. } => Some(body.clone()),
-                    InboundContent::DeliveryReceipt { status, message_ids, .. } => {
-                        Some(format!("{status:?} for {}", message_ids.join(",")))
-                    }
-                    _ => None,
-                },
-                "reply_to": inbound.reply_to.as_ref().map(|r| serde_json::json!({
-                    "id": r.stanza_id,
-                    "participant": r.participant,
-                    "quoted_text": r.quoted_text,
-                })),
-                "is_from_me": inbound.is_from_me,
-            });
-            Some(format!("event: inbound\ndata: {data}\n\n"))
+            let data = serde_json::to_string(inbound.as_ref()).ok()?;
+            let event_id = format!("inbound:{}:{}", inbound.bridge_id, inbound.sequence);
+            Some(format_sse_frame("inbound", Some(&event_id), &data))
         }
         crate::bridge_events::BridgeEvent::OutboundStatus(status) => {
             let data = serde_json::to_string(status).ok()?;
-            Some(format!("event: status\ndata: {data}\n\n"))
+            let state = status.state.to_string();
+            let event_id = format!(
+                "status:{}:{}:{}",
+                status.job_id,
+                state,
+                status.wa_message_id.as_deref().unwrap_or("none")
+            );
+            Some(format_sse_frame("status", Some(&event_id), &data))
         }
         crate::bridge_events::BridgeEvent::Heartbeat => {
-            Some("event: heartbeat\ndata: {}\n\n".to_string())
+            Some(format_sse_frame("heartbeat", None, "{}"))
         }
     }
 }
@@ -1384,6 +1460,10 @@ fn parse_cli_response(raw: &[u8]) -> anyhow::Result<(u16, Vec<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use crate::bridge::{InboundContent, MessageFlags, WhatsAppInbound};
+    use crate::bridge_events::BridgeEvent;
 
     #[test]
     fn test_is_loopback_bind_accepts_local_hosts() {
@@ -1429,5 +1509,72 @@ mod tests {
         assert!(!ct_eq("abc", "ab"));
         assert!(!ct_eq("", "a"));
         assert!(ct_eq("", ""));
+    }
+
+    #[test]
+    fn test_vcard_name_sanitized() {
+        // Newlines in name could inject vCard fields
+        let name = "Evil\nBEGIN:VCARD\nFN:Injected";
+        let safe = name.replace(['\n', '\r', '\0'], " ");
+        assert!(!safe.contains('\n'));
+        assert!(safe.contains("Evil BEGIN:VCARD FN:Injected"));
+    }
+
+    #[test]
+    fn test_vcard_phone_sanitized() {
+        // Only digits and + should survive
+        let phone = "1-555-BAD\n999";
+        let safe: String = phone.chars().filter(|c| c.is_ascii_digit() || *c == '+').collect();
+        assert_eq!(safe, "1555999");
+    }
+
+    #[test]
+    fn test_resolve_group_reaction_target_requires_explicit_group_metadata() {
+        assert!(resolve_group_reaction_target("120363000@g.us", None, Some("user@s.whatsapp.net")).is_err());
+        assert!(resolve_group_reaction_target("120363000@g.us", Some(false), None).is_err());
+        assert_eq!(
+            resolve_group_reaction_target(
+                "120363000@g.us",
+                Some(false),
+                Some("user@s.whatsapp.net"),
+            )
+            .unwrap(),
+            false
+        );
+    }
+
+    #[test]
+    fn test_format_sse_event_serializes_full_inbound_payload() {
+        let inbound = WhatsAppInbound {
+            sequence: 7,
+            bridge_id: "default".into(),
+            jid: "120363000@g.us".into(),
+            id: "wamid-1".into(),
+            content: InboundContent::Text {
+                body: "hello".into(),
+                link_preview: None,
+            },
+            sender: "15551234567".into(),
+            sender_raw: "15551234567@s.whatsapp.net".into(),
+            push_name: "Alice".into(),
+            timestamp: 1_700_000_000,
+            reply_to: None,
+            is_from_me: false,
+            is_group: true,
+            mentions: vec!["199@s.whatsapp.net".into()],
+            ephemeral_expiration: Some(3600),
+            flags: MessageFlags {
+                is_forwarded: true,
+                forwarding_score: 2,
+                is_view_once: false,
+            },
+        };
+
+        let frame = format_sse_event(&BridgeEvent::Inbound(Arc::new(inbound))).unwrap();
+        assert!(frame.contains("id: inbound:default:7"));
+        assert!(frame.contains("event: inbound"));
+        assert!(frame.contains("\"sender_raw\":\"15551234567@s.whatsapp.net\""));
+        assert!(frame.contains("\"sequence\":7"));
+        assert!(frame.contains("\"content\":{\"type\":\"text\",\"body\":\"hello\",\"link_preview\":null}"));
     }
 }

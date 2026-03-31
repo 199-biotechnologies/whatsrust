@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Identifies the type of outbound operation in the job queue.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutboundOpKind {
     Text,
@@ -59,7 +59,8 @@ impl OutboundOpKind {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    /// Parse from the string representation. Returns `None` for unrecognized values.
+    pub fn parse_str(s: &str) -> Option<Self> {
         match s {
             "text" => Some(Self::Text),
             "reply" => Some(Self::Reply),
@@ -84,6 +85,26 @@ impl OutboundOpKind {
             "status_revoke" => Some(Self::StatusRevoke),
             _ => None,
         }
+    }
+
+    /// Deprecated: use `parse_str()` or `.parse::<OutboundOpKind>()` instead.
+    #[deprecated(note = "use parse_str() or .parse::<OutboundOpKind>() (FromStr) instead")]
+    #[allow(dead_code)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        Self::parse_str(s)
+    }
+}
+
+impl std::fmt::Display for OutboundOpKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for OutboundOpKind {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Self::parse_str(s).ok_or_else(|| format!("unknown op kind: {s}"))
     }
 }
 
@@ -286,7 +307,7 @@ pub async fn execute_job(
     use whatsapp_rust::UploadOptions;
     use waproto::whatsapp as wa;
 
-    let kind = OutboundOpKind::from_str(&row.op_kind)
+    let kind = OutboundOpKind::parse_str(&row.op_kind)
         .ok_or_else(|| anyhow::anyhow!("unknown op_kind: {}", row.op_kind))?;
 
     match kind {
@@ -335,8 +356,10 @@ pub async fn execute_job(
                     ..Default::default()
                 }
             };
-            let result = client.send_message(target.clone(), msg).await
-                .map_err(|e| anyhow::anyhow!("send text: {e}"))?;
+            let send_result = client.send_message(target.clone(), msg).await
+                .map_err(|e| anyhow::anyhow!("send text: {e}"));
+            let _ = client.chatstate().send_paused(target).await;
+            let result = send_result?;
             Ok(ExecOutcome { wa_message_id: Some(result.message_id), poll_key: None })
         }
 
@@ -365,8 +388,10 @@ pub async fn execute_job(
                 })),
                 ..Default::default()
             };
-            let result = client.send_message(target.clone(), msg).await
-                .map_err(|e| anyhow::anyhow!("send reply: {e}"))?;
+            let send_result = client.send_message(target.clone(), msg).await
+                .map_err(|e| anyhow::anyhow!("send reply: {e}"));
+            let _ = client.chatstate().send_paused(target).await;
+            let result = send_result?;
             Ok(ExecOutcome { wa_message_id: Some(result.message_id), poll_key: None })
         }
 
@@ -703,7 +728,7 @@ mod tests {
             OutboundOpKind::Reaction,
             OutboundOpKind::Forward,
         ] {
-            assert_eq!(OutboundOpKind::from_str(kind.as_str()), Some(kind));
+            assert_eq!(OutboundOpKind::parse_str(kind.as_str()), Some(kind));
         }
     }
 
@@ -747,7 +772,7 @@ mod tests {
             OutboundOpKind::StatusVideo,
             OutboundOpKind::StatusRevoke,
         ] {
-            assert_eq!(OutboundOpKind::from_str(kind.as_str()), Some(kind));
+            assert_eq!(OutboundOpKind::parse_str(kind.as_str()), Some(kind));
         }
     }
 

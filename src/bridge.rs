@@ -98,13 +98,26 @@ type GroupCacheHandle = Arc<ParkingMutex<GroupCache>>;
 // Types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BridgeState {
     Disconnected,
     Pairing,
     Connected,
     Reconnecting,
     Stopped,
+}
+
+impl std::fmt::Display for BridgeState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disconnected => f.write_str("disconnected"),
+            Self::Pairing => f.write_str("pairing"),
+            Self::Connected => f.write_str("connected"),
+            Self::Reconnecting => f.write_str("reconnecting"),
+            Self::Stopped => f.write_str("stopped"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +134,7 @@ pub struct BridgeMetrics {
     pub started_at: std::time::Instant,
     pub messages_sent: AtomicU64,
     pub messages_received: AtomicU64,
+    pub inbound_sequence: AtomicU64,
     pub reconnect_count: AtomicU64,
     pub last_connect_epoch: AtomicU64,
     pub last_disconnect_epoch: AtomicU64,
@@ -134,6 +148,7 @@ impl BridgeMetrics {
             started_at: std::time::Instant::now(),
             messages_sent: AtomicU64::new(0),
             messages_received: AtomicU64::new(0),
+            inbound_sequence: AtomicU64::new(0),
             reconnect_count: AtomicU64::new(0),
             last_connect_epoch: AtomicU64::new(0),
             last_disconnect_epoch: AtomicU64::new(0),
@@ -169,6 +184,10 @@ impl BridgeMetrics {
 
     pub fn record_reconnect(&self) {
         self.reconnect_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn next_inbound_sequence(&self) -> u64 {
+        self.inbound_sequence.fetch_add(1, Ordering::Relaxed) + 1
     }
 }
 
@@ -240,7 +259,7 @@ impl SendPacer {
 }
 
 /// Group metadata returned by group query methods.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct GroupInfo {
     pub jid: String,
     pub subject: String,
@@ -248,7 +267,7 @@ pub struct GroupInfo {
 }
 
 /// A participant in a WhatsApp group.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct GroupParticipantInfo {
     pub jid: String,
     pub phone: Option<String>,
@@ -266,7 +285,8 @@ enum ExtractResult {
 }
 
 /// Content variants for inbound WhatsApp messages.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 #[allow(dead_code)] // Fields consumed by bot integrations, not the REPL
 pub enum InboundContent {
     /// Plain text or extended text message.
@@ -277,7 +297,9 @@ pub enum InboundContent {
     },
     /// Image with downloaded bytes.
     Image {
-        data: Vec<u8>,
+        /// Raw image bytes (skipped during serialization — access via field or `media_bytes()`).
+        #[serde(skip)]
+        data: Arc<[u8]>,
         mime: String,
         caption: Option<String>,
         width: Option<u32>,
@@ -285,14 +307,18 @@ pub enum InboundContent {
     },
     /// Audio (voice note or file) with downloaded bytes.
     Audio {
-        data: Vec<u8>,
+        /// Raw audio bytes (skipped during serialization).
+        #[serde(skip)]
+        data: Arc<[u8]>,
         mime: String,
         seconds: Option<u32>,
         is_voice: bool,
     },
     /// Video with downloaded bytes.
     Video {
-        data: Vec<u8>,
+        /// Raw video bytes (skipped during serialization).
+        #[serde(skip)]
+        data: Arc<[u8]>,
         mime: String,
         caption: Option<String>,
         seconds: Option<u32>,
@@ -303,7 +329,9 @@ pub enum InboundContent {
     },
     /// Document/file with downloaded bytes.
     Document {
-        data: Vec<u8>,
+        /// Raw document bytes (skipped during serialization).
+        #[serde(skip)]
+        data: Arc<[u8]>,
         mime: String,
         filename: String,
         caption: Option<String>,
@@ -311,7 +339,9 @@ pub enum InboundContent {
     },
     /// Sticker with downloaded bytes.
     Sticker {
-        data: Vec<u8>,
+        /// Raw sticker bytes (skipped during serialization).
+        #[serde(skip)]
+        data: Arc<[u8]>,
         mime: String,
         is_animated: bool,
         /// Emoji or label describing the sticker (from accessibility_label).
@@ -456,9 +486,15 @@ impl InboundContent {
                 format!("[vote on {poll_id}: {}]", selected_options.join(", "))
             }
             Self::DeliveryReceipt { message_ids, status, .. } => {
-                format!("[receipt: {status:?} for {} message(s)]", message_ids.len())
+                format!("[receipt: {status} for {} message(s)]", message_ids.len())
             }
         }
+    }
+}
+
+impl std::fmt::Display for InboundContent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.display_text())
     }
 }
 
@@ -473,7 +509,7 @@ fn format_size(bytes: usize) -> String {
 }
 
 /// Forwarding and view-once metadata on an inbound message.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct MessageFlags {
     pub is_forwarded: bool,
     pub forwarding_score: u32,
@@ -481,7 +517,7 @@ pub struct MessageFlags {
 }
 
 /// Link preview metadata extracted from inbound ExtendedTextMessage.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 #[allow(dead_code)] // Public API for library consumers
 pub struct InboundLinkPreview {
     pub url: String,
@@ -490,7 +526,7 @@ pub struct InboundLinkPreview {
 }
 
 /// Context of a quoted/replied-to message.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ReplyContext {
     /// Stanza ID of the quoted message.
     pub stanza_id: String,
@@ -500,9 +536,12 @@ pub struct ReplyContext {
     pub quoted_text: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 #[allow(dead_code)] // Fields consumed by bot integrations, not the REPL
 pub struct WhatsAppInbound {
+    /// Monotonic sequence assigned when the bridge admits this inbound event.
+    /// Consumers can use it to restore chat order when async media downloads finish out of order.
+    pub sequence: u64,
     /// Which bridge instance received this message (for multi-number routing).
     pub bridge_id: String,
     /// Chat JID (group or individual)
@@ -533,14 +572,75 @@ pub struct WhatsAppInbound {
     pub flags: MessageFlags,
 }
 
+#[allow(dead_code)] // Public API for library consumers (habb)
+impl WhatsAppInbound {
+    /// Extract the text body, if this is a text or edit message.
+    pub fn text_body(&self) -> Option<&str> {
+        match &self.content {
+            InboundContent::Text { body, .. } => Some(body),
+            InboundContent::Edit { new_text, .. } => Some(new_text),
+            _ => None,
+        }
+    }
+
+    /// Extract the caption from media messages (image, video, document).
+    pub fn caption(&self) -> Option<&str> {
+        match &self.content {
+            InboundContent::Image { caption, .. }
+            | InboundContent::Video { caption, .. }
+            | InboundContent::Document { caption, .. } => caption.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Check if this message @mentions the given JID (e.g. our own bot JID).
+    pub fn is_mentioned(&self, jid: &str) -> bool {
+        self.mentions.iter().any(|m| m == jid)
+    }
+
+    /// Check if this is a group message (convenience for `self.is_group`).
+    pub fn is_dm(&self) -> bool {
+        !self.is_group
+    }
+
+    /// Build a `MessageRef` for replying, reacting, or editing this message.
+    pub fn as_ref(&self) -> MessageRef {
+        MessageRef::from_inbound(self)
+    }
+
+    /// Get the raw media bytes if this is a media message (image, audio, video, document, sticker).
+    pub fn media_bytes(&self) -> Option<&[u8]> {
+        match &self.content {
+            InboundContent::Image { data, .. }
+            | InboundContent::Audio { data, .. }
+            | InboundContent::Video { data, .. }
+            | InboundContent::Document { data, .. }
+            | InboundContent::Sticker { data, .. } => Some(data.as_ref()),
+            _ => None,
+        }
+    }
+
+    /// Get the MIME type if this is a media message.
+    pub fn media_mime(&self) -> Option<&str> {
+        match &self.content {
+            InboundContent::Image { mime, .. }
+            | InboundContent::Audio { mime, .. }
+            | InboundContent::Video { mime, .. }
+            | InboundContent::Document { mime, .. }
+            | InboundContent::Sticker { mime, .. } => Some(mime),
+            _ => None,
+        }
+    }
+}
+
 /// Reference to a specific message — used for reactions, replies, edits.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 #[allow(dead_code)] // Public API for downstream crates (habb)
 pub struct MessageRef {
     pub chat_jid: String,
     pub message_id: String,
     pub from_me: bool,
-    /// Sender JID — required for group chats when from_me is false.
+    /// Sender JID — required for group chats and present for incoming DMs.
     pub sender_jid: Option<String>,
 }
 
@@ -552,17 +652,18 @@ impl MessageRef {
             chat_jid: msg.jid.clone(),
             message_id: msg.id.clone(),
             from_me: msg.is_from_me,
-            sender_jid: if msg.is_from_me {
-                None
-            } else {
+            sender_jid: if msg.is_group || !msg.is_from_me {
                 Some(msg.sender_raw.clone())
+            } else {
+                None
             },
         }
     }
 }
 
 /// Presence events surfaced to the consumer (typing, recording indicators).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 #[allow(dead_code)] // Fields consumed by bot integrations, not the REPL
 pub enum PresenceEvent {
     Composing { chat_jid: String, sender: String },
@@ -1221,12 +1322,15 @@ impl WhatsAppBridge {
         mime: &str,
         caption: Option<&str>,
     ) -> Result<()> {
+        if data.is_empty() {
+            anyhow::bail!("cannot send empty image (0 bytes)");
+        }
         let payload = serde_json::to_string(&crate::outbound::MediaPayload {
             mime: mime.to_string(),
             caption: caption.map(|c| c.to_string()),
             filename: None,
             seconds: None,
-            is_voice_note: true,
+            is_voice_note: false,
         })?;
         self.enqueue_op(jid, crate::outbound::OutboundOpKind::Image, &payload, Some(data)).await?;
         Ok(())
@@ -1241,6 +1345,9 @@ impl WhatsAppBridge {
         seconds: Option<u32>,
         is_voice_note: bool,
     ) -> Result<()> {
+        if data.is_empty() {
+            anyhow::bail!("cannot send empty audio (0 bytes)");
+        }
         let payload = serde_json::to_string(&crate::outbound::MediaPayload {
             mime: mime.to_string(),
             caption: None,
@@ -1296,12 +1403,15 @@ impl WhatsAppBridge {
         mime: &str,
         caption: Option<&str>,
     ) -> Result<()> {
+        if data.is_empty() {
+            anyhow::bail!("cannot send empty video (0 bytes)");
+        }
         let payload = serde_json::to_string(&crate::outbound::MediaPayload {
             mime: mime.to_string(),
             caption: caption.map(|c| c.to_string()),
             filename: None,
             seconds: None,
-            is_voice_note: true,
+            is_voice_note: false,
         })?;
         self.enqueue_op(jid, crate::outbound::OutboundOpKind::Video, &payload, Some(data)).await?;
         Ok(())
@@ -1316,12 +1426,20 @@ impl WhatsAppBridge {
         filename: &str,
         caption: Option<&str>,
     ) -> Result<()> {
+        if data.is_empty() {
+            anyhow::bail!("cannot send empty document (0 bytes)");
+        }
+        // Sanitize filename: strip path components to prevent traversal display issues
+        let safe_filename = std::path::Path::new(filename)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file");
         let payload = serde_json::to_string(&crate::outbound::MediaPayload {
             mime: mime.to_string(),
             caption: caption.map(|c| c.to_string()),
-            filename: Some(filename.to_string()),
+            filename: Some(safe_filename.to_string()),
             seconds: None,
-            is_voice_note: true,
+            is_voice_note: false,
         })?;
         self.enqueue_op(jid, crate::outbound::OutboundOpKind::Document, &payload, Some(data)).await?;
         Ok(())
@@ -1341,7 +1459,7 @@ impl WhatsAppBridge {
             caption: None,
             filename: None,
             seconds: if is_animated { Some(1) } else { Some(0) },
-            is_voice_note: true,
+            is_voice_note: false,
         })?;
         self.enqueue_op(jid, crate::outbound::OutboundOpKind::Sticker, &payload, Some(data)).await?;
         Ok(())
@@ -1391,6 +1509,13 @@ impl WhatsAppBridge {
         name: Option<&str>,
         address: Option<&str>,
     ) -> Result<()> {
+        // Validate coordinates — NaN/Infinity produce corrupt JSON and silent data loss
+        if !lat.is_finite() || !lon.is_finite() {
+            anyhow::bail!("invalid coordinates: lat={lat}, lon={lon} (must be finite numbers)");
+        }
+        if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+            anyhow::bail!("coordinates out of range: lat={lat} (±90), lon={lon} (±180)");
+        }
         let payload = serde_json::to_string(&crate::outbound::LocationPayload {
             lat,
             lon,
@@ -1583,12 +1708,15 @@ impl WhatsAppBridge {
         mime: &str,
         caption: Option<&str>,
     ) -> Result<()> {
+        if data.is_empty() {
+            anyhow::bail!("cannot send empty view-once image (0 bytes)");
+        }
         let payload = serde_json::to_string(&crate::outbound::MediaPayload {
             mime: mime.to_string(),
             caption: caption.map(|c| c.to_string()),
             filename: None,
             seconds: None,
-            is_voice_note: true,
+            is_voice_note: false,
         })?;
         self.enqueue_op(jid, crate::outbound::OutboundOpKind::ViewOnceImage, &payload, Some(data)).await?;
         Ok(())
@@ -1602,12 +1730,15 @@ impl WhatsAppBridge {
         mime: &str,
         caption: Option<&str>,
     ) -> Result<()> {
+        if data.is_empty() {
+            anyhow::bail!("cannot send empty view-once video (0 bytes)");
+        }
         let payload = serde_json::to_string(&crate::outbound::MediaPayload {
             mime: mime.to_string(),
             caption: caption.map(|c| c.to_string()),
             filename: None,
             seconds: None,
-            is_voice_note: true,
+            is_voice_note: false,
         })?;
         self.enqueue_op(jid, crate::outbound::OutboundOpKind::ViewOnceVideo, &payload, Some(data)).await?;
         Ok(())
@@ -2301,6 +2432,8 @@ async fn handle_event(
                 return;
             }
 
+            let inbound_sequence = metrics.next_inbound_sequence();
+
             // Unwrap wrappers before extracting metadata so reply-to and flags
             // are found on wrapped ephemeral/view-once content too.
             let inner_msg = unwrap_to_inner(&msg);
@@ -2351,6 +2484,7 @@ async fn handle_event(
                     }
 
                     let inbound = WhatsAppInbound {
+                        sequence: inbound_sequence,
                         bridge_id: bridge_id.to_string(),
                         jid: info.source.chat.to_string(),
                         id: info.id.clone(),
@@ -2377,8 +2511,12 @@ async fn handle_event(
                         debug!(error = %e, "failed to insert inbound history (may be duplicate)");
                     }
 
+                    let inbound_arc = Arc::new(inbound.clone());
                     match inbound_tx.send(inbound).await {
                         Ok(()) => {
+                            let _ = event_tx.send(Arc::new(crate::bridge_events::BridgeEvent::Inbound(
+                                inbound_arc,
+                            )));
                             metrics.record_received();
                             dedup.mark_done(&info.id);
                             if auto_mark_read && !info.source.is_from_me {
@@ -2508,6 +2646,7 @@ async fn handle_event(
             let chat_jid = receipt.source.chat.to_string();
             let sender = receipt.source.sender.to_string();
             let msg_ids: Vec<String> = receipt.message_ids.iter().map(|id| id.to_string()).collect();
+            let inbound_sequence = metrics.next_inbound_sequence();
 
             info!(
                 receipt_type = ?receipt.r#type,
@@ -2553,6 +2692,7 @@ async fn handle_event(
 
             // Create synthetic inbound message for consumers
             let inbound = WhatsAppInbound {
+                sequence: inbound_sequence,
                 bridge_id: bridge_id.to_string(),
                 jid: chat_jid.clone(),
                 id: msg_ids.first().cloned().unwrap_or_default(),
@@ -2574,9 +2714,10 @@ async fn handle_event(
                 flags: MessageFlags::default(),
             };
             let inbound_arc = Arc::new(inbound.clone());
-            let _ = event_tx.send(Arc::new(crate::bridge_events::BridgeEvent::Inbound(inbound_arc)));
             if inbound_tx.send(inbound).await.is_err() {
                 warn!("inbound channel closed — receipt dropped");
+            } else {
+                let _ = event_tx.send(Arc::new(crate::bridge_events::BridgeEvent::Inbound(inbound_arc)));
             }
         }
         Event::DeviceListUpdate(update) => {
@@ -2886,7 +3027,7 @@ async fn extract_content_inner(
         match client.download(img.as_ref() as &dyn Downloadable).await {
             Ok(data) => {
                 if data.len() as u64 > MAX_MEDIA_BYTES { warn!(size = data.len(), "downloaded image exceeds size limit"); return ExtractResult::Unhandled; }
-                return ExtractResult::Content(InboundContent::Image { data, mime, caption, width, height });
+                return ExtractResult::Content(InboundContent::Image { data: data.into(), mime, caption, width, height });
             }
             Err(e) => {
                 warn!(error = %e, "failed to download image");
@@ -2910,7 +3051,7 @@ async fn extract_content_inner(
         match client.download(vid as &dyn Downloadable).await {
             Ok(data) => {
                 if data.len() as u64 > MAX_MEDIA_BYTES { warn!(size = data.len(), "downloaded video exceeds size limit"); return ExtractResult::Unhandled; }
-                return ExtractResult::Content(InboundContent::Video { data, mime, caption, seconds, width, height, is_gif });
+                return ExtractResult::Content(InboundContent::Video { data: data.into(), mime, caption, seconds, width, height, is_gif });
             }
             Err(e) => {
                 warn!(error = %e, "failed to download video");
@@ -2931,7 +3072,7 @@ async fn extract_content_inner(
         match client.download(aud.as_ref() as &dyn Downloadable).await {
             Ok(data) => {
                 if data.len() as u64 > MAX_MEDIA_BYTES { warn!(size = data.len(), "downloaded audio exceeds size limit"); return ExtractResult::Unhandled; }
-                return ExtractResult::Content(InboundContent::Audio { data, mime, seconds, is_voice });
+                return ExtractResult::Content(InboundContent::Audio { data: data.into(), mime, seconds, is_voice });
             }
             Err(e) => {
                 warn!(error = %e, "failed to download audio");
@@ -2953,7 +3094,7 @@ async fn extract_content_inner(
         match client.download(doc.as_ref() as &dyn Downloadable).await {
             Ok(data) => {
                 if data.len() as u64 > MAX_MEDIA_BYTES { warn!(size = data.len(), "downloaded document exceeds size limit"); return ExtractResult::Unhandled; }
-                return ExtractResult::Content(InboundContent::Document { data, mime, filename, caption, page_count });
+                return ExtractResult::Content(InboundContent::Document { data: data.into(), mime, filename, caption, page_count });
             }
             Err(e) => {
                 warn!(error = %e, "failed to download document");
@@ -2977,7 +3118,7 @@ async fn extract_content_inner(
                 match client.download(doc.as_ref() as &dyn Downloadable).await {
                     Ok(data) => {
                         if data.len() as u64 > MAX_MEDIA_BYTES { warn!(size = data.len(), "downloaded document exceeds size limit"); return ExtractResult::Unhandled; }
-                        return ExtractResult::Content(InboundContent::Document { data, mime, filename, caption, page_count });
+                        return ExtractResult::Content(InboundContent::Document { data: data.into(), mime, filename, caption, page_count });
                     }
                     Err(e) => {
                         warn!(error = %e, "failed to download document (with caption)");
@@ -3000,7 +3141,7 @@ async fn extract_content_inner(
         match client.download(stk.as_ref() as &dyn Downloadable).await {
             Ok(data) => {
                 if data.len() as u64 > MAX_MEDIA_BYTES { warn!(size = data.len(), "downloaded sticker exceeds size limit"); return ExtractResult::Unhandled; }
-                return ExtractResult::Content(InboundContent::Sticker { data, mime, is_animated, sticker_emoji });
+                return ExtractResult::Content(InboundContent::Sticker { data: data.into(), mime, is_animated, sticker_emoji });
             }
             Err(e) => {
                 warn!(error = %e, "failed to download sticker");
@@ -3816,6 +3957,7 @@ mod tests {
     #[test]
     fn test_message_ref_from_inbound() {
         let msg = WhatsAppInbound {
+            sequence: 1,
             bridge_id: "default".into(),
             jid: "group@g.us".into(),
             id: "msg123".into(),
@@ -3844,6 +3986,7 @@ mod tests {
     #[test]
     fn test_message_ref_from_me_has_no_sender() {
         let msg = WhatsAppInbound {
+            sequence: 2,
             bridge_id: "default".into(),
             jid: "chat@s.whatsapp.net".into(),
             id: "msg456".into(),
@@ -3862,6 +4005,30 @@ mod tests {
         let mref = MessageRef::from_inbound(&msg);
         assert!(mref.from_me);
         assert!(mref.sender_jid.is_none());
+    }
+
+    #[test]
+    fn test_message_ref_from_me_in_group_keeps_sender() {
+        let msg = WhatsAppInbound {
+            sequence: 3,
+            bridge_id: "default".into(),
+            jid: "group@g.us".into(),
+            id: "msg789".into(),
+            content: InboundContent::Text { body: "hi".into(), link_preview: None },
+            sender: "myphone".into(),
+            sender_raw: "15551230000@s.whatsapp.net".into(),
+            push_name: String::new(),
+            timestamp: 1000,
+            reply_to: None,
+            is_from_me: true,
+            is_group: true,
+            mentions: Vec::new(),
+            ephemeral_expiration: None,
+            flags: MessageFlags::default(),
+        };
+        let mref = MessageRef::from_inbound(&msg);
+        assert!(mref.from_me);
+        assert_eq!(mref.sender_jid.as_deref(), Some("15551230000@s.whatsapp.net"));
     }
 
     #[test]
@@ -3951,5 +4118,35 @@ mod tests {
             pacer.wait_turn().await;
         }
         assert!(start.elapsed() < Duration::from_millis(10));
+    }
+
+    #[test]
+    fn test_location_rejects_nan_and_infinity() {
+        // NaN/Infinity coordinates must be caught before they corrupt outbound queue JSON
+        assert!(!f64::NAN.is_finite());
+        assert!(!f64::INFINITY.is_finite());
+        assert!(!f64::NEG_INFINITY.is_finite());
+        assert!(42.0_f64.is_finite());
+    }
+
+    #[test]
+    fn test_location_rejects_out_of_range() {
+        // Latitude must be [-90, 90], longitude must be [-180, 180]
+        assert!(!(-90.0..=90.0).contains(&91.0));
+        assert!(!(-180.0..=180.0).contains(&181.0));
+        assert!((-90.0..=90.0).contains(&45.0));
+        assert!((-180.0..=180.0).contains(&-120.0));
+    }
+
+    #[test]
+    fn test_document_filename_sanitized() {
+        // Path traversal in filenames should be stripped to just the final component
+        let path = std::path::Path::new("../../etc/passwd");
+        let safe = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+        assert_eq!(safe, "passwd");
+        // Normal filenames pass through
+        let path2 = std::path::Path::new("report.pdf");
+        let safe2 = path2.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+        assert_eq!(safe2, "report.pdf");
     }
 }

@@ -8,17 +8,18 @@
 
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::bridge::WhatsAppInbound;
 
 /// Capacity of the broadcast channel. Slow receivers that fall behind
 /// this many events will get `Lagged` and should reconnect.
-const EVENT_BUS_CAPACITY: usize = 256;
+const EVENT_BUS_CAPACITY: usize = 2048;
 
 /// Unified bridge event envelope.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
 #[allow(dead_code)] // Heartbeat constructed by SSE handler in api.rs, not bridge itself
 pub enum BridgeEvent {
     /// An inbound WhatsApp message or status update.
@@ -30,7 +31,7 @@ pub enum BridgeEvent {
 }
 
 /// Status update for an outbound job.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutboundStatusEvent {
     /// The queue row ID returned by `enqueue_job()`.
     pub job_id: i64,
@@ -43,7 +44,7 @@ pub struct OutboundStatusEvent {
 }
 
 /// Lifecycle states for an outbound job.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[allow(dead_code)] // Queued + Expired are valid states for SSE consumers / downstream crates
 #[serde(rename_all = "snake_case")]
 pub enum OutboundJobState {
@@ -58,7 +59,7 @@ pub enum OutboundJobState {
 }
 
 /// Delivery status for inbound receipt events.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryStatus {
     Sent,
@@ -67,6 +68,34 @@ pub enum DeliveryStatus {
     Played,
     Failed,
     Unknown,
+}
+
+impl std::fmt::Display for OutboundJobState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Queued => f.write_str("queued"),
+            Self::Sending => f.write_str("sending"),
+            Self::Sent => f.write_str("sent"),
+            Self::Delivered => f.write_str("delivered"),
+            Self::Read => f.write_str("read"),
+            Self::Played => f.write_str("played"),
+            Self::Failed => f.write_str("failed"),
+            Self::Expired => f.write_str("expired"),
+        }
+    }
+}
+
+impl std::fmt::Display for DeliveryStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sent => f.write_str("sent"),
+            Self::Delivered => f.write_str("delivered"),
+            Self::Read => f.write_str("read"),
+            Self::Played => f.write_str("played"),
+            Self::Failed => f.write_str("failed"),
+            Self::Unknown => f.write_str("unknown"),
+        }
+    }
 }
 
 /// Create a new event bus (sender + initial receiver).
