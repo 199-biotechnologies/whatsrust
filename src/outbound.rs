@@ -478,8 +478,9 @@ pub async fn execute_job(
         OutboundOpKind::Reaction | OutboundOpKind::Unreact => {
             let p: ReactionPayload = serde_json::from_str(&row.payload_json)?;
             let emoji = if kind == OutboundOpKind::Unreact { String::new() } else { p.emoji };
-            let target_str = target.to_string();
-            let participant = if target_str.contains("@g.us") && !p.target_is_from_me {
+            // In groups, participant is always required — even for self-authored messages.
+            let is_group = target.to_string().ends_with("@g.us");
+            let participant = if is_group {
                 p.target_sender_jid
             } else {
                 None

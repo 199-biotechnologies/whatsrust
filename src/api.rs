@@ -566,7 +566,8 @@ struct ReactionTargetReq {
 
 async fn handle_react(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
     let req: ReactReq = match parse_body(body) { Ok(r) => r, Err(e) => return e };
-    let from_me = req.from_me.unwrap_or(true);
+    // If sender_jid is provided and from_me not explicitly set, infer from_me=false
+    let from_me = req.from_me.unwrap_or(req.sender_jid.is_none());
     if req.emoji.is_empty() {
         return json_err(400, "emoji must not be empty");
     }
@@ -588,7 +589,7 @@ async fn handle_unreact(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
         &req.jid,
         &req.id,
         req.sender_jid.as_deref(),
-        req.from_me.unwrap_or(true),
+        req.from_me.unwrap_or(req.sender_jid.is_none()),
     ).await {
         Ok(()) => json_ok_simple(),
         Err(e) => bridge_err(e),
