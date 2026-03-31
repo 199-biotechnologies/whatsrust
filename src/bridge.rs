@@ -242,7 +242,7 @@ impl SendPacer {
             // Wait for next token + jitter
             let deficit = 1.0 - *tokens;
             let wait = Duration::from_secs_f64(deficit * self.refill_interval.as_secs_f64());
-            let jitter_ms = rand_jitter_ms((self.refill_interval.as_millis() as u64 / 4).max(1));
+            let jitter_ms = rand_jitter_ms((self.refill_interval.as_millis() as u64 / 3).max(1));
             let total_wait = wait + Duration::from_millis(jitter_ms);
             drop(state); // release lock during sleep
             tokio::time::sleep(total_wait).await;
@@ -707,7 +707,7 @@ pub struct BridgeConfig {
     pub max_outbound_retries: i32,
     /// Optional channel to receive presence events (typing, recording indicators).
     pub presence_tx: Option<mpsc::Sender<PresenceEvent>>,
-    /// Device name shown in WhatsApp's "Linked Devices" list (default: "RustClaw").
+    /// Device name shown in WhatsApp's "Linked Devices" list (default: "Habb").
     pub device_name: String,
     /// Maximum message IDs tracked for dedup (default: 4096).
     pub dedup_capacity: usize,
@@ -732,7 +732,7 @@ impl Default for BridgeConfig {
             prune_interval_secs: 3600,
             max_outbound_retries: 3,
             presence_tx: None,
-            device_name: "RustClaw".to_string(),
+            device_name: "Habb".to_string(),
             dedup_capacity: DEDUP_CACHE_CAPACITY,
         }
     }
@@ -3561,6 +3561,34 @@ async fn handle_outbound(
                 error: None,
             },
         )));
+
+        // --- Auto typing indicator (anti-ban: simulate human typing speed) ---
+        // For text-like ops, show "composing" for a duration scaled by message length.
+        // For audio, the recording indicator is already handled in execute_job.
+        // Status sends, reactions, edits, revokes skip this (they're instant in real WhatsApp).
+        {
+            let op_kind = crate::outbound::OutboundOpKind::parse_str(&row.op_kind);
+            let needs_typing = matches!(
+                op_kind,
+                Some(crate::outbound::OutboundOpKind::Text)
+                    | Some(crate::outbound::OutboundOpKind::Reply)
+                    | Some(crate::outbound::OutboundOpKind::Forward)
+            );
+            if needs_typing {
+                // Estimate typing duration: ~40ms per character, min 800ms, max 6s, ±30% jitter
+                let char_count = row.payload_json.len().min(500); // cap at 500 chars for timing
+                let base_ms = (char_count as u64 * 40).clamp(800, 6000);
+                let jitter = {
+                    use rand::Rng;
+                    let mut rng = rand::thread_rng();
+                    let factor: f64 = rng.gen_range(0.7..1.3);
+                    (base_ms as f64 * factor) as u64
+                };
+                let _ = client.chatstate().send_composing(&jid).await;
+                tokio::time::sleep(Duration::from_millis(jitter)).await;
+                let _ = client.chatstate().send_paused(&jid).await;
+            }
+        }
 
         match crate::outbound::execute_job(&row, &jid, &client).await {
             Ok(outcome) => {
