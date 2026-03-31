@@ -23,6 +23,7 @@ chrono = "0.4"
 dashmap = "6"
 hkdf = "0.12"
 fs2 = "0.4"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 parking_lot = "0.12"
 png = "0.17"
 prost = "0.14"

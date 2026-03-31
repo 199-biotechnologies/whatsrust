@@ -399,12 +399,17 @@ pub async fn execute_job(
             let p: MediaPayload = serde_json::from_str(&row.payload_json)?;
             let data = row.payload_blob.clone()
                 .ok_or_else(|| anyhow::anyhow!("image op missing payload_blob"))?;
+            // Extract dimensions + generate thumbnail before upload
+            let meta = crate::media_utils::extract_image_meta(&data);
             let upload = client.upload(data, MediaType::Image, UploadOptions::default()).await
                 .map_err(|e| anyhow::anyhow!("image upload: {e}"))?;
             let msg = wa::Message {
                 image_message: Some(Box::new(wa::message::ImageMessage {
                     mimetype: Some(p.mime),
                     caption: p.caption,
+                    width: meta.as_ref().map(|m| m.width),
+                    height: meta.as_ref().map(|m| m.height),
+                    jpeg_thumbnail: meta.as_ref().map(|m| m.thumbnail.clone()),
                     url: Some(upload.url),
                     direct_path: Some(upload.direct_path),
                     media_key: Some(upload.media_key),
@@ -455,6 +460,12 @@ pub async fn execute_job(
             if p.is_voice_note {
                 let _ = client.chatstate().send_recording(target).await;
             }
+            // Generate waveform for voice notes (visual waveform bars in chat bubble)
+            let waveform = if p.is_voice_note {
+                Some(crate::media_utils::generate_waveform(&data))
+            } else {
+                None
+            };
             let upload = client.upload(data, MediaType::Audio, UploadOptions::default()).await
                 .map_err(|e| anyhow::anyhow!("audio upload: {e}"))?;
             let msg = wa::Message {
@@ -462,6 +473,7 @@ pub async fn execute_job(
                     mimetype: Some(p.mime),
                     ptt: Some(p.is_voice_note),
                     seconds: p.seconds,
+                    waveform,
                     url: Some(upload.url),
                     direct_path: Some(upload.direct_path),
                     media_key: Some(upload.media_key),

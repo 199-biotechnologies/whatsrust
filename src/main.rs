@@ -13,6 +13,7 @@ mod bridge;
 mod bridge_events;
 mod dedup;
 mod instance_lock;
+mod media_utils;
 mod outbound;
 mod polls;
 pub mod qr;
