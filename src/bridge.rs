@@ -2422,13 +2422,25 @@ async fn handle_event(
             let sender_raw = info.source.sender.to_string();
             let sender = resolve_sender(&sender_raw, store).await;
 
-            // Allowlist filter: skip messages from numbers not on the list
+            // Normalize DM chat JID: resolve @lid → @s.whatsapp.net so downstream
+            // consumers (e.g. Habb) see a consistent identity for each contact.
+            // Groups are never LID-based so only DMs need resolution.
+            let chat_jid_raw = info.source.chat.to_string();
+            let chat_jid = resolve_chat_jid(&chat_jid_raw, store).await;
+
+            // Allowlist filter: skip messages from numbers not on the list.
+            // Check both the resolved sender AND the resolved chat JID phone,
+            // since LID resolution may succeed for one but not the other.
             if !allowed_numbers.is_empty()
                 && !info.source.is_from_me
                 && !allowed_numbers.iter().any(|n| n == &sender)
+                && !allowed_numbers.iter().any(|n| {
+                    // Also match if chat JID resolved to a phone-based JID
+                    chat_jid.strip_suffix("@s.whatsapp.net").is_some_and(|pn| pn == n)
+                })
             {
                 dedup.mark_done(&info.id);
-                info!(sender = %sender, raw = %sender_raw, "message from non-allowed sender, skipping");
+                info!(sender = %sender, raw = %sender_raw, chat = %chat_jid, "message from non-allowed sender, skipping");
                 return;
             }
 
@@ -2472,7 +2484,7 @@ async fn handle_event(
                                     .filter_map(|o| o.option_name.clone())
                                     .collect();
                                 if let Err(e) = store.store_poll_key(
-                                    &info.source.chat.to_string(),
+                                    &chat_jid,
                                     &info.id,
                                     enc_key,
                                     &options,
@@ -2486,7 +2498,7 @@ async fn handle_event(
                     let inbound = WhatsAppInbound {
                         sequence: inbound_sequence,
                         bridge_id: bridge_id.to_string(),
-                        jid: info.source.chat.to_string(),
+                        jid: chat_jid.clone(),
                         id: info.id.clone(),
                         content,
                         sender,
@@ -2521,7 +2533,7 @@ async fn handle_event(
                             dedup.mark_done(&info.id);
                             if auto_mark_read && !info.source.is_from_me {
                                 let _ = rr_tx.send(ReadReceiptCmd::Seen {
-                                    chat_jid: info.source.chat.to_string(),
+                                    chat_jid: chat_jid_raw.clone(),
                                     participant_jid: if info.source.is_group {
                                         Some(info.source.sender.to_string())
                                     } else {
@@ -3443,6 +3455,21 @@ async fn resolve_alternate_chat_jid(chat_jid: &str, store: &Store) -> Option<Str
         }
     }
     None
+}
+
+/// Resolve a chat JID from @lid to @s.whatsapp.net using the LID mapping table.
+/// Returns the original JID unchanged if it's not an @lid JID or no mapping exists.
+/// Groups (@g.us) and other non-LID JIDs pass through unchanged.
+async fn resolve_chat_jid(raw: &str, store: &Store) -> String {
+    let Some((user_part, "lid")) = raw.split_once('@') else {
+        return raw.to_string();
+    };
+    // Strip device suffix (:N) — lid_pn_mapping stores bare LIDs
+    let bare_lid = user_part.split(':').next().unwrap_or(user_part);
+    if let Ok(Some(entry)) = store.get_lid_mapping(bare_lid).await {
+        return format!("{}@s.whatsapp.net", entry.phone_number);
+    }
+    raw.to_string()
 }
 
 /// Resolve a sender JID to a phone number using the LID mapping table.
