@@ -2419,14 +2419,15 @@ async fn handle_event(
                 return;
             }
 
+            let sender_alt = info.source.sender_alt.as_ref();
             let sender_raw = info.source.sender.to_string();
-            let sender = resolve_sender(&sender_raw, store).await;
+            let sender = resolve_sender(&sender_raw, sender_alt, store).await;
 
             // Normalize DM chat JID: resolve @lid → @s.whatsapp.net so downstream
             // consumers (e.g. Habb) see a consistent identity for each contact.
             // Groups are never LID-based so only DMs need resolution.
             let chat_jid_raw = info.source.chat.to_string();
-            let chat_jid = resolve_chat_jid(&chat_jid_raw, store).await;
+            let chat_jid = resolve_chat_jid(&chat_jid_raw, sender_alt, store).await;
 
             // Allowlist filter: skip messages from numbers not on the list.
             // Check both the resolved sender AND the resolved chat JID phone,
@@ -2655,8 +2656,10 @@ async fn handle_event(
                 _ => DeliveryStatus::Unknown,
             };
 
-            let chat_jid = receipt.source.chat.to_string();
-            let sender = receipt.source.sender.to_string();
+            let receipt_alt = receipt.source.sender_alt.as_ref();
+            let chat_jid_raw = receipt.source.chat.to_string();
+            let chat_jid = resolve_chat_jid(&chat_jid_raw, receipt_alt, store).await;
+            let sender = resolve_sender(&receipt.source.sender.to_string(), receipt_alt, store).await;
             let msg_ids: Vec<String> = receipt.message_ids.iter().map(|id| id.to_string()).collect();
             let inbound_sequence = metrics.next_inbound_sequence();
 
@@ -2760,8 +2763,9 @@ async fn handle_event(
         }
         Event::ChatPresence(update) => {
             if let Some(ref ptx) = presence_tx {
-                let chat_jid = update.source.chat.to_string();
-                let sender = update.source.sender.to_string();
+                let pres_alt = update.source.sender_alt.as_ref();
+                let chat_jid = resolve_chat_jid(&update.source.chat.to_string(), pres_alt, store).await;
+                let sender = resolve_sender(&update.source.sender.to_string(), pres_alt, store).await;
                 let evt = match update.state {
                     wacore::types::presence::ChatPresence::Composing => {
                         match update.media {
@@ -3457,16 +3461,32 @@ async fn resolve_alternate_chat_jid(chat_jid: &str, store: &Store) -> Option<Str
     None
 }
 
+/// Strip the `@server` suffix and any `:device` qualifier to get the bare user part.
+fn bare_lid_user(jid_str: &str) -> &str {
+    let user_part = jid_str.split('@').next().unwrap_or(jid_str);
+    user_part.split(':').next().unwrap_or(user_part)
+}
+
 /// Resolve a chat JID from @lid to @s.whatsapp.net using the LID mapping table.
 /// Returns the original JID unchanged if it's not an @lid JID or no mapping exists.
 /// Groups (@g.us) and other non-LID JIDs pass through unchanged.
-async fn resolve_chat_jid(raw: &str, store: &Store) -> String {
-    let Some((user_part, "lid")) = raw.split_once('@') else {
+///
+/// When available, `sender_alt` from wa-rs is used as an inline fallback before
+/// hitting the database — this covers the first-message edge case where the LID
+/// mapping hasn't been persisted yet.
+async fn resolve_chat_jid(raw: &str, sender_alt: Option<&wacore_binary::jid::Jid>, store: &Store) -> String {
+    let Some((_, "lid")) = raw.split_once('@') else {
         return raw.to_string();
     };
-    // Strip device suffix (:N) — lid_pn_mapping stores bare LIDs
-    let bare_lid = user_part.split(':').next().unwrap_or(user_part);
-    if let Ok(Some(entry)) = store.get_lid_mapping(bare_lid).await {
+    // 1. Try sender_alt (inline PN from wa-rs, available before DB is populated)
+    if let Some(alt) = sender_alt {
+        if alt.server == "s.whatsapp.net" {
+            return format!("{}@s.whatsapp.net", alt.user);
+        }
+    }
+    // 2. Fall back to DB lookup
+    let bare = bare_lid_user(raw);
+    if let Ok(Some(entry)) = store.get_lid_mapping(bare).await {
         return format!("{}@s.whatsapp.net", entry.phone_number);
     }
     raw.to_string()
@@ -3477,22 +3497,32 @@ async fn resolve_chat_jid(raw: &str, store: &Store) -> String {
 ///
 /// Handles device-qualified LIDs like `100000000000001.1:75@lid` by stripping
 /// the device suffix (`:75`) before lookup, since lid_pn_mapping stores bare LIDs.
-async fn resolve_sender(sender_raw: &str, store: &Store) -> String {
-    // Extract the user part (before @)
-    let user_part = sender_raw
-        .split('@')
-        .next()
-        .unwrap_or(sender_raw);
+/// Only probes the database when the JID is actually @lid — phone-based JIDs
+/// short-circuit without a DB round-trip.
+async fn resolve_sender(sender_raw: &str, sender_alt: Option<&wacore_binary::jid::Jid>, store: &Store) -> String {
+    let (user_part, server) = sender_raw
+        .split_once('@')
+        .unwrap_or((sender_raw, ""));
 
-    // Strip device suffix (:N) for LID lookup — lid_pn_mapping uses bare LIDs
-    let bare_lid = user_part.split(':').next().unwrap_or(user_part);
+    // Only @lid JIDs need resolution
+    if server != "lid" {
+        return user_part.to_string();
+    }
 
-    // Try LID → phone lookup (bare LID without device suffix)
-    if let Ok(Some(entry)) = store.get_lid_mapping(bare_lid).await {
+    // 1. Try sender_alt (inline PN from wa-rs)
+    if let Some(alt) = sender_alt {
+        if alt.server == "s.whatsapp.net" {
+            return alt.user.clone();
+        }
+    }
+
+    // 2. Fall back to DB lookup
+    let bare = user_part.split(':').next().unwrap_or(user_part);
+    if let Ok(Some(entry)) = store.get_lid_mapping(bare).await {
         return entry.phone_number;
     }
 
-    // Already a phone number or no mapping — return user part as-is
+    // No mapping — return user part as-is
     user_part.to_string()
 }
 
@@ -3764,8 +3794,10 @@ fn select_poll_voter_jid(sender_jid: Option<&str>, poll_participant: Option<&str
 }
 
 /// Returns true for JIDs that should be silently dropped (status broadcasts,
-/// newsletter channels, server messages, LID-only JIDs).
-/// Mirrors Baileys' `shouldIgnoreJid` logic.
+/// newsletter channels, server messages).
+/// Note: @lid JIDs are NOT dropped — they are valid DM identities after WhatsApp's
+/// migration and are resolved to phone-based JIDs by `resolve_chat_jid`.
+///
 /// Apply forwarding context to a message. Increments forwarding_score and sets is_forwarded.
 /// For plain `conversation` text (which has no context_info field), converts to extended_text_message.
 pub fn add_forward_context(mut msg: wa::Message) -> wa::Message {
