@@ -87,7 +87,7 @@ impl QrRender {
     pub fn terminal_lines(&self) -> usize {
         let quiet = 2;
         let total = self.size + 2 * quiet;
-        (total + 1) / 2 // ceil(total / 2) since we pack 2 rows per line
+        total.div_ceil(2)
     }
 
     /// Auto-refreshing HTML page with the QR code rendered as an inline SVG.

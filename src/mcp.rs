@@ -114,10 +114,10 @@ fn sse_channel_forwarder(port: u16, tx: mpsc::Sender<String>) {
                     continue;
                 }
 
-                if line.starts_with("event:") {
-                    event_type = line[6..].trim().to_string();
-                } else if line.starts_with("data:") {
-                    data_buf = line[5..].trim().to_string();
+                if let Some(rest) = line.strip_prefix("event:") {
+                    event_type = rest.trim().to_string();
+                } else if let Some(rest) = line.strip_prefix("data:") {
+                    data_buf = rest.trim().to_string();
                 } else if line.is_empty() {
                     if event_type == "inbound" && !data_buf.is_empty() {
                         if let Ok(msg) = serde_json::from_str::<Value>(&data_buf) {
@@ -616,5 +616,158 @@ fn mcp_connect_host() -> String {
         "127.0.0.1".to_string()
     } else {
         bind
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // -----------------------------------------------------------------------
+    // extract_display_text
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_display_text_returns_text_for_text_message() {
+        let msg = json!({ "content": { "Text": "hello world" } });
+        assert_eq!(extract_display_text(&msg), "hello world");
+    }
+
+    #[test]
+    fn extract_display_text_returns_bracketed_kind_for_media_without_caption() {
+        for kind in &["Image", "Video", "Audio", "Document", "Sticker"] {
+            let mut content = serde_json::Map::new();
+            content.insert(kind.to_string(), json!({}));
+            let msg = json!({ "content": content });
+            let expected = format!("[{}]", kind.to_lowercase());
+            assert_eq!(extract_display_text(&msg), expected, "failed for kind {kind}");
+        }
+    }
+
+    #[test]
+    fn extract_display_text_includes_caption_when_present() {
+        let msg = json!({ "content": { "Image": { "caption": "a sunset" } } });
+        assert_eq!(extract_display_text(&msg), "[image] a sunset");
+    }
+
+    #[test]
+    fn extract_display_text_returns_reaction_with_emoji() {
+        let msg = json!({ "content": { "Reaction": { "emoji": "👍" } } });
+        assert_eq!(extract_display_text(&msg), "[reaction: 👍]");
+    }
+
+    #[test]
+    fn extract_display_text_returns_poll_with_question() {
+        let msg = json!({ "content": { "PollCreated": { "question": "Best language?" } } });
+        assert_eq!(extract_display_text(&msg), "[poll: Best language?]");
+    }
+
+    #[test]
+    fn extract_display_text_returns_location_placeholder() {
+        let msg = json!({ "content": { "Location": {} } });
+        assert_eq!(extract_display_text(&msg), "[location]");
+    }
+
+    #[test]
+    fn extract_display_text_returns_contact_with_name() {
+        let msg = json!({ "content": { "Contact": { "display_name": "Alice" } } });
+        assert_eq!(extract_display_text(&msg), "[contact: Alice]");
+    }
+
+    #[test]
+    fn extract_display_text_returns_empty_when_no_content() {
+        let msg = json!({ "jid": "123@s.whatsapp.net" });
+        assert_eq!(extract_display_text(&msg), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_channel_notification
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_channel_notification_sets_jsonrpc_method() {
+        let msg = json!({
+            "jid": "1234@s.whatsapp.net",
+            "sender": "1234@s.whatsapp.net",
+            "id": "MSGID",
+            "timestamp": 1700000000i64,
+            "is_from_me": false,
+            "is_group": false,
+            "content": { "Text": "hi" }
+        });
+        let notif = build_channel_notification(&msg);
+        assert_eq!(notif["jsonrpc"], "2.0");
+        assert_eq!(notif["method"], "notifications/claude/channel");
+    }
+
+    #[test]
+    fn build_channel_notification_sets_individual_chat_type_for_dm() {
+        let msg = json!({
+            "jid": "1234@s.whatsapp.net",
+            "sender": "1234@s.whatsapp.net",
+            "id": "X",
+            "timestamp": 0i64,
+            "is_from_me": false,
+            "is_group": false,
+            "content": { "Text": "dm" }
+        });
+        let notif = build_channel_notification(&msg);
+        assert_eq!(notif["params"]["meta"]["chat_type"], "individual");
+    }
+
+    #[test]
+    fn build_channel_notification_sets_group_chat_type_for_group() {
+        let msg = json!({
+            "jid": "group@g.us",
+            "sender": "1234@s.whatsapp.net",
+            "id": "X",
+            "timestamp": 0i64,
+            "is_from_me": false,
+            "is_group": true,
+            "content": { "Text": "group msg" }
+        });
+        let notif = build_channel_notification(&msg);
+        assert_eq!(notif["params"]["meta"]["chat_type"], "group");
+    }
+
+    #[test]
+    fn build_channel_notification_content_matches_display_text() {
+        let msg = json!({
+            "jid": "1234@s.whatsapp.net",
+            "sender": "1234@s.whatsapp.net",
+            "id": "X",
+            "timestamp": 0i64,
+            "is_from_me": false,
+            "is_group": false,
+            "content": { "Text": "hello" }
+        });
+        let notif = build_channel_notification(&msg);
+        assert_eq!(notif["params"]["content"], "hello");
+    }
+
+    // -----------------------------------------------------------------------
+    // mcp_connect_host
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mcp_connect_host_maps_wildcard_to_loopback() {
+        std::env::set_var("WHATSRUST_BIND", "0.0.0.0");
+        assert_eq!(mcp_connect_host(), "127.0.0.1");
+        std::env::remove_var("WHATSRUST_BIND");
+    }
+
+    #[test]
+    fn mcp_connect_host_maps_ipv6_wildcard_to_loopback() {
+        std::env::set_var("WHATSRUST_BIND", "::");
+        assert_eq!(mcp_connect_host(), "127.0.0.1");
+        std::env::remove_var("WHATSRUST_BIND");
+    }
+
+    #[test]
+    fn mcp_connect_host_preserves_specific_bind_address() {
+        std::env::set_var("WHATSRUST_BIND", "192.168.1.10");
+        assert_eq!(mcp_connect_host(), "192.168.1.10");
+        std::env::remove_var("WHATSRUST_BIND");
     }
 }

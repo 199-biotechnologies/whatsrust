@@ -142,6 +142,12 @@ pub struct BridgeMetrics {
     pub last_outbound_epoch: AtomicU64,
 }
 
+impl Default for BridgeMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BridgeMetrics {
     pub fn new() -> Self {
         Self {
@@ -760,9 +766,9 @@ impl BoundedMsgCache {
     }
 
     fn insert(&mut self, id: String, msg: Box<wa::Message>) {
-        if self.map.contains_key(&id) {
+        if let std::collections::hash_map::Entry::Occupied(mut e) = self.map.entry(id.clone()) {
             // Already cached — update in place, don't grow order
-            self.map.insert(id, msg);
+            e.insert(msg);
             return;
         }
         while self.map.len() >= self.capacity {
@@ -776,6 +782,7 @@ impl BoundedMsgCache {
         self.map.insert(id, msg);
     }
 
+    #[allow(clippy::borrowed_box)]
     fn get(&self, id: &str) -> Option<&Box<wa::Message>> {
         self.map.get(id)
     }
@@ -887,7 +894,7 @@ impl WhatsAppBridge {
     }
 
     /// Send a text message with a link preview card.
-    #[allow(dead_code)] // Public API for library consumers
+    #[allow(dead_code, clippy::too_many_arguments)] // Public API for library consumers
     pub async fn send_message_with_preview(
         &self,
         jid: &str,
@@ -2236,7 +2243,7 @@ async fn run_bot_session(
                 }
             }
         }
-        _ = handle_outbound(&client_handle, cancel, store, config.max_outbound_retries, metrics, send_pacer, outbound_notify, event_tx) => {
+        _ = handle_outbound(client_handle, cancel, store, config.max_outbound_retries, metrics, send_pacer, outbound_notify, event_tx) => {
             if cancel.is_cancelled() || stop_reconnect.load(Ordering::Relaxed) {
                 Ok(SessionAction::Stop)
             } else {
@@ -2249,7 +2256,7 @@ async fn run_bot_session(
 
             // Drain: attempt to send queued jobs if we still have a connection
             let drain_result = tokio::time::timeout(drain_timeout, async {
-                if let Some(client) = get_client_handle(&client_handle) {
+                if let Some(client) = get_client_handle(client_handle) {
                     let mut sent = 0u32;
                     while let Ok(Some(row)) = store.claim_next_job().await {
                         let jid = match parse_jid(&row.jid) {
@@ -2288,7 +2295,7 @@ async fn run_bot_session(
 
             if drain_result.is_err() {
                 warn!(timeout_secs = config.drain_timeout_secs, "shutdown drain timed out");
-                if let Some(client) = get_client_handle(&client_handle) {
+                if let Some(client) = get_client_handle(client_handle) {
                     client.disconnect().await;
                 }
             }
@@ -2673,7 +2680,7 @@ async fn handle_event(
             );
 
             // Update delivery status for queued jobs by WA message ID
-            let status_str = serde_json::to_value(&status)
+            let status_str = serde_json::to_value(status)
                 .ok()
                 .and_then(|v| v.as_str().map(|s| s.to_string()))
                 .unwrap_or_else(|| format!("{status:?}").to_lowercase());
@@ -3530,6 +3537,7 @@ async fn resolve_sender(sender_raw: &str, sender_alt: Option<&wacore_binary::jid
 // Outbound message handling
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_outbound(
     client_handle: &Arc<ParkingMutex<Option<Arc<Client>>>>,
     cancel: &CancellationToken,
