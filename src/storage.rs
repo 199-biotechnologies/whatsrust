@@ -1746,7 +1746,7 @@ impl ProtocolStore for Store {
                 )
                 .optional()
                 .map_err(db_err)?;
-            Ok(stored.map_or(false, |s| s == cbk))
+            Ok(stored.is_some_and(|s| s == cbk))
         })
         .await
     }

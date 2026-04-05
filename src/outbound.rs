@@ -89,7 +89,7 @@ impl OutboundOpKind {
 
     /// Deprecated: use `parse_str()` or `.parse::<OutboundOpKind>()` instead.
     #[deprecated(note = "use parse_str() or .parse::<OutboundOpKind>() (FromStr) instead")]
-    #[allow(dead_code)]
+    #[allow(dead_code, clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         Self::parse_str(s)
     }
@@ -286,7 +286,7 @@ fn parse_recipient_jids(recipients: &[String]) -> anyhow::Result<Vec<wacore_bina
     recipients
         .iter()
         .map(|r| {
-            let normalized = r.trim().replace('+', "").replace(' ', "").replace('-', "");
+            let normalized = r.trim().replace(['+', ' ', '-'], "");
             wacore_binary::jid::Jid::from_str(&format!("{normalized}@s.whatsapp.net"))
                 .map_err(|e| anyhow::anyhow!("bad recipient JID '{r}': {e}"))
         })

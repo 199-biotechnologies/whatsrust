@@ -1,0 +1,197 @@
+[2m2026-04-05T04:02:17.093225Z[0m [32m INFO[0m [2mwhatsrust[0m[2m:[0m whatsrust v0.3.0
+[2m2026-04-05T04:02:17.093370Z[0m [32m INFO[0m [2mwhatsrust[0m[2m:[0m sender allowlist active [3mallowed[0m[2m=[0m["84949764200", "85295155050", "85254284261", "14159000264", "120363406674111320", "120363401793588075", "120363422422191807", "120363425637859297", "120363422485699740", "120363400316788731", "120363108273613941", "120363407178910362", "120363405318981374"]
+[2m2026-04-05T04:02:17.094597Z[0m [32m INFO[0m [2mwhatsrust[0m[2m:[0m session lock acquired [3mlock[0m[2m=[0mwhatsapp.db.instance.lock
+[2m2026-04-05T04:02:17.097145Z[0m [32m INFO[0m [2mwhatsrust[0m[2m:[0m bridge started, state: Disconnected
+[2m2026-04-05T04:02:17.097165Z[0m [32m INFO[0m [2mwhatsrust::bridge[0m[2m:[0m WhatsApp bridge starting
+[2m2026-04-05T04:02:17.097216Z[0m [32m INFO[0m [2mwhatsrust[0m[2m:[0m waiting for WhatsApp connection (scan QR code or enter pair code)...
+Commands:
+  send <jid> <message>           — send text (prints msg ID)
+  reply <jid> <id> <sender> <msg>— reply quoting a message
+[2m2026-04-05T04:02:17.097393Z[0m [32m INFO[0m [2mwhatsrust::api[0m[2m:[0m API server listening [3mbind[0m[2m=[0m127.0.0.1 [3mport[0m[2m=[0m7270
+  edit <jid> <id> <new text>     — edit a sent message
+  react <jid> <id> <emoji> [from_me] [sender_jid] — react to a message
+  unreact <jid> <id> [from_me] [sender_jid] — remove a reaction
+  revoke <jid> <id>              — delete a message for everyone
+  image <jid> <path>             — send an image file
+  audio <jid> <path>             — send audio as voice note
+  video <jid> <path>             — send a video file
+  doc <jid> <path>               — send a document/file
+  sticker <jid> <path>           — send a WebP sticker
+  location <jid> <lat> <lon>     — send a location pin
+  contact <jid> <name> <phone>   — send a contact card
+  forward <jid> <msg_id>         — forward a cached message (fwd)
+  vo-image <jid> <path> [cap]    — send view-once image
+  vo-video <jid> <path> [cap]    — send view-once video
+  poll <jid> <N> <Q> | opt | ... — create a poll (N = selectable count)
+  subscribe <jid>                — subscribe to contact presence
+  typing <jid>                   — show typing indicator
+  stop-typing <jid>              — cancel typing indicator
+  recording <jid>                — show recording indicator
+  stop-recording <jid>           — cancel recording indicator
+  status                         — show bridge state
+  quit                           — shut down
+
+[2m2026-04-05T04:02:17.115762Z[0m [32m INFO[0m [2mwhatsrust::bridge[0m[2m:[0m startup backup complete [3mpath[0m[2m=[0mwhatsapp.db.backups/whatsapp_backup_1775361737.db
+[2m2026-04-05T04:02:17.117420Z[0m [32m INFO[0m [2mwhatsapp_rust::bot[0m[2m:[0m Applying device props override: os=Some("Habb"), version=None, platform_type=None
+[2m2026-04-05T04:02:17.117467Z[0m [32m INFO[0m [2mwhatsapp_rust::bot[0m[2m:[0m Creating client...
+[2m2026-04-05T04:02:17.845016Z[0m [32m INFO[0m [2mwhatsapp_rust::handshake[0m[2m:[0m Handshake complete, switching to encrypted communication
+[2m2026-04-05T04:02:18.150233Z[0m [32m INFO[0m [2mwhatsapp_rust::client[0m[2m:[0m Successfully authenticated with WhatsApp servers! (gen=1)
+[2m2026-04-05T04:02:19.289229Z[0m [32m INFO[0m [2mwhatsrust::bridge[0m[2m:[0m offline sync completed — real-time messages active [3mcount[0m[2m=[0m0
+[2m2026-04-05T04:02:19.289387Z[0m [32m INFO[0m [2mwhatsrust::bridge[0m[2m:[0m WhatsApp connected
+[2m2026-04-05T04:02:58.085258Z[0m [32m INFO[0m [2mwhatsrust::bridge[0m[2m:[0m delivery receipt [3mreceipt_type[0m[2m=[0mDelivered [3mstatus[0m[2m=[0mDelivered [3mmessage_count[0m[2m=[0m1 [3mchat[0m[2m=[0m85254284261@s.whatsapp.net [3msender[0m[2m=[0m85254284261
+
+<< [85254284261@s.whatsapp.net] 85254284261 (delivery-receipt): [receipt: delivered for 1 message(s)]
+> [2m2026-04-05T04:02:59.212883Z[0m [32m INFO[0m [2mwhatsrust::bridge[0m[2m:[0m delivery receipt [3mreceipt_type[0m[2m=[0mSender [3mstatus[0m[2m=[0mSent [3mmessage_count[0m[2m=[0m1 [3mchat[0m[2m=[0m84949764200@s.whatsapp.net [3msender[0m[2m=[0m84949764200
+
+<< [84949764200@s.whatsapp.net] 84949764200 (delivery-receipt): [receipt: sent for 1 message(s)]
+> [2m2026-04-05T04:03:00.133456Z[0m [32m INFO[0m [2mwhatsrust::bridge[0m[2m:[0m delivery receipt [3mreceipt_type[0m[2m=[0mRead [3mstatus[0m[2m=[0mRead [3mmessage_count[0m[2m=[0m1 [3mchat[0m[2m=[0m85254284261@s.whatsapp.net [3msender[0m[2m=[0m85254284261
+
+<< [85254284261@s.whatsapp.net] 85254284261 (delivery-receipt): [receipt: read for 1 message(s)]
+> [2m2026-04-05T04:07:23.293974Z[0m [32m INFO[0m [2mwhatsrust[0m[2m:[0m SIGTERM received
+[2m2026-04-05T04:07:23.294023Z[0m [32m INFO[0m [2mwhatsrust[0m[2m:[0m shutting down...
+[2m2026-04-05T04:07:23.294109Z[0m [32m INFO[0m [2mwhatsrust::bridge[0m[2m:[0m bridge shutdown requested — draining in-flight operations
+[2m2026-04-05T04:07:23.294297Z[0m [32m INFO[0m [2mwhatsapp_rust::client[0m[2m:[0m Disconnecting client intentionally.
+[2m2026-04-05T04:07:23.294401Z[0m [32m INFO[0m [2mwhatsrust::bridge[0m[2m:[0m graceful shutdown complete
+[2m2026-04-05T04:07:23.308665Z[0m [32m INFO[0m [2mwhatsrust::bridge[0m[2m:[0m shutdown backup complete [3mpath[0m[2m=[0mwhatsapp.db.backups/whatsapp_backup_1775362043.db
+[2m2026-04-05T04:07:23.308699Z[0m [32m INFO[0m [2mwhatsrust::bridge[0m[2m:[0m WhatsApp bridge stopped
+[2m2026-04-05T04:07:23.318894Z[0m [32m INFO[0m [2mwhatsrust[0m[2m:[0m whatsrust v0.3.0
+[2m2026-04-05T04:07:23.318941Z[0m [32m INFO[0m [2mwhatsrust[0m[2m:[0m sender allowlist active [3mallowed[0m[2m=[0m["84949764200", "85295155050", "85254284261", "14159000264", "120363406674111320", "120363401793588075", "120363422422191807", "120363425637859297", "120363422485699740", "120363400316788731", "120363108273613941", "120363407178910362", "120363405318981374"]
+[2m2026-04-05T04:07:23.319963Z[0m [32m INFO[0m [2mwhatsrust[0m[2m:[0m session lock acquired [3mlock[0m[2m=[0mwhatsapp.db.instance.lock
+[2m2026-04-05T04:07:23.322877Z[0m [32m INFO[0m [2mwhatsrust[0m[2m:[0m bridge started, state: Disconnected
+[2m2026-04-05T04:07:23.322907Z[0m [32m INFO[0m [2mwhatsrust[0m[2m:[0m waiting for WhatsApp connection (scan QR code or enter pair code)...
+[2m2026-04-05T04:07:23.322906Z[0m [32m INFO[0m [2mwhatsrust::bridge[0m[2m:[0m WhatsApp bridge starting
+Commands:
+  send <jid> <message>           — send text (prints msg ID)
+  reply <jid> <id> <sender> <msg>— reply quoting a message
+  edit <jid> <id> <new text>     — edit a sent message
+  react <jid> <id> <emoji> [from_me] [sender_jid] — react to a message
+  unreact <jid> <id> [from_me] [sender_jid] — remove a reaction
+  revoke <jid> <id>              — delete a message for everyone
+  image <jid> <path>             — send an image file
+[2m2026-04-05T04:07:23.322969Z[0m [32m INFO[0m [2mwhatsrust::api[0m[2m:[0m API server listening [3mbind[0m[2m=[0m127.0.0.1 [3mport[0m[2m=[0m7270
+  audio <jid> <path>             — send audio as voice note
+  video <jid> <path>             — send a video file
+  doc <jid> <path>               — send a document/file
+  sticker <jid> <path>           — send a WebP sticker
+  location <jid> <lat> <lon>     — send a location pin
+  contact <jid> <name> <phone>   — send a contact card
+  forward <jid> <msg_id>         — forward a cached message (fwd)
+  vo-image <jid> <path> [cap]    — send view-once image
+  vo-video <jid> <path> [cap]    — send view-once video
+  poll <jid> <N> <Q> | opt | ... — create a poll (N = selectable count)
+  subscribe <jid>                — subscribe to contact presence
+  typing <jid>                   — show typing indicator
+  stop-typing <jid>              — cancel typing indicator
+  recording <jid>                — show recording indicator
+  stop-recording <jid>           — cancel recording indicator
+  status                         — show bridge state
+  quit                           — shut down
+
+[2m2026-04-05T04:07:23.339054Z[0m [32m INFO[0m [2mwhatsrust::bridge[0m[2m:[0m startup backup complete [3mpath[0m[2m=[0mwhatsapp.db.backups/whatsapp_backup_1775362043.db
+[2m2026-04-05T04:07:23.339649Z[0m [32m INFO[0m [2mwhatsapp_rust::bot[0m[2m:[0m Applying device props override: os=Some("Habb"), version=None, platform_type=None
+[2m2026-04-05T04:07:23.339684Z[0m [32m INFO[0m [2mwhatsapp_rust::bot[0m[2m:[0m Creating client...
+[2m2026-04-05T04:07:24.267182Z[0m [32m INFO[0m [2mwhatsapp_rust::handshake[0m[2m:[0m Handshake complete, switching to encrypted communication
+[2m2026-04-05T04:07:24.523985Z[0m [32m INFO[0m [2mwhatsapp_rust::client[0m[2m:[0m Successfully authenticated with WhatsApp servers! (gen=1)
+[2m2026-04-05T04:07:25.139515Z[0m [32m INFO[0m [2mwhatsrust::bridge[0m[2m:[0m offline sync completed — real-time messages active [3mcount[0m[2m=[0m0
+[2m2026-04-05T04:07:25.139562Z[0m [32m INFO[0m [2mwhatsrust::bridge[0m[2m:[0m WhatsApp connected
+[2m2026-04-05T04:12:50.071371Z[0m [32m INFO[0m [2mwhatsrust[0m[2m:[0m SIGTERM received
+[2m2026-04-05T04:12:50.073581Z[0m [32m INFO[0m [2mwhatsrust::bridge[0m[2m:[0m bridge shutdown requested — draining in-flight operations
+[2m2026-04-05T04:12:50.073739Z[0m [32m INFO[0m [2mwhatsrust[0m[2m:[0m shutting down...
+[2m2026-04-05T04:12:50.073963Z[0m [32m INFO[0m [2mwhatsapp_rust::client[0m[2m:[0m Disconnecting client intentionally.
+[2m2026-04-05T04:12:50.074055Z[0m [32m INFO[0m [2mwhatsrust::bridge[0m[2m:[0m graceful shutdown complete
+[2m2026-04-05T04:12:50.088320Z[0m [32m INFO[0m [2mwhatsrust::bridge[0m[2m:[0m shutdown backup complete [3mpath[0m[2m=[0mwhatsapp.db.backups/whatsapp_backup_1775362370.db
+[2m2026-04-05T04:12:50.088376Z[0m [32m INFO[0m [2mwhatsrust::bridge[0m[2m:[0m WhatsApp bridge stopped
+[2m2026-04-05T04:12:50.103043Z[0m [32m INFO[0m [2mwhatsrust[0m[2m:[0m whatsrust v0.3.0
+[2m2026-04-05T04:12:50.103089Z[0m [32m INFO[0m [2mwhatsrust[0m[2m:[0m sender allowlist active [3mallowed[0m[2m=[0m["84949764200", "85295155050", "85254284261", "14159000264", "120363406674111320", "120363401793588075", "120363422422191807", "120363425637859297", "120363422485699740", "120363400316788731", "120363108273613941", "120363407178910362", "120363405318981374"]
+[2m2026-04-05T04:12:50.104139Z[0m [32m INFO[0m [2mwhatsrust[0m[2m:[0m session lock acquired [3mlock[0m[2m=[0mwhatsapp.db.instance.lock
+[2m2026-04-05T04:12:50.106600Z[0m [32m INFO[0m [2mwhatsrust[0m[2m:[0m bridge started, state: Disconnected
+[2m2026-04-05T04:12:50.106794Z[0m [32m INFO[0m [2mwhatsrust[0m[2m:[0m waiting for WhatsApp connection (scan QR code or enter pair code)...
+[2m2026-04-05T04:12:50.106700Z[0m [32m INFO[0m [2mwhatsrust::bridge[0m[2m:[0m WhatsApp bridge starting
+[2m2026-04-05T04:12:50.107148Z[0m [32m INFO[0m [2mwhatsrust::api[0m[2m:[0m API server listening [3mbind[0m[2m=[0m127.0.0.1 [3mport[0m[2m=[0m7270
+Commands:
+  send <jid> <message>           — send text (prints msg ID)
+  reply <jid> <id> <sender> <msg>— reply quoting a message
+  edit <jid> <id> <new text>     — edit a sent message
+  react <jid> <id> <emoji> [from_me] [sender_jid] — react to a message
+  unreact <jid> <id> [from_me] [sender_jid] — remove a reaction
+  revoke <jid> <id>              — delete a message for everyone
+  image <jid> <path>             — send an image file
+  audio <jid> <path>             — send audio as voice note
+  video <jid> <path>             — send a video file
+  doc <jid> <path>               — send a document/file
+  sticker <jid> <path>           — send a WebP sticker
+  location <jid> <lat> <lon>     — send a location pin
+  contact <jid> <name> <phone>   — send a contact card
+  forward <jid> <msg_id>         — forward a cached message (fwd)
+  vo-image <jid> <path> [cap]    — send view-once image
+  vo-video <jid> <path> [cap]    — send view-once video
+  poll <jid> <N> <Q> | opt | ... — create a poll (N = selectable count)
+  subscribe <jid>                — subscribe to contact presence
+  typing <jid>                   — show typing indicator
+  stop-typing <jid>              — cancel typing indicator
+  recording <jid>                — show recording indicator
+  stop-recording <jid>           — cancel recording indicator
+  status                         — show bridge state
+  quit                           — shut down
+
+[2m2026-04-05T04:12:50.124671Z[0m [32m INFO[0m [2mwhatsrust::bridge[0m[2m:[0m startup backup complete [3mpath[0m[2m=[0mwhatsapp.db.backups/whatsapp_backup_1775362370.db
+[2m2026-04-05T04:12:50.125548Z[0m [32m INFO[0m [2mwhatsapp_rust::bot[0m[2m:[0m Applying device props override: os=Some("Habb"), version=None, platform_type=None
+[2m2026-04-05T04:12:50.125593Z[0m [32m INFO[0m [2mwhatsapp_rust::bot[0m[2m:[0m Creating client...
+[2m2026-04-05T04:12:50.764828Z[0m [32m INFO[0m [2mwhatsapp_rust::handshake[0m[2m:[0m Handshake complete, switching to encrypted communication
+[2m2026-04-05T04:12:51.070630Z[0m [32m INFO[0m [2mwhatsapp_rust::client[0m[2m:[0m Successfully authenticated with WhatsApp servers! (gen=1)
+[2m2026-04-05T04:12:51.892516Z[0m [32m INFO[0m [2mwhatsrust::bridge[0m[2m:[0m offline sync completed — real-time messages active [3mcount[0m[2m=[0m0
+[2m2026-04-05T04:12:51.892644Z[0m [32m INFO[0m [2mwhatsrust::bridge[0m[2m:[0m WhatsApp connected
+[2m2026-04-05T04:16:56.228316Z[0m [32m INFO[0m [2mwhatsrust[0m[2m:[0m SIGTERM received
+[2m2026-04-05T04:16:56.228374Z[0m [32m INFO[0m [2mwhatsrust[0m[2m:[0m shutting down...
+[2m2026-04-05T04:16:56.242655Z[0m [32m INFO[0m [2mwhatsrust::bridge[0m[2m:[0m shutdown backup complete [3mpath[0m[2m=[0mwhatsapp.db.backups/whatsapp_backup_1775362616.db
+[2m2026-04-05T04:16:56.242777Z[0m [32m INFO[0m [2mwhatsrust::bridge[0m[2m:[0m WhatsApp bridge stopped
+[2m2026-04-05T04:16:56.257313Z[0m [32m INFO[0m [2mwhatsrust[0m[2m:[0m whatsrust v0.3.0
+[2m2026-04-05T04:16:56.257355Z[0m [32m INFO[0m [2mwhatsrust[0m[2m:[0m sender allowlist active [3mallowed[0m[2m=[0m["84949764200", "85295155050", "85254284261", "14159000264", "120363406674111320", "120363401793588075", "120363422422191807", "120363425637859297", "120363422485699740", "120363400316788731", "120363108273613941", "120363407178910362", "120363405318981374"]
+[2m2026-04-05T04:16:56.258436Z[0m [32m INFO[0m [2mwhatsrust[0m[2m:[0m session lock acquired [3mlock[0m[2m=[0mwhatsapp.db.instance.lock
+[2m2026-04-05T04:16:56.261460Z[0m [32m INFO[0m [2mwhatsrust[0m[2m:[0m bridge started, state: Disconnected
+[2m2026-04-05T04:16:56.261481Z[0m [32m INFO[0m [2mwhatsrust[0m[2m:[0m waiting for WhatsApp connection (scan QR code or enter pair code)...
+[2m2026-04-05T04:16:56.261478Z[0m [32m INFO[0m [2mwhatsrust::bridge[0m[2m:[0m WhatsApp bridge starting
+[2m2026-04-05T04:16:56.261537Z[0m [32m INFO[0m [2mwhatsrust::api[0m[2m:[0m API server listening [3mbind[0m[2m=[0m127.0.0.1 [3mport[0m[2m=[0m7270
+Commands:
+  send <jid> <message>           — send text (prints msg ID)
+  reply <jid> <id> <sender> <msg>— reply quoting a message
+  edit <jid> <id> <new text>     — edit a sent message
+  react <jid> <id> <emoji> [from_me] [sender_jid] — react to a message
+  unreact <jid> <id> [from_me] [sender_jid] — remove a reaction
+  revoke <jid> <id>              — delete a message for everyone
+  image <jid> <path>             — send an image file
+  audio <jid> <path>             — send audio as voice note
+  video <jid> <path>             — send a video file
+  doc <jid> <path>               — send a document/file
+  sticker <jid> <path>           — send a WebP sticker
+  location <jid> <lat> <lon>     — send a location pin
+  contact <jid> <name> <phone>   — send a contact card
+  forward <jid> <msg_id>         — forward a cached message (fwd)
+  vo-image <jid> <path> [cap]    — send view-once image
+  vo-video <jid> <path> [cap]    — send view-once video
+  poll <jid> <N> <Q> | opt | ... — create a poll (N = selectable count)
+  subscribe <jid>                — subscribe to contact presence
+  typing <jid>                   — show typing indicator
+  stop-typing <jid>              — cancel typing indicator
+  recording <jid>                — show recording indicator
+  stop-recording <jid>           — cancel recording indicator
+  status                         — show bridge state
+  quit                           — shut down
+
+[2m2026-04-05T04:16:56.277697Z[0m [32m INFO[0m [2mwhatsrust::bridge[0m[2m:[0m startup backup complete [3mpath[0m[2m=[0mwhatsapp.db.backups/whatsapp_backup_1775362616.db
+[2m2026-04-05T04:16:56.278289Z[0m [32m INFO[0m [2mwhatsapp_rust::bot[0m[2m:[0m Applying device props override: os=Some("Habb"), version=None, platform_type=None
+[2m2026-04-05T04:16:56.278315Z[0m [32m INFO[0m [2mwhatsapp_rust::bot[0m[2m:[0m Creating client...
+[2m2026-04-05T04:16:57.030650Z[0m [32m INFO[0m [2mwhatsapp_rust::handshake[0m[2m:[0m Handshake complete, switching to encrypted communication
+[2m2026-04-05T04:16:57.337459Z[0m [32m INFO[0m [2mwhatsapp_rust::client[0m[2m:[0m Successfully authenticated with WhatsApp servers! (gen=1)
+[2m2026-04-05T04:16:58.430929Z[0m [32m INFO[0m [2mwhatsrust::bridge[0m[2m:[0m offline sync completed — real-time messages active [3mcount[0m[2m=[0m0
+[2m2026-04-05T04:16:58.431058Z[0m [32m INFO[0m [2mwhatsrust::bridge[0m[2m:[0m WhatsApp connected
+[2m2026-04-05T04:17:10.239536Z[0m [32m INFO[0m [2mwhatsrust::bridge[0m[2m:[0m delivery receipt [3mreceipt_type[0m[2m=[0mDelivered [3mstatus[0m[2m=[0mDelivered [3mmessage_count[0m[2m=[0m1 [3mchat[0m[2m=[0m85254284261@s.whatsapp.net [3msender[0m[2m=[0m85254284261
+
+<< [85254284261@s.whatsapp.net] 85254284261 (delivery-receipt): [receipt: delivered for 1 message(s)]
+> [2m2026-04-05T04:17:10.548799Z[0m [32m INFO[0m [2mwhatsrust::bridge[0m[2m:[0m delivery receipt [3mreceipt_type[0m[2m=[0mSender [3mstatus[0m[2m=[0mSent [3mmessage_count[0m[2m=[0m1 [3mchat[0m[2m=[0m84949764200@s.whatsapp.net [3msender[0m[2m=[0m84949764200
+
+<< [84949764200@s.whatsapp.net] 84949764200 (delivery-receipt): [receipt: sent for 1 message(s)]
+> [2m2026-04-05T04:17:12.702311Z[0m [32m INFO[0m [2mwhatsrust::bridge[0m[2m:[0m delivery receipt [3mreceipt_type[0m[2m=[0mRead [3mstatus[0m[2m=[0mRead [3mmessage_count[0m[2m=[0m1 [3mchat[0m[2m=[0m85254284261@s.whatsapp.net [3msender[0m[2m=[0m85254284261
+
+<< [85254284261@s.whatsapp.net] 85254284261 (delivery-receipt): [receipt: read for 1 message(s)]
+> [2m2026-04-05T04:27:13.983382Z[0m [32m INFO[0m [2mwhatsapp_rust::client[0m[2m:[0m Received ping, sending pong.

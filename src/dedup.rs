@@ -93,6 +93,12 @@ impl AtomicDedupCache {
     pub fn len(&self) -> usize {
         self.map.len()
     }
+
+    /// Returns true if the cache contains no entries.
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
 }
 
 #[cfg(test)]
