@@ -3,8 +3,14 @@
 //! Proxies tool calls to the running whatsrust daemon via its HTTP API.
 //! Start with `whatsrust mcp` — typically invoked by Claude Code or other
 //! MCP-compatible AI tool harnesses.
+//!
+//! ## Channel support
+//! When the daemon's SSE stream (`GET /api/events`) emits an `inbound` event,
+//! this server pushes a `notifications/claude/channel` notification to Claude Code
+//! so incoming WhatsApp messages arrive in the session automatically.
 
 use std::io::{BufRead, Write};
+use std::sync::mpsc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -12,11 +18,26 @@ use serde_json::{json, Value};
 /// Run the MCP server on stdin/stdout. Blocks until EOF.
 pub fn run_mcp_server(port: u16) {
     let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    let mut stdout = stdout.lock();
 
-    // Send server info on startup (initialize handshake)
-    // MCP clients send initialize first, but we also need to be ready to handle it.
+    // All stdout writes go through this channel so both the stdin handler and
+    // the SSE forwarder can write without needing stdout to be Send.
+    let (write_tx, write_rx) = mpsc::channel::<String>();
+
+    // Writer thread: owns stdout and flushes every line immediately.
+    {
+        let write_tx_sse = write_tx.clone();
+        // SSE forwarder — sends notifications directly to the writer.
+        std::thread::spawn(move || {
+            sse_channel_forwarder(port, write_tx_sse);
+        });
+    }
+    std::thread::spawn(move || {
+        let mut stdout = std::io::stdout();
+        for line in write_rx {
+            let _ = writeln!(stdout, "{line}");
+            let _ = stdout.flush();
+        }
+    });
 
     for line in stdin.lock().lines() {
         let line = match line {
@@ -30,7 +51,7 @@ pub fn run_mcp_server(port: u16) {
             Ok(r) => r,
             Err(e) => {
                 let err = json_rpc_error(Value::Null, -32700, &format!("parse error: {e}"));
-                let _ = writeln!(stdout, "{}", serde_json::to_string(&err).unwrap());
+                let _ = write_tx.send(serde_json::to_string(&err).unwrap());
                 continue;
             }
         };
@@ -39,10 +60,157 @@ pub fn run_mcp_server(port: u16) {
         let is_notification = req.id.is_null() || req.method.starts_with("notifications/");
         let response = handle_rpc(&req, port);
         if !is_notification {
-            let _ = writeln!(stdout, "{}", serde_json::to_string(&response).unwrap());
-            let _ = stdout.flush();
+            let _ = write_tx.send(serde_json::to_string(&response).unwrap());
         }
     }
+}
+
+/// Connects to the daemon's SSE stream and forwards every `inbound` event to
+/// Claude Code as a `notifications/claude/channel` notification.
+/// Reconnects with backoff on disconnect (daemon restart, network hiccup, etc.).
+fn sse_channel_forwarder(port: u16, tx: mpsc::Sender<String>) {
+    use std::io::BufRead;
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let mut backoff = Duration::from_secs(1);
+
+    loop {
+        if let Ok(stream) = TcpStream::connect(("127.0.0.1", port)) {
+            // Send HTTP GET /api/events request
+            {
+                use std::io::Write as _;
+                let mut s = stream.try_clone().unwrap();
+                let req = format!(
+                    "GET /api/events HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: text/event-stream\r\nConnection: keep-alive\r\n\r\n"
+                );
+                if s.write_all(req.as_bytes()).is_err() {
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                    continue;
+                }
+            }
+
+            backoff = Duration::from_secs(1); // reset on successful connect
+            let reader = std::io::BufReader::new(stream);
+            let mut past_headers = false;
+            let mut event_type = String::new();
+            let mut data_buf = String::new();
+
+            for line in reader.lines() {
+                let line = match line {
+                    Ok(l) => l,
+                    Err(_) => break,
+                };
+
+                // Skip HTTP response headers
+                if !past_headers {
+                    if line.is_empty() { past_headers = true; }
+                    continue;
+                }
+
+                // SSE chunked transfer may prefix data length lines — skip hex lines
+                if line.chars().all(|c| c.is_ascii_hexdigit()) && !line.is_empty() {
+                    continue;
+                }
+
+                if line.starts_with("event:") {
+                    event_type = line[6..].trim().to_string();
+                } else if line.starts_with("data:") {
+                    data_buf = line[5..].trim().to_string();
+                } else if line.is_empty() {
+                    if event_type == "inbound" && !data_buf.is_empty() {
+                        if let Ok(msg) = serde_json::from_str::<Value>(&data_buf) {
+                            let notification = build_channel_notification(&msg);
+                            if let Ok(serialized) = serde_json::to_string(&notification) {
+                                if tx.send(serialized).is_err() {
+                                    return; // main thread gone, exit
+                                }
+                            }
+                        }
+                    }
+                    event_type.clear();
+                    data_buf.clear();
+                }
+            }
+        }
+
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(Duration::from_secs(30));
+    }
+}
+
+/// Build the `notifications/claude/channel` JSON-RPC notification for an inbound message.
+fn build_channel_notification(msg: &Value) -> Value {
+    let chat_jid = msg.get("jid").and_then(|v| v.as_str()).unwrap_or("");
+    let sender = msg.get("sender").and_then(|v| v.as_str()).unwrap_or("");
+    let message_id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    let timestamp = msg.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
+    let is_from_me = msg.get("is_from_me").and_then(|v| v.as_bool()).unwrap_or(false);
+    let is_group = msg.get("is_group").and_then(|v| v.as_bool()).unwrap_or(false);
+    let chat_type = if is_group { "group" } else { "individual" };
+
+    // Extract display text from content
+    let content = extract_display_text(msg);
+
+    json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/claude/channel",
+        "params": {
+            "content": content,
+            "meta": {
+                "chat_jid": chat_jid,
+                "sender": sender,
+                "message_id": message_id,
+                "timestamp": timestamp.to_string(),
+                "is_from_me": is_from_me.to_string(),
+                "chat_type": chat_type
+            }
+        }
+    })
+}
+
+/// Extract a human-readable string from the inbound message's content field.
+fn extract_display_text(msg: &Value) -> String {
+    if let Some(content) = msg.get("content") {
+        // Text message
+        if let Some(text) = content.get("Text").and_then(|v| v.as_str()) {
+            return text.to_string();
+        }
+        // Image/video/audio with caption
+        for kind in &["Image", "Video", "Audio", "Document", "Sticker"] {
+            if let Some(media) = content.get(kind) {
+                let caption = media.get("caption").and_then(|v| v.as_str()).unwrap_or("");
+                return if caption.is_empty() {
+                    format!("[{}]", kind.to_lowercase())
+                } else {
+                    format!("[{}] {}", kind.to_lowercase(), caption)
+                };
+            }
+        }
+        // Reaction
+        if let Some(reaction) = content.get("Reaction") {
+            let emoji = reaction.get("emoji").and_then(|v| v.as_str()).unwrap_or("?");
+            return format!("[reaction: {}]", emoji);
+        }
+        // Poll
+        if let Some(poll) = content.get("PollCreated") {
+            let question = poll.get("question").and_then(|v| v.as_str()).unwrap_or("poll");
+            return format!("[poll: {}]", question);
+        }
+        // Location
+        if content.get("Location").is_some() {
+            return "[location]".to_string();
+        }
+        // Contact
+        if let Some(contact) = content.get("Contact") {
+            let name = contact.get("display_name").and_then(|v| v.as_str()).unwrap_or("contact");
+            return format!("[contact: {}]", name);
+        }
+        // Fallback: serialize the whole content
+        return serde_json::to_string(content).unwrap_or_default();
+    }
+    String::new()
 }
 
 #[derive(Deserialize)]
@@ -83,11 +251,26 @@ fn handle_rpc(req: &JsonRpcRequest, port: u16) -> JsonRpcResponse {
     match req.method.as_str() {
         "initialize" => json_rpc_ok(req.id.clone(), json!({
             "protocolVersion": "2024-11-05",
-            "capabilities": { "tools": {} },
+            "capabilities": {
+                "tools": {},
+                "experimental": { "claude/channel": {} }
+            },
             "serverInfo": {
                 "name": "whatsrust",
                 "version": env!("CARGO_PKG_VERSION")
-            }
+            },
+            "instructions": "You are a WhatsApp bridge assistant.\n\
+                \n\
+                ## Incoming WhatsApp messages\n\
+                Messages arrive as <channel source=\"whatsrust\" chat_jid=\"...\" sender=\"...\" is_from_me=\"...\" chat_type=\"...\">.\n\
+                - If is_from_me=\"true\" — these are messages the owner sent themselves; ignore unless they are commands.\n\
+                - Otherwise: a new WhatsApp message has arrived. Read the chat_jid, sender, and content.\n\
+                \n\
+                ## Sending messages\n\
+                Use whatsrust_send to send a message. Always confirm with the owner before sending unless explicitly told to act autonomously.\n\
+                \n\
+                ## Getting context\n\
+                Call whatsrust_history with the chat_jid to read recent conversation before replying."
         })),
         "notifications/initialized" => json_rpc_ok(req.id.clone(), json!({})),
         "tools/list" => json_rpc_ok(req.id.clone(), json!({ "tools": tool_definitions() })),

@@ -2271,6 +2271,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "wacore"
 version = "0.5.0"
+source = "git+https://github.com/199-biotechnologies/whatsapp-rust?rev=9fb13a7bb1f91c3e32eccc517db2566068f15f33#9fb13a7bb1f91c3e32eccc517db2566068f15f33"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2312,6 +2313,7 @@ dependencies = [
 [[package]]
 name = "wacore-appstate"
 version = "0.5.0"
+source = "git+https://github.com/199-biotechnologies/whatsapp-rust?rev=9fb13a7bb1f91c3e32eccc517db2566068f15f33#9fb13a7bb1f91c3e32eccc517db2566068f15f33"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -2332,6 +2334,7 @@ dependencies = [
 [[package]]
 name = "wacore-binary"
 version = "0.5.0"
+source = "git+https://github.com/199-biotechnologies/whatsapp-rust?rev=9fb13a7bb1f91c3e32eccc517db2566068f15f33#9fb13a7bb1f91c3e32eccc517db2566068f15f33"
 dependencies = [
  "flate2",
  "phf",
@@ -2343,6 +2346,7 @@ dependencies = [
 [[package]]
 name = "wacore-derive"
 version = "0.5.0"
+source = "git+https://github.com/199-biotechnologies/whatsapp-rust?rev=9fb13a7bb1f91c3e32eccc517db2566068f15f33#9fb13a7bb1f91c3e32eccc517db2566068f15f33"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2352,6 +2356,7 @@ dependencies = [
 [[package]]
 name = "wacore-libsignal"
 version = "0.5.0"
+source = "git+https://github.com/199-biotechnologies/whatsapp-rust?rev=9fb13a7bb1f91c3e32eccc517db2566068f15f33#9fb13a7bb1f91c3e32eccc517db2566068f15f33"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2383,6 +2388,7 @@ dependencies = [
 [[package]]
 name = "wacore-noise"
 version = "0.5.0"
+source = "git+https://github.com/199-biotechnologies/whatsapp-rust?rev=9fb13a7bb1f91c3e32eccc517db2566068f15f33#9fb13a7bb1f91c3e32eccc517db2566068f15f33"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2401,6 +2407,7 @@ dependencies = [
 [[package]]
 name = "waproto"
 version = "0.5.0"
+source = "git+https://github.com/199-biotechnologies/whatsapp-rust?rev=9fb13a7bb1f91c3e32eccc517db2566068f15f33#9fb13a7bb1f91c3e32eccc517db2566068f15f33"
 dependencies = [
  "prost",
  "prost-build",
@@ -2522,6 +2529,7 @@ dependencies = [
 [[package]]
 name = "whatsapp-rust"
 version = "0.5.0"
+source = "git+https://github.com/199-biotechnologies/whatsapp-rust?rev=9fb13a7bb1f91c3e32eccc517db2566068f15f33#9fb13a7bb1f91c3e32eccc517db2566068f15f33"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -2553,6 +2561,7 @@ dependencies = [
 [[package]]
 name = "whatsapp-rust-tokio-transport"
 version = "0.5.0"
+source = "git+https://github.com/199-biotechnologies/whatsapp-rust?rev=9fb13a7bb1f91c3e32eccc517db2566068f15f33#9fb13a7bb1f91c3e32eccc517db2566068f15f33"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -2572,6 +2581,7 @@ dependencies = [
 [[package]]
 name = "whatsapp-rust-ureq-http-client"
 version = "0.5.0"
+source = "git+https://github.com/199-biotechnologies/whatsapp-rust?rev=9fb13a7bb1f91c3e32eccc517db2566068f15f33#9fb13a7bb1f91c3e32eccc517db2566068f15f33"
 dependencies = [
  "anyhow",
  "async-trait",
