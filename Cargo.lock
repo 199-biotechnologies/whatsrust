@@ -2192,6 +2192,7 @@ checksum = "dea7109cdcd5864d4eeb1b58a1648dc9bf520360d7af16ec26d0a9354bafcfc0"
 dependencies = [
  "base64",
  "cookie_store",
+ "flate2",
  "log",
  "percent-encoding",
  "rustls",
@@ -2616,6 +2617,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "ureq",
  "wacore",
  "wacore-binary",
  "waproto",

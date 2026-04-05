@@ -940,23 +940,54 @@ async fn handle_media(bridge: &WhatsAppBridge, body: &[u8], is_loopback: bool, k
         let fname = req.filename.clone().unwrap_or_else(|| "file".to_string());
         (bytes, mime, fname)
     } else if let Some(ref path_str) = req.path {
-        // Path mode — loopback-only
-        if !is_loopback {
-            return json_err(403, "local-path media uploads are disabled for non-loopback API binds");
+        if path_str.starts_with("http://") || path_str.starts_with("https://") {
+            // URL mode — fetch from network, allowed from any bind
+            let url = path_str.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let resp = ureq::get(&url)
+                    .call()
+                    .map_err(|e| format!("failed to fetch '{url}': {e}"))?;
+                let ct = resp.headers().get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.split(';').next())
+                    .map(str::trim)
+                    .unwrap_or("application/octet-stream")
+                    .to_owned();
+                let bytes = resp.into_body().read_to_vec()
+                    .map_err(|e| format!("failed to read response body: {e}"))?;
+                Ok::<(Vec<u8>, String), String>((bytes, ct))
+            }).await;
+            let (bytes, ct) = match result {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => return json_err(400, &e),
+                Err(e) => return json_err(500, &format!("spawn_blocking failed: {e}")),
+            };
+            if bytes.is_empty() { return json_err(400, "fetched URL returned empty body"); }
+            if bytes.len() as u64 > MAX_MEDIA_READ_BYTES {
+                return json_err(400, &format!("URL content exceeds size limit ({} bytes)", bytes.len()));
+            }
+            let mime = req.mime.clone().unwrap_or(ct);
+            let fname = path_str.split('/').last().and_then(|s| s.split('?').next()).unwrap_or("file").to_string();
+            (bytes, mime, fname)
+        } else {
+            // Local path mode — loopback-only
+            if !is_loopback {
+                return json_err(403, "local-path media uploads are disabled for non-loopback API binds");
+            }
+            let bytes = match read_file_for_media(path_str).await { Ok(d) => d, Err(e) => return e };
+            let path = std::path::Path::new(path_str);
+            let mime = req.mime.clone().unwrap_or_else(|| match kind {
+                MediaKind::Image => mime_for_image(path).to_string(),
+                MediaKind::Video => mime_for_video(path).to_string(),
+                MediaKind::Audio => mime_for_audio(path).to_string(),
+                MediaKind::Doc => mime_for_doc(path).to_string(),
+                MediaKind::Sticker => "image/webp".to_string(),
+                MediaKind::ViewOnceImage => mime_for_image(path).to_string(),
+                MediaKind::ViewOnceVideo => mime_for_video(path).to_string(),
+            });
+            let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();
+            (bytes, mime, fname)
         }
-        let bytes = match read_file_for_media(path_str).await { Ok(d) => d, Err(e) => return e };
-        let path = std::path::Path::new(path_str);
-        let mime = req.mime.clone().unwrap_or_else(|| match kind {
-            MediaKind::Image => mime_for_image(path).to_string(),
-            MediaKind::Video => mime_for_video(path).to_string(),
-            MediaKind::Audio => mime_for_audio(path).to_string(),
-            MediaKind::Doc => mime_for_doc(path).to_string(),
-            MediaKind::Sticker => "image/webp".to_string(),
-            MediaKind::ViewOnceImage => mime_for_image(path).to_string(),
-            MediaKind::ViewOnceVideo => mime_for_video(path).to_string(),
-        });
-        let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();
-        (bytes, mime, fname)
     } else {
         return json_err(400, "either 'path' (loopback) or 'data' (base64) is required");
     };

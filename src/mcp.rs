@@ -325,12 +325,14 @@ fn tool_definitions() -> Vec<Value> {
             json!({"type":"object","properties":{
                 "jid":{"type":"string"},"id":{"type":"string"}
             },"required":["jid","id"]})),
-        tool_def("whatsrust_image", "Send an image (base64)",
+        tool_def("whatsrust_image", "Send an image (base64 or file path)",
             json!({"type":"object","properties":{
-                "jid":{"type":"string"},"data":{"type":"string","description":"Base64-encoded image"},
+                "jid":{"type":"string"},
+                "data":{"type":"string","description":"Base64-encoded image (mutually exclusive with path)"},
+                "path":{"type":"string","description":"Absolute local file path or https:// URL (mutually exclusive with data)"},
                 "mime":{"type":"string","description":"MIME type (default image/jpeg)"},
                 "caption":{"type":"string"}
-            },"required":["jid","data"]})),
+            },"required":["jid"]})),
         tool_def("whatsrust_groups", "List all joined groups", json!({"type":"object","properties":{}})),
         tool_def("whatsrust_group_info", "Get group details and members",
             json!({"type":"object","properties":{"jid":{"type":"string"}},"required":["jid"]})),
@@ -464,7 +466,50 @@ fn call_tool(name: &str, args: &Value, port: u16) -> Value {
         "whatsrust_react" => http_post(port, "/api/react", args),
         "whatsrust_edit" => http_post(port, "/api/edit", args),
         "whatsrust_revoke" => http_post(port, "/api/revoke", args),
-        "whatsrust_image" => http_post(port, "/api/image", args),
+        "whatsrust_image" => {
+            // If data (base64) is already provided, forward as-is.
+            // If path is provided (local file or https:// URL), resolve it to base64 here
+            // and send only {jid, data, mime, caption} — never forward `path` to the API.
+            if args.get("data").and_then(|v| v.as_str()).is_some() {
+                http_post(port, "/api/image", args)
+            } else if let Some(path) = args.get("path").and_then(|v| v.as_str()).map(str::to_owned) {
+                let (bytes, detected_mime) = if path.starts_with("http://") || path.starts_with("https://") {
+                    let resp = match ureq::get(&path).call() {
+                        Ok(r) => r,
+                        Err(e) => return json!({ "content": [{ "type": "text", "text": format!("failed to fetch '{path}': {e}") }], "isError": true }),
+                    };
+                    let ct = resp.headers().get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.split(';').next())
+                        .map(str::trim)
+                        .unwrap_or("image/jpeg")
+                        .to_owned();
+                    let b = match resp.into_body().read_to_vec() {
+                        Ok(b) => b,
+                        Err(e) => return json!({ "content": [{ "type": "text", "text": format!("failed to read response from '{path}': {e}") }], "isError": true }),
+                    };
+                    (b, ct)
+                } else {
+                    let b = match std::fs::read(&path) {
+                        Ok(b) => b,
+                        Err(e) => return json!({ "content": [{ "type": "text", "text": format!("cannot read image file '{path}': {e}") }], "isError": true }),
+                    };
+                    let mime = if path.ends_with(".png") { "image/png" }
+                        else if path.ends_with(".gif") { "image/gif" }
+                        else if path.ends_with(".webp") { "image/webp" }
+                        else { "image/jpeg" };
+                    (b, mime.to_owned())
+                };
+                use base64::Engine;
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                let mime = args.get("mime").and_then(|v| v.as_str()).unwrap_or(&detected_mime).to_owned();
+                let mut payload = json!({"jid": args["jid"], "data": b64, "mime": mime});
+                if let Some(cap) = args.get("caption") { payload["caption"] = cap.clone(); }
+                http_post(port, "/api/image", &payload)
+            } else {
+                return json!({ "content": [{ "type": "text", "text": "whatsrust_image: provide either 'data' (base64) or 'path' (file path or URL)" }], "isError": true });
+            }
+        }
         "whatsrust_typing" => http_post(port, "/api/typing", args),
         "whatsrust_location" => http_post(port, "/api/location", args),
         "whatsrust_contact" => http_post(port, "/api/contact", args),
