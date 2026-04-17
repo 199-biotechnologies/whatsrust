@@ -6,7 +6,7 @@
 
 <br />
 
-[![Star this repo](https://img.shields.io/github/stars/199-biotechnologies/whatsrust?style=for-the-badge&logo=github&label=%E2%AD%90%20Star%20this%20repo&color=yellow)](https://github.com/199-biotechnologies/whatsrust/stargazers)
+[![Star this repo](https://img.shields.io/github/stars/paperfoot/whatsrust?style=for-the-badge&logo=github&label=%E2%AD%90%20Star%20this%20repo&color=yellow)](https://github.com/paperfoot/whatsrust/stargazers)
 &nbsp;&nbsp;
 [![Follow @longevityboris](https://img.shields.io/badge/Follow_%40longevityboris-000000?style=for-the-badge&logo=x&logoColor=white)](https://x.com/longevityboris)
 
@@ -16,11 +16,11 @@
 &nbsp;
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)](LICENSE)
 &nbsp;
-[![54 API Endpoints](https://img.shields.io/badge/API-54_endpoints-green?style=for-the-badge)](https://github.com/199-biotechnologies/whatsrust#api)
+[![54 API Endpoints](https://img.shields.io/badge/API-54_endpoints-green?style=for-the-badge)](https://github.com/paperfoot/whatsrust#api)
 &nbsp;
-[![30 MCP Tools](https://img.shields.io/badge/MCP-30_tools-blueviolet?style=for-the-badge)](https://github.com/199-biotechnologies/whatsrust#mcp-server-for-ai-agents)
+[![30 MCP Tools](https://img.shields.io/badge/MCP-30_tools-blueviolet?style=for-the-badge)](https://github.com/paperfoot/whatsrust#mcp-server-for-ai-agents)
 &nbsp;
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen?style=for-the-badge)](https://github.com/199-biotechnologies/whatsrust/pulls)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen?style=for-the-badge)](https://github.com/paperfoot/whatsrust/pulls)
 
 ---
 
@@ -59,7 +59,7 @@ We needed WhatsApp inside agent software and got tired of babysitting a Node sid
 ## Install
 
 ```bash
-git clone https://github.com/199-biotechnologies/whatsrust
+git clone https://github.com/paperfoot/whatsrust
 cd whatsrust && cargo run
 ```
 
@@ -304,7 +304,7 @@ Built by [Boris Djordjevic](https://github.com/longevityboris) at [199 Biotechno
 
 **If this is useful to you:**
 
-[![Star this repo](https://img.shields.io/github/stars/199-biotechnologies/whatsrust?style=for-the-badge&logo=github&label=%E2%AD%90%20Star%20this%20repo&color=yellow)](https://github.com/199-biotechnologies/whatsrust/stargazers)
+[![Star this repo](https://img.shields.io/github/stars/paperfoot/whatsrust?style=for-the-badge&logo=github&label=%E2%AD%90%20Star%20this%20repo&color=yellow)](https://github.com/paperfoot/whatsrust/stargazers)
 &nbsp;&nbsp;
 [![Follow @longevityboris](https://img.shields.io/badge/Follow_%40longevityboris-000000?style=for-the-badge&logo=x&logoColor=white)](https://x.com/longevityboris)
 
