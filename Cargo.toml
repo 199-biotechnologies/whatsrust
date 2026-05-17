@@ -43,6 +43,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Our own rusqlite backend (src/storage.rs) replaces it.
 # For local dev, .cargo/config.toml patches these to ../whatsapp-rust path deps.
 whatsapp-rust = { git = "https://github.com/199-biotechnologies/whatsapp-rust", rev = "9fb13a7bb1f91c3e32eccc517db2566068f15f33", default-features = false, features = ["tokio-runtime", "tokio-transport", "ureq-client", "moka-cache", "simd", "signal", "tokio-native"] }
+ureq = "3"
 wacore = { git = "https://github.com/199-biotechnologies/whatsapp-rust", rev = "9fb13a7bb1f91c3e32eccc517db2566068f15f33" }
 wacore-binary = { git = "https://github.com/199-biotechnologies/whatsapp-rust", rev = "9fb13a7bb1f91c3e32eccc517db2566068f15f33" }
 waproto = { git = "https://github.com/199-biotechnologies/whatsapp-rust", rev = "9fb13a7bb1f91c3e32eccc517db2566068f15f33" }

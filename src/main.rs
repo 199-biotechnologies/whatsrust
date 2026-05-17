@@ -880,7 +880,7 @@ async fn main() -> Result<()> {
                             if parts.len() < 3 {
                                 eprintln!("usage: delete-for-me <jid> <msg_id> [sender] [from_me]");
                             } else {
-                                let sender = parts.get(3).map(|s| *s);
+                                let sender = parts.get(3).copied();
                                 let from_me = parts.get(4).map(|v| *v != "false").unwrap_or(true);
                                 match bridge_for_repl.delete_message_for_me(parts[1], parts[2], sender, from_me).await {
                                     Ok(()) => println!("ok"),
@@ -892,7 +892,7 @@ async fn main() -> Result<()> {
                             if parts.len() < 3 {
                                 eprintln!("usage: {} <jid> <msg_id> [sender] [from_me]", parts[0]);
                             } else {
-                                let sender = parts.get(3).map(|s| *s);
+                                let sender = parts.get(3).copied();
                                 let from_me = parts.get(4).map(|v| *v != "false").unwrap_or(true);
                                 let result = if parts[0] == "star" {
                                     bridge_for_repl.star_message(parts[1], parts[2], sender, from_me).await

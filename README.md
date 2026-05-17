@@ -233,7 +233,68 @@ Async sends return `{ok, job_id}`. Add `?sync=true` to wait for the WhatsApp mes
 
 Run `whatsrust mcp` to start a Model Context Protocol server with 30 tools over JSON-RPC stdio. Connect it to Claude Code, Cursor, or any MCP-compatible AI agent and your agent can send messages, manage groups, post stories, and handle chat operations through WhatsApp.
 
-Works out of the box with Claude Code -- just add it to your MCP config and your AI agent gets full WhatsApp access.
+### Claude Code setup
+
+Build the release binary, then add whatsrust to `~/.claude.json`:
+
+```bash
+cargo build --release
+```
+
+```json
+{
+  "mcpServers": {
+    "whatsrust": {
+      "command": "/path/to/whatsrust/target/release/whatsrust",
+      "args": ["mcp"],
+      "cwd": "/path/to/whatsrust",
+      "env": {
+        "WHATSRUST_DB": "/path/to/whatsrust/whatsapp.db"
+      }
+    }
+  }
+}
+```
+
+The MCP server proxies to the running daemon over HTTP — the daemon must be running for MCP tools to work.
+
+### Run the daemon persistently (Linux)
+
+Use a systemd user service so the daemon starts automatically on login and restarts on crash:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cat > ~/.config/systemd/user/whatsrust.service << 'EOF'
+[Unit]
+Description=WhatsRust WhatsApp daemon
+After=network.target
+
+[Service]
+ExecStart=/path/to/whatsrust/target/release/whatsrust
+WorkingDirectory=/path/to/whatsrust
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/path/to/whatsrust/daemon.log
+StandardError=append:/path/to/whatsrust/daemon.log
+
+[Install]
+WantedBy=default.target
+EOF
+
+systemctl --user daemon-reload
+systemctl --user enable --now whatsrust
+
+# Enable auto-start at boot (without requiring login)
+loginctl enable-linger $USER
+```
+
+Useful service commands:
+
+```bash
+systemctl --user status whatsrust     # check status
+systemctl --user restart whatsrust    # restart
+journalctl --user -u whatsrust -f     # live logs
+```
 
 ---
 
