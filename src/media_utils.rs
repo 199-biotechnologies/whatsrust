@@ -30,6 +30,7 @@ pub fn extract_image_meta(data: &[u8]) -> Option<ImageMeta> {
 }
 
 /// Extract just image dimensions from raw bytes (fast path using image crate).
+#[allow(dead_code)]
 pub fn extract_image_dimensions(data: &[u8]) -> Option<(u32, u32)> {
     // Try header-only decode first for speed
     #[allow(deprecated)]

@@ -61,8 +61,15 @@ fn read_local_media_file(path: &Path) -> Result<Vec<u8>> {
     Ok(std::fs::read(path)?)
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
     // CLI mode: fire request to running daemon
@@ -224,7 +231,11 @@ async fn main() -> Result<()> {
         println!();
 
         loop {
-            match lines.next_line().await {
+            let next = tokio::select! {
+                _ = cancel_for_repl.cancelled() => break,
+                next = lines.next_line() => next,
+            };
+            match next {
                 Ok(Some(line)) => {
                     let line = line.trim().to_string();
                     if line.is_empty() {
@@ -980,7 +991,12 @@ async fn main() -> Result<()> {
         warn!("bridge did not fully stop within 5 seconds");
     }
 
-    Ok(())
+    // Graceful shutdown is complete (bridge drained + state backed up). The
+    // REPL spawns a blocking stdin reader thread (tokio::io::stdin), which stays
+    // parked in a read() syscall whenever stdin is an open terminal/pipe. The
+    // runtime's drop would block forever waiting on that thread, so exit
+    // explicitly instead of returning and hanging.
+    std::process::exit(0);
 }
 
 // ---------------------------------------------------------------------------
