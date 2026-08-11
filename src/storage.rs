@@ -254,6 +254,18 @@ pub struct InboundRow {
     pub timestamp: i64,
 }
 
+/// A row from the unified conversation history (inbound + outbound).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConversationRow {
+    pub chat_jid: String,
+    pub sender_jid: String,
+    pub message_id: String,
+    pub content_kind: String,
+    pub body_text: Option<String>,
+    pub timestamp: i64,
+    pub direction: String, // "inbound" | "outbound"
+}
+
 /// Statistics from a prune operation.
 #[derive(Debug, Clone)]
 pub struct PruneStats {
@@ -605,6 +617,49 @@ impl Store {
                     content_kind: row.get(4)?,
                     body_text: row.get(5)?,
                     timestamp: row.get(6)?,
+                })
+            }).map_err(db_err)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>().map_err(db_err)
+        })
+        .await
+    }
+
+    /// Unified conversation history: inbound messages + sent outbound messages,
+    /// merged and sorted by timestamp. Outbound rows use the JID as sender_jid
+    /// with direction="outbound"; inbound rows use direction="inbound".
+    pub async fn search_unified(
+        &self,
+        chat_jid: &str,
+        limit: i64,
+        before_ts: Option<i64>,
+    ) -> Result<Vec<ConversationRow>> {
+        let jid = chat_jid.to_owned();
+        let before = before_ts.unwrap_or(i64::MAX);
+        self.run(move |c| {
+            let sql = "
+                SELECT chat_jid, sender_jid, message_id, content_kind, body_text, timestamp, 'inbound' AS direction
+                FROM inbound_messages
+                WHERE chat_jid = ?1 AND timestamp < ?2
+                UNION ALL
+                SELECT jid AS chat_jid, jid AS sender_jid, COALESCE(wa_message_id, CAST(id AS TEXT)) AS message_id,
+                       op_kind AS content_kind,
+                       json_extract(payload_json, '$.text') AS body_text,
+                       created_at AS timestamp, 'outbound' AS direction
+                FROM outbound_queue
+                WHERE jid = ?1 AND status = 'sent' AND created_at < ?2
+                ORDER BY timestamp DESC
+                LIMIT ?3
+            ";
+            let mut stmt = c.prepare(sql).map_err(db_err)?;
+            let rows = stmt.query_map(params![jid, before, limit], |row| {
+                Ok(ConversationRow {
+                    chat_jid: row.get(0)?,
+                    sender_jid: row.get(1)?,
+                    message_id: row.get(2)?,
+                    content_kind: row.get(3)?,
+                    body_text: row.get(4)?,
+                    timestamp: row.get(5)?,
+                    direction: row.get(6)?,
                 })
             }).map_err(db_err)?;
             rows.collect::<std::result::Result<Vec<_>, _>>().map_err(db_err)

@@ -884,10 +884,13 @@ fn mime_for_doc(path: &std::path::Path) -> &'static str {
 // --- History & Search ---
 
 async fn handle_history(bridge: &WhatsAppBridge, req: &HttpRequest) -> Vec<u8> {
-    let jid = req.query_get("jid");
+    let jid = match req.query_get("jid") {
+        Some(j) if !j.is_empty() => j,
+        _ => return json_err(400, "query parameter 'jid' is required"),
+    };
     let limit: i64 = req.query_get("limit").and_then(|v| v.parse().ok()).unwrap_or(50).max(1).min(200);
     let before: Option<i64> = req.query_get("before").and_then(|v| v.parse().ok());
-    match bridge.store().search_inbound(jid, None, limit, before).await {
+    match bridge.store().search_unified(&jid, limit, before).await {
         Ok(rows) => {
             let count = rows.len();
             json_ok(json!({"messages": rows, "count": count}))
